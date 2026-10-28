@@ -1,0 +1,8 @@
+[package]
+name = "wein-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 纯逻辑调度器：零依赖、无 async、无 I/O——同步可测、确定性可验
+[dependencies]

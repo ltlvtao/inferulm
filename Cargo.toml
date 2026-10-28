@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/wein-sched",
     "crates/wein-engine",
     "crates/wein-serve",
     "crates/wein-cli",

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+wein-sched = { path = "../wein-sched" }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

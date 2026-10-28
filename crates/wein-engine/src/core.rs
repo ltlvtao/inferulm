@@ -1,0 +1,244 @@
+//! EngineCore：真实 engine core 的第一步——统一 token 预算调度器（wein-sched）
+//! + 可插拔执行器，组装成与 MockEngine 同协议的引擎任务。
+//!
+//! 对外只经 EngineHandle（Submit/Cancel + 事件流）——serve 验收套件对引擎实现
+//! 完全无感知，MockEngine 可与之互换，这就是 TDD 外→内协议锚的兑现。
+//!
+//! 三线程拓扑（02-architecture §5）中的 "engine core 线程"：当前为 tokio 任务，
+//! 协议是 channel，后续搬到专用线程不动接口。exec 线程（§5 第三线程）以
+//! `Executor` trait 预留——真实实现是 CUDA 图/NPU 图；M0 用 ScriptedExecutor。
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::sleep;
+
+use wein_sched::{
+    FinishReason as SchedFinish, ReqId, ReqInput, SchedConfig, SchedEvent, Scheduler, StepPlan,
+};
+
+use crate::handle::EngineHandle;
+use crate::protocol::{EngineCommand, EngineEvent, EngineRequest, FinishReason, RequestId};
+
+pub struct CoreConfig {
+    pub sched: SchedConfig,
+    /// 脚本执行器的 token 表（循环取用；与 MockScript.pieces 对齐以便 parity 测试）
+    pub pieces: Vec<u32>,
+    /// 每步墙钟延迟（模拟 kernel 时间；0 = 尽快推进）
+    pub step_delay: Duration,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            sched: SchedConfig::default(),
+            pieces: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            step_delay: Duration::from_millis(1),
+        }
+    }
+}
+
+impl CoreConfig {
+    /// 脚本式配置：调度参数取默认（budget 512 / max_running 256 / chunk 256）。
+    pub fn scripted(pieces: Vec<u32>, step_delay: Duration) -> Self {
+        Self { pieces, step_delay, ..Default::default() }
+    }
+}
+
+/// 引擎侧可断言状态（对应 MockState 的角色；BASELINE §4 L2 插桩的载体）。
+#[derive(Default)]
+pub struct EngineStats {
+    accepted: AtomicUsize,
+    cancelled: AtomicUsize,
+    finished: AtomicUsize,
+    preempted: AtomicUsize,
+    steps: AtomicU64,
+}
+
+impl EngineStats {
+    pub fn accepted_count(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+    pub fn cancelled_count(&self) -> usize {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+    pub fn finished_count(&self) -> usize {
+        self.finished.load(Ordering::Relaxed)
+    }
+    pub fn preempted_count(&self) -> usize {
+        self.preempted.load(Ordering::Relaxed)
+    }
+    pub fn step_count(&self) -> u64 {
+        self.steps.load(Ordering::Relaxed)
+    }
+}
+
+/// 执行器：engine core 只做决策，一步的"算"由执行器完成（§5 exec 线程的 trait 预留）。
+pub trait Executor: Send {
+    /// 执行一步，返回每个 decode 槽位产出的 token
+    fn step(&mut self, plan: &StepPlan) -> Vec<(ReqId, u32)>;
+    /// 步末回收：清理已离批请求的执行器内部状态（DeferredRelease 钩子）
+    fn retain(&mut self, active: &[ReqId]);
+}
+
+/// 确定性执行器：每请求独立循环取 pieces（与 MockEngine 相同的可预测输出，
+/// parity 测试因此可以逐字节比对）。
+pub struct ScriptedExecutor {
+    pieces: Vec<u32>,
+    counters: HashMap<ReqId, usize>,
+}
+
+impl ScriptedExecutor {
+    pub fn new(pieces: Vec<u32>) -> Self {
+        Self { pieces, counters: HashMap::new() }
+    }
+}
+
+impl Executor for ScriptedExecutor {
+    fn step(&mut self, plan: &StepPlan) -> Vec<(ReqId, u32)> {
+        let n = self.pieces.len().max(1);
+        plan.decode
+            .iter()
+            .map(|&id| {
+                let c = self.counters.entry(id).or_insert(0);
+                let tok = self.pieces[*c % n];
+                *c += 1;
+                (id, tok)
+            })
+            .collect()
+    }
+
+    fn retain(&mut self, active: &[ReqId]) {
+        self.counters.retain(|k, _| active.contains(k));
+    }
+}
+
+pub struct EngineCore;
+
+impl EngineCore {
+    /// 启动 engine core 任务，返回 (serve 用的句柄, 断言用的状态)。
+    pub fn spawn(cfg: CoreConfig) -> (EngineHandle, Arc<EngineStats>) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stats = Arc::new(EngineStats::default());
+        tokio::spawn(Self::run(cfg, cmd_rx, stats.clone()));
+        (EngineHandle::new(cmd_tx), stats)
+    }
+
+    async fn run(
+        cfg: CoreConfig,
+        mut cmd_rx: UnboundedReceiver<EngineCommand>,
+        stats: Arc<EngineStats>,
+    ) {
+        let mut sched = Scheduler::new(cfg.sched);
+        let mut exec = ScriptedExecutor::new(cfg.pieces);
+        let mut senders: HashMap<RequestId, UnboundedSender<EngineEvent>> = HashMap::new();
+
+        while let Some(cmd) = cmd_rx.recv().await {
+            Self::handle(&mut sched, &mut senders, &stats, cmd);
+            // 批量吸收同刻到达的命令再统一推进：一次调度决策管一批提交
+            Self::drain(&mut cmd_rx, &mut sched, &mut senders, &stats);
+
+            // 推进直到空闲；空闲即停车等新命令（不忙转）。
+            // 步是原子的：本步 token 全部发出 → 完成事件 → 回收；
+            // 步间命令（取消/新提交）在下一步首 drain 时生效——
+            // 因此取消后客户端至多再收到在飞那一步的 token（e2 验收钉死的边界）
+            while !sched.is_idle() {
+                Self::drain(&mut cmd_rx, &mut sched, &mut senders, &stats);
+                let plan = sched.step();
+                stats.steps.fetch_add(1, Ordering::Relaxed);
+                if !cfg.step_delay.is_zero() {
+                    sleep(cfg.step_delay).await;
+                }
+                for (id, tok) in exec.step(&plan) {
+                    if let Some(tx) = senders.get(&id) {
+                        let _ = tx.send(EngineEvent::Token(tok));
+                    }
+                }
+                Self::pump(&mut sched, &mut senders, &stats);
+                // DeferredRelease：步末回收执行器内已离批请求的状态
+                exec.retain(&plan.batch);
+            }
+        }
+        // cmd_tx 全部 drop = 引擎关闭；senders 随之 drop，事件流自然关闭
+    }
+
+    /// 吸收当前排队中的全部命令并回放事件。
+    /// 步间必须 drain：取消要及时生效（不能等当前批跑完），新提交也要能进批
+    /// （continuous batching 的准入路径——e2 验收钉死的语义）。
+    fn drain(
+        cmd_rx: &mut UnboundedReceiver<EngineCommand>,
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stats: &EngineStats,
+    ) {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            Self::handle(sched, senders, stats, cmd);
+        }
+        Self::pump(sched, senders, stats);
+    }
+
+    fn handle(
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stats: &EngineStats,
+        cmd: EngineCommand,
+    ) {
+        match cmd {
+            EngineCommand::Submit(req) => {
+                stats.accepted.fetch_add(1, Ordering::Relaxed);
+                let EngineRequest {
+                    id, prompt_token_ids, max_tokens, sampling: _, respond_to,
+                } = req;
+                senders.insert(id, respond_to);
+                if let Some(tx) = senders.get(&id) {
+                    let _ = tx.send(EngineEvent::Accepted);
+                }
+                sched.submit(ReqInput { id, prompt_len: prompt_token_ids.len(), max_tokens });
+            }
+            EngineCommand::Cancel(id) => {
+                stats.cancelled.fetch_add(1, Ordering::Relaxed);
+                sched.cancel(id);
+                // best-effort 通知 Aborted（接收端可能已放弃，发送失败即忽略）
+                if let Some(tx) = senders.get(&id) {
+                    let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
+                }
+            }
+        }
+    }
+
+    /// 回放调度器事件。抢占对 serve 不可见——它是引擎内部实现细节，
+    /// serve 只是看到 token 流稍后到达；Finished 是唯一对外终结事件。
+    fn pump(
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stats: &EngineStats,
+    ) {
+        for ev in sched.poll_events() {
+            match ev {
+                SchedEvent::Admitted(_) => {}
+                SchedEvent::Preempted(_) => {
+                    stats.preempted.fetch_add(1, Ordering::Relaxed);
+                }
+                SchedEvent::Cancelled(id) => {
+                    senders.remove(&id);
+                }
+                SchedEvent::Finished { id, reason } => {
+                    stats.finished.fetch_add(1, Ordering::Relaxed);
+                    if let Some(tx) = senders.remove(&id) {
+                        let _ = tx.send(EngineEvent::Finished(map_reason(reason)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn map_reason(r: SchedFinish) -> FinishReason {
+    match r {
+        SchedFinish::Stop => FinishReason::Stop,
+        SchedFinish::Length => FinishReason::Length,
+        SchedFinish::Aborted => FinishReason::Aborted,
+    }
+}

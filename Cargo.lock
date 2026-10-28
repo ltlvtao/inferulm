@@ -1481,7 +1481,12 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "wein-sched",
 ]
+
+[[package]]
+name = "wein-sched"
+version = "0.1.0"
 
 [[package]]
 name = "wein-serve"

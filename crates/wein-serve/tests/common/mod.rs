@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::Value;
-use wein_engine::{MockEngine, MockScript, MockState};
+use wein_engine::{CoreConfig, EngineCore, EngineStats, MockEngine, MockScript, MockState};
 use wein_serve::{spawn_server, ServeState};
 
 pub use wein_serve::MockTokenizer;
@@ -102,4 +102,27 @@ pub fn content_of(frames: &[String]) -> String {
         }
     }
     out
+}
+
+pub struct TestCore {
+    pub base: String,
+    pub stats: Arc<EngineStats>,
+}
+
+/// 与 start() 同构，但引擎换成 EngineCore（wein-sched 调度器 + 脚本执行器）：
+/// serve 层验收对引擎实现完全无感知——协议锚的兑现。
+pub async fn start_core(cfg: CoreConfig, tok: MockTokenizer) -> TestCore {
+    let (engine, stats) = EngineCore::spawn(cfg);
+    let state = ServeState {
+        model_id: "mock-model".into(),
+        tokenizer: Arc::new(tok),
+        engine,
+    };
+    let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    TestCore { base: format!("http://{addr}"), stats }
+}
+
+/// 与 MockScript::default() 输出对齐的 core 配置（pieces 0..7 循环，1ms 步进）
+pub fn default_core() -> CoreConfig {
+    CoreConfig::scripted(vec![0, 1, 2, 3, 4, 5, 6, 7], Duration::from_millis(1))
 }
