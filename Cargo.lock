@@ -1501,10 +1501,17 @@ name = "wein-kernel"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "serde",
+ "serde_json",
+ "wein-platform",
 ]
 
 [[package]]
 name = "wein-memory"
+version = "0.1.0"
+
+[[package]]
+name = "wein-platform"
 version = "0.1.0"
 
 [[package]]

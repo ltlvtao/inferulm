@@ -54,10 +54,11 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".target "), "缺 target 头");
     assert!(ptx.contains(".entry vec_add_f32("), "vec_add_f32 入口缺失/被改名");
     assert!(ptx.contains(".entry bf16_dot("), "bf16_dot 入口缺失/被改名");
+    assert!(ptx.contains(".entry rms_norm("), "rms_norm 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        2,
-        "导出 kernel 数应为 2（多了说明编译单元混入了别的入口）"
+        3,
+        "导出 kernel 数应为 3（多了说明编译单元混入了别的入口）"
     );
 }
 

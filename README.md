@@ -5,13 +5,14 @@
 设计文档见 [`../design/`](../design/)（01-strategy / 02-architecture）。
 开发方法：**TDD 外→内**——验收用例先于实现，从 serve 层向内核层推进。
 
-## 当前状态（M0 第四层：kernel，cuda 冒烟）
+## 当前状态（M0 第五层：trait Op 注册表 + wein-platform 最小面）
 
 - `wein-serve`：OpenAI-compatible HTTP/SSE（chat/completions + completions + models），增量 detokenizer（UTF-8 边界安全），stop 参数截断 + 引擎取消，断连自动取消
 - `wein-sched`：统一 token 预算调度器（纯逻辑零依赖）——无 prefill/decode phase（token 债统一建模）、chunked prefill、抢占 = recompute（债 = prompt + 已生成）、FIFO 准入、BatchBuffer 增量 op、DeferredRelease；容量侧可插拔（`CapacityModel`，默认聚合 token 模型）
 - `wein-engine`：边界协议（Submit/Cancel + 事件流）+ **EngineCore**（调度器 + 可插拔 `Executor` 组装）+ MockEngine（对照组）；`EngineStats` 为 L2/L2m 插桩载体
 - `wein-memory`：paged KV 布局 / BlockPool（LIFO + rc + DeferredRelease + 水位）/ radix 前缀缓存（pin 驱逐免疫，LRU 级联驱逐）/ req_to_token / `MemState` 容量语义——零依赖 crate，经引擎侧 `PoolCapacity` 适配器接入 `CapacityModel` 钩子
-- `wein-kernel`：cuda 冒烟（§13-2 三线全过）——`kernels/` 子 crate 纯 Rust→PTX（nightly + abi_ptx/stdarch_nvptx feature，无 nvcc）+ dlopen(libcuda) 最小 Driver API 面（零 toolkit 依赖）+ 高层 Gpu/Module/Func/Stream/DevBuf
+- `wein-kernel`：cuda 冒烟（§13-2 三线全过）——`kernels/` 子 crate 纯 Rust→PTX（nightly + abi_ptx/stdarch_nvptx feature，无 nvcc）+ dlopen(libcuda) 最小 Driver API 面（零 toolkit 依赖）+ 高层 Gpu/Module/Func/Stream/DevBuf；**trait Op 注册表**（§4）：启动时按 `HardwareProfile` resolve 一次 → `OpTable` 具体类型槽位（无 Box<dyn>/字符串查表），失败 = Degrade 三元组；首个算子 `rms_norm`（双 launch 档位 row/blocked，golden 位对齐）+ CPU 参考实现（`reference`，独立代码路径）+ golden vector 框架（cuda/asc 共享同一文件，§4）
+- `wein-platform`：三层能力模型（§3）——`Device` PCI vendor 零依赖探测（无任何 vendor SDK）/ `HardwareProfile` 不可变画像（supports + block_size 平台注入：CUDA 16 / 昇腾 128）/ `Degrade` 声明式降级三元组（不隐式硬改配置的类型化载体）
 - `wein-cli`：`wein serve --mock` 起 mock 服务
 - `wein-bench`：并发性能验收工具（TTFT/ITL/吞吐 + smoke 阈值门禁）
 
@@ -40,8 +41,9 @@ bench/battery.sh release
 1. **serve** ✅：MockEngine 钉死边界协议（24 验收用例）
 2. **engine core** ✅：wein-sched 调度器（8 同步验收）+ EngineCore 协议验收（3）+ serve 套件换引擎 parity 复跑（8）——同一协议，行为零漂移
 3. **memory** ✅：wein-memory（布局/BlockPool/radix/req_to_token/MemState，验收 m1-m10）+ `CapacityModel` 钩子接入（引擎适配器 + im1-im4 集成验收 + serve 套件 parity 复跑 p9）——抢占触发从聚合 token 模型换成 BlockPool 水位，调度策略零改动
-4. **kernel**（冒烟 ✅，trait Op/exec 接入待做）：cuda crate 冒烟实验完成——验收 k1-k8 全绿（PTX 产出物/指令降落/驱动探测/显存往返/vec_add 位对齐/**bf16 点积位对齐**/JIT 缓存跨进程复用/launch 4.69µs）；**风险登记**：路线锁 nightly + 两个未稳定 feature（abi_ptx #38788、stdarch_nvptx #111199），不达标时启用 cubin 旁路（架构不变）；后续：`trait Op` 注册表、varlen paged attention 等 M0 算子清单（§4）、`Executor` 从 ScriptedExecutor 换真实 exec 线程
-5. 逐层替换 mock，验收套件始终不变
+4. **kernel**（冒烟 ✅，trait Op ✅，exec 接入待做）：cuda crate 冒烟实验完成——验收 k1-k8 全绿（PTX 产出物/指令降落/驱动探测/显存往返/vec_add 位对齐/**bf16 点积位对齐**/JIT 缓存跨进程复用/launch 4.69µs）；**风险登记**：路线锁 nightly + 两个未稳定 feature（abi_ptx #38788、stdarch_nvptx #111199），不达标时启用 cubin 旁路（架构不变）
+5. **trait Op 注册表** ✅：`OpTable` 启动时 resolve（arch 档位裁决，o1/o3 确定性；o2 无卡 Err = Degrade 三元组）+ 首算子 `rms_norm`（同一 kernel 双 launch 档位，o5 两档 golden 位一致）+ golden vector 框架（o6 缺失生成/回读对拍/漂移须显式重生成；asc 接入复用同一文件）+ `wein-platform` 最小面（pf1-pf3）；**数值对齐纪律**：只正确舍入原语、行内顺序累加、bf16→f32 精确——o4 GPU↔CPU 参考位对齐一次达成
+6. 逐层替换 mock，验收套件始终不变——后续：M0 其余算子（rope/silu/varlen paged attention/W8A8/KV scatter）逐个入表、`Executor` 从 ScriptedExecutor 换真实 exec 线程
 
 ## 规约
 

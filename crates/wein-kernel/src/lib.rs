@@ -1,13 +1,16 @@
 //! wein-kernel：算子层（02-architecture §4）。
 //!
-//! 当前为 **cuda crate 冒烟实验**（§13-2）的落点：
 //! - `kernels/` 子 crate：no_std Rust 编译到 nvptx64 → PTX 文本（build.rs）
 //! - `cuda::driver`：dlopen(libcuda.so.1) 的最小 Driver API 面（无 toolkit 依赖）
-//! - `cuda::Gpu/Module/Func/Stream/DevBuf`：高层封装，exec 层（后续）经此提交 kernel
+//! - `cuda::Gpu/Module/Func/Stream/DevBuf`：高层封装
+//! - `ops::`：**trait Op 家族 + 启动时注册表**——按 HardwareProfile 解析一次，
+//!   具体类型单态化，热路径零动态分发（§4）；首个成员 rms_norm
+//! - `reference::`：CPU 参考实现——golden vector 生成端（cuda/asc 共享，§4）
 //!
-//! trait Op 注册表与厂商库 FFI（cuBLASLt）按 §4 在 W2 展开——本层冒烟先行，
-//! 回答全项目最大技术风险：纯 Rust→PTX 路线能不能走。
+//! 厂商库 FFI（cuBLASLt）与 M0 其余算子按 §4 逐个入表。
 pub mod cuda;
+pub mod ops;
+pub mod reference;
 
 /// PTX 产物路径（build.rs 注入）。加载用文本读它；JIT 缓存由 driver 管。
 pub fn ptx_path() -> std::path::PathBuf {

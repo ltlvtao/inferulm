@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/wein-platform",
     "crates/wein-sched",
     "crates/wein-memory",
     "crates/wein-engine",
@@ -15,7 +16,7 @@ exclude = [
     "crates/wein-kernel/kernels",
 ]
 
-# W1 后续补 wein-platform / wein-exec / wein-model（02-architecture §2）
+# W1 后续补 wein-exec / wein-model（02-architecture §2）
 
 [workspace.package]
 version = "0.1.0"

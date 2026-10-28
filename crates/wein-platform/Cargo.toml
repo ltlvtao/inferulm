@@ -1,0 +1,7 @@
+[package]
+name = "wein-platform"
+version = "0.1.0"
+edition = "2021"
+description = "平台层：Device/HardwareProfile/能力模型/env 注册表（02-architecture §3）"
+
+[dependencies]

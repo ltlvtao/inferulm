@@ -14,6 +14,9 @@
 #![no_std]
 #![feature(abi_ptx)]
 #![feature(stdarch_nvptx)]
+// sqrt/mul_add 等浮点方法在新 nightly 被移入 core_float_math（#137578）；
+// 正确舍入原语直接走 intrinsics——语义等同 sqrt.rn.f32（冒烟风险登记项）
+#![feature(core_intrinsics)]
 
 use core::arch::nvptx::{_block_dim_x, _block_idx_x, _thread_idx_x};
 
@@ -90,5 +93,44 @@ pub unsafe extern "ptx-kernel" fn bf16_dot(
             j += 1;
         }
         *out.add(t as usize) = f32_to_bf16(acc);
+    }
+}
+
+/// RMSNorm（Llama/Qwen 形态）：out[r] = x[r] / sqrt(mean(x[r]²) + eps) * w。
+/// M0 融合算子清单首个入表成员（§4）。
+///
+/// 对齐纪律（与 reference.rs 同守，golden 对拍的可达性依据）：
+/// - 只用正确舍入原语：mul.rn / add.rn / div.rn / sqrt.rn——禁 rsqrt(MUFU)
+///   近似与 fma 收缩（两侧同为 IEEE 单算才可能位位相等）
+/// - 行内顺序累加（i 递增），与参考实现逐步同序
+/// - 一行由单线程完整计算：launch 几何（row/blocked 档）不改变数值序
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn rms_norm(
+    x: *const u16,
+    w: *const u16,
+    out: *mut u16,
+    hidden: u32,
+    eps: f32,
+    rows: u32,
+) {
+    let r = tid();
+    if r < rows {
+        let h = hidden as usize;
+        let base = (r as usize) * h;
+        let mut acc = 0.0f32;
+        let mut i = 0usize;
+        while i < h {
+            let v = bf16_to_f32(*x.add(base + i));
+            acc = v * v + acc;
+            i += 1;
+        }
+        let denom = unsafe { core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps) };
+        let inv = 1.0f32 / denom;
+        let mut i = 0usize;
+        while i < h {
+            let o = bf16_to_f32(*x.add(base + i)) * inv * bf16_to_f32(*w.add(i));
+            *out.add(base + i) = f32_to_bf16(o);
+            i += 1;
+        }
     }
 }
