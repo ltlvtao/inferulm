@@ -48,6 +48,15 @@ pub struct OpTable<'a> {
     pub embed: EmbedCuda<'a>,
     pub add: AddCuda<'a>,
     pub mul: MulCuda<'a>,
+    // I1 竖切（Qwen3.5 文本骨干）
+    pub rms_norm_zc: RmsNormZcCuda<'a>,
+    pub rope_pt: RopePtCuda<'a>,
+    pub sigmul: SigmulCuda<'a>,
+    pub conv1d_dw: Conv1dDwCuda<'a>,
+    pub conv_state_roll: ConvStateRollCuda<'a>,
+    pub deltanet: DeltanetCuda<'a>,
+    pub rms_norm_gated: RmsNormGatedCuda<'a>,
+    pub argmax_rows: ArgmaxRowsCuda<'a>,
 }
 
 impl OpTable<'_> {
@@ -96,6 +105,15 @@ impl OpTable<'_> {
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
         let mul = MulCuda { gpu, f: m.func("mul") };
+        // I1 竖切八入口（同模块；deltanet 自带块几何——注册时零假设）
+        let rms_norm_zc = RmsNormZcCuda { gpu, f: m.func("rms_norm_zc") };
+        let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
+        let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
+        let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
+        let conv_state_roll = ConvStateRollCuda { gpu, f: m.func("conv_state_roll") };
+        let deltanet = DeltanetCuda { gpu, f: m.func("deltanet") };
+        let rms_norm_gated = RmsNormGatedCuda { gpu, f: m.func("rms_norm_gated") };
+        let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
         // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
         let gemm = GemmLt { lt: Box::new(
             crate::cuda::BlasLt::open(gpu).map_err(|e| vec![Degrade {
@@ -104,7 +122,9 @@ impl OpTable<'_> {
                 impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
             }])?,
         )};
-        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul })
+        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
+            rms_norm_zc, rope_pt, sigmul, conv1d_dw, conv_state_roll, deltanet, rms_norm_gated,
+            argmax_rows })
     }
 }
 
@@ -172,6 +192,305 @@ impl MulOp for MulCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "mul/cuda"
+    }
+}
+
+// ───────────────────── I1 竖切算子（Qwen3.5 文本骨干） ─────────────────────
+// 与 kernels/ 新入口一一对应；deltanet 是唯一的非 256 块几何（block=v_dim）。
+
+/// 零中心 RMSNorm（Qwen3_5RMSNorm 语义）：out = x·rsqrt(mean(x²)+eps)·(1+w)
+pub trait RmsNormZcOp {
+    /// x/out: [rows, hidden] bf16；w: [hidden] bf16
+    fn run(&self, x: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct RmsNormZcCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl RmsNormZcOp for RmsNormZcCuda<'_> {
+    fn run(&self, x: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
+        let args = crate::kernel_args![*x, *w, *out, hidden, eps, rows];
+        self.gpu.launch(&self.f, rows.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "rms_norm_zc/cuda"
+    }
+}
+
+/// partial RoPE：单张量 [tokens, heads, head_dim]，前 rot_dim 维 rotate_half，
+/// 其余 pass-through（kernel 不触碰——out 可与 x 同缓冲原地）
+pub trait RopePtOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        cos: &DevBuf,
+        sin: &DevBuf,
+        pos: &DevBuf,
+        out: &DevBuf,
+        rot_dim: u32,
+        head_dim: u32,
+        heads: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct RopePtCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl RopePtOp for RopePtCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        cos: &DevBuf,
+        sin: &DevBuf,
+        pos: &DevBuf,
+        out: &DevBuf,
+        rot_dim: u32,
+        head_dim: u32,
+        heads: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * heads * (rot_dim / 2);
+        let args = crate::kernel_args![*x, *cos, *sin, *pos, *out, rot_dim, head_dim, heads, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "rope_pt/cuda"
+    }
+}
+
+/// 门控乘：out = x·sigmoid(g)（注意力输出门；与 mul 的区别在 sigmoid 在内）
+pub trait SigmulOp {
+    fn run(&self, x: &DevBuf, g: &DevBuf, out: &DevBuf, n: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct SigmulCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl SigmulOp for SigmulCuda<'_> {
+    fn run(&self, x: &DevBuf, g: &DevBuf, out: &DevBuf, n: u32, stream: &Stream) {
+        let args = crate::kernel_args![*x, *g, *out, n];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "sigmul/cuda"
+    }
+}
+
+/// 深度wise 因果 conv1d + silu：varlen 批内同请求 token 段连续（executor
+/// 合同），不足 kernel-1 步的 tap 取 conv 状态
+pub trait Conv1dDwOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        w: &DevBuf,
+        state_in: &DevBuf,
+        out: &DevBuf,
+        tok_row: &DevBuf,
+        tok_pos: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct Conv1dDwCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl Conv1dDwOp for Conv1dDwCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        w: &DevBuf,
+        state_in: &DevBuf,
+        out: &DevBuf,
+        tok_row: &DevBuf,
+        tok_pos: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * conv_dim;
+        let args = crate::kernel_args![*x, *w, *state_in, *out, *tok_row, *tok_pos, conv_dim, kernel, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "conv1d_dw/cuda"
+    }
+}
+
+/// conv 状态滚动：state ←（旧 state ++ 本段 x）末 kernel-1 个（原地）
+pub trait ConvStateRollOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        state: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        rows: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct ConvStateRollCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl ConvStateRollOp for ConvStateRollCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        state: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        rows: u32,
+        stream: &Stream,
+    ) {
+        let n = rows * conv_dim;
+        let args = crate::kernel_args![*x, *state, *row_start, *row_count, conv_dim, kernel, rows];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "conv_state_roll/cuda"
+    }
+}
+
+/// gated deltanet 递推：grid = rows×v_heads、block = v_dim（线程持 S[v][0..k_dim]）。
+/// 状态池属 executor（[rows, v_heads, v_dim, k_dim] f32，行号经 row_id 间接）
+pub trait DeltanetOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        a: &DevBuf,
+        b: &DevBuf,
+        a_log: &DevBuf,
+        dt_bias: &DevBuf,
+        state: &DevBuf,
+        core_out: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        row_id: &DevBuf,
+        n_rows: u32,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        l2_eps: f32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct DeltanetCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl DeltanetOp for DeltanetCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        a: &DevBuf,
+        b: &DevBuf,
+        a_log: &DevBuf,
+        dt_bias: &DevBuf,
+        state: &DevBuf,
+        core_out: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        row_id: &DevBuf,
+        n_rows: u32,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        l2_eps: f32,
+        stream: &Stream,
+    ) {
+        // 块几何自带：一 block = (行, v 头)，block 宽 = v_dim
+        let args = crate::kernel_args![*q, *k, *v, *a, *b, *a_log, *dt_bias, *state, *core_out,
+            *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps];
+        self.gpu.launch(&self.f, n_rows * v_heads, v_dim, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "deltanet/cuda"
+    }
+}
+
+/// 带门 RMSNorm（deltanet 输出）：w 是 F32 权重（Qwen3.5 checkpoint 原生）
+pub trait RmsNormGatedOp {
+    fn run(&self, x: &DevBuf, z: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct RmsNormGatedCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl RmsNormGatedOp for RmsNormGatedCuda<'_> {
+    fn run(&self, x: &DevBuf, z: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
+        let args = crate::kernel_args![*x, *z, *w, *out, hidden, eps, rows];
+        self.gpu.launch(&self.f, rows.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "rms_norm_gated/cuda"
+    }
+}
+
+/// 设备端行 argmax（greedy 采样）：全序归约确定，等值取小下标
+pub trait ArgmaxRowsOp {
+    /// x: [row_total, n] bf16；rows: [s] 采样的全局行号；scratch: [s,512] u32
+    fn run(&self, x: &DevBuf, rows: &DevBuf, scratch: &DevBuf, out: &DevBuf, n: u32, s: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct ArgmaxRowsCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl ArgmaxRowsOp for ArgmaxRowsCuda<'_> {
+    fn run(&self, x: &DevBuf, rows: &DevBuf, scratch: &DevBuf, out: &DevBuf, n: u32, s: u32, stream: &Stream) {
+        let args = crate::kernel_args![*x, *rows, *scratch, *out, n, s];
+        self.gpu.launch(&self.f, s, 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "argmax_rows/cuda"
     }
 }
 
@@ -442,6 +761,8 @@ impl PagedAttnOp for PagedAttnCuda<'_> {
 pub trait GemmOp {
     /// a: [m,k] / b: [k,n] / c: [m,n]，bf16 行主序
     fn run(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream);
+    /// C = A·Wᵀ：w 按存储 [n,k] 直读（nn.Linear 权重布局，I1 稳态形态）
+    fn run_wt(&self, a: &DevBuf, w: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream);
     fn name(&self) -> &'static str;
 }
 
@@ -453,6 +774,9 @@ pub struct GemmLt<'a> {
 impl GemmOp for GemmLt<'_> {
     fn run(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
         self.lt.gemm(a, b, c, m, n, k, stream)
+    }
+    fn run_wt(&self, a: &DevBuf, w: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        self.lt.gemm_wt(a, w, c, m, n, k, stream)
     }
     fn name(&self) -> &'static str {
         "gemm/cuda-lt"

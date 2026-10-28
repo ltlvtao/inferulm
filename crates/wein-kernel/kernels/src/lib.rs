@@ -18,7 +18,7 @@
 // 正确舍入原语直接走 intrinsics——语义等同 sqrt.rn.f32（冒烟风险登记项）
 #![feature(core_intrinsics)]
 
-use core::arch::nvptx::{_block_dim_x, _block_idx_x, _thread_idx_x};
+use core::arch::nvptx::{_block_dim_x, _block_idx_x, _syncthreads, _thread_idx_x};
 
 /// GPU 上没有展开——panic 即 trap（warp 死给驱动报，不挂整机）
 #[panic_handler]
@@ -124,6 +124,46 @@ fn rne(x: f32) -> f32 {
         fl
     } else {
         fl + 1.0
+    }
+}
+
+// ───────────────────── I1 竖切数值原语（deltanet 门控链） ─────────────────────
+// 与 reference.rs 同字面量同 Horner 序（位对齐纪律延伸到 log 域）：
+// softplus(x) = ln(1+e^x) 需要 log——atanh 级数 + 指数位分解的自控 log2。
+
+/// log2（自控）：位分解 z = 2^e·m（m∈[1,2)，>√2 折半）→ m 归一到
+/// [1/√2, √2) → atanh 级数（r=(m−1)/(m+1)≤0.1716，截到 r¹¹，误差 ~1e-11）。
+/// 输入域：softplus 喂的 z=1+e^x ∈ [1, 5e8]——无零/次正规担忧
+#[inline(always)]
+fn log2f(z: f32) -> f32 {
+    // √2 的最近 f32（0x3FB504F3）——与 reference 同字面量
+    const SQRT2: f32 = 1.4142135;
+    const LN2: f32 = 0.6931471805599453;
+    let bits = z.to_bits();
+    let e = ((bits >> 23) as i32) - 127;
+    let mut m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000); // [1, 2)
+    let mut e = e;
+    if m > SQRT2 {
+        m = m * 0.5;
+        e += 1;
+    }
+    let r = (m - 1.0) / (m + 1.0);
+    let r2 = r * r;
+    // atanh(r) = r·(1 + r²·(1/3 + r²·(1/5 + …r²·(1/11))))
+    let atanh = r
+        * (1.0 + r2 * (1.0 / 3.0 + r2 * (1.0 / 5.0 + r2 * (1.0 / 7.0 + r2 * (1.0 / 9.0 + r2 * (1.0 / 11.0))))));
+    // log2(m) = 2·atanh(r)/ln2
+    e as f32 + atanh * (2.0 / LN2)
+}
+
+/// softplus：x>20 直通（e^x 溢出保护，torch 同阈），否则 ln(1+e^x)
+#[inline(always)]
+fn softplus(x: f32) -> f32 {
+    const LN2: f32 = 0.6931471805599453;
+    if x > 20.0 {
+        x
+    } else {
+        log2f(1.0 + expf(x)) * LN2
     }
 }
 
@@ -440,5 +480,353 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
         }
         *out.add(qbase + e) = f32_to_bf16(acc / denom);
         e += 1;
+    }
+}
+
+// ───────────────────── I1 竖切算子（Qwen3.5 文本骨干） ─────────────────────
+// 零中心 norm / partial rope / 门控乘 / 深度因果卷积 / gated deltanet /
+// 带门 RMSNorm / 设备端 argmax——数值对齐纪律与上文同守。
+
+/// 零中心 RMSNorm（Qwen3.5 形态）：out = x·rsqrt(mean(x²)+eps)·(1+w)。
+/// 与 transformers Qwen3_5RMSNorm 同语义：norm 在 f32、(1+w) 在 f32、
+/// 单次收 bf16。行内顺序累加同 rms_norm
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn rms_norm_zc(
+    x: *const u16,
+    w: *const u16,
+    out: *mut u16,
+    hidden: u32,
+    eps: f32,
+    rows: u32,
+) {
+    let r = tid();
+    if r < rows {
+        let h = hidden as usize;
+        let base = (r as usize) * h;
+        let mut acc = 0.0f32;
+        let mut i = 0usize;
+        while i < h {
+            let v = bf16_to_f32(*x.add(base + i));
+            acc = v * v + acc;
+            i += 1;
+        }
+        let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
+        let mut i = 0usize;
+        while i < h {
+            let o = bf16_to_f32(*x.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
+            *out.add(base + i) = f32_to_bf16(o);
+            i += 1;
+        }
+    }
+}
+
+/// partial RoPE（单张量、每 token 一 pos、rotate_half、前 rot_dim 维旋转、
+/// 其余 pass-through 不触碰——out 可原地别名 x）。行 = tokens×heads 个
+/// head_dim 宽的头行。x: [tokens, heads, head_dim]
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn rope_pt(
+    x: *const u16,
+    cos: *const f32,
+    sin: *const f32,
+    pos: *const u32,
+    out: *mut u16,
+    rot_dim: u32,
+    head_dim: u32,
+    heads: u32,
+    tokens: u32,
+) {
+    let half = (rot_dim / 2) as usize;
+    let hd = head_dim as usize;
+    let row_pairs = heads as usize * half; // 每 token 的 (头,对) 数
+    let i = tid() as usize;
+    if i >= tokens as usize * row_pairs {
+        return;
+    }
+    let (t, rem) = (udiv(i, row_pairs), urem(i, row_pairs));
+    let p = urem(rem, half);
+    let row = t * (heads as usize * hd) + udiv(rem, half) * hd;
+    let ti = *pos.add(t) as usize;
+    let c = *cos.add(ti * half + p);
+    let s = *sin.add(ti * half + p);
+    let (x1, x2) = (bf16_to_f32(*x.add(row + p)), bf16_to_f32(*x.add(row + half + p)));
+    *out.add(row + p) = f32_to_bf16(x1 * c - x2 * s);
+    *out.add(row + half + p) = f32_to_bf16(x2 * c + x1 * s);
+}
+
+/// 门控乘（注意力输出门 / 任意 sigmoid 门）：out = x·sigmoid(g)。
+/// sigmoid = 1/(1+expf(−g))——自控 exp 路径，与 silu 同源
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn sigmul(
+    x: *const u16,
+    g: *const u16,
+    out: *mut u16,
+    n: u32,
+) {
+    let i = tid() as usize;
+    if i < n as usize {
+        let v = bf16_to_f32(*x.add(i));
+        let s = bf16_to_f32(*g.add(i));
+        *out.add(i) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-s))));
+    }
+}
+
+/// 深度wise 因果 conv1d（kernel=4，激活 silu）：varlen 批内每 token 依赖
+/// 同请求前 3 个 token（跨步接 conv_state）。一线程一 (token, channel)：
+/// out[t,c] = silu(Σ_k w[c,k]·tap_k)，tap 不足 3 步取 state_in。
+/// conv 结果先收 bf16 再 silu 收 bf16（torch conv→act 两级 round）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn conv1d_dw(
+    x: *const u16,        // [tokens, conv_dim]
+    w: *const u16,        // [conv_dim, kernel]
+    state_in: *const u16, // [rows, conv_dim, kernel-1]
+    out: *mut u16,        // [tokens, conv_dim]
+    tok_row: *const u32,  // [tokens] → 状态行
+    tok_pos: *const u32,  // [tokens] → 请求内局部位置
+    conv_dim: u32,
+    kernel: u32,
+    tokens: u32,
+) {
+    let cd = conv_dim as usize;
+    let ks = kernel as usize;
+    let st = ks - 1;
+    let i = tid() as usize;
+    if i >= tokens as usize * cd {
+        return;
+    }
+    let (g, c) = (udiv(i, cd), urem(i, cd));
+    let (row, p) = (*tok_row.add(g) as usize, *tok_pos.add(g) as i32);
+    let mut acc = 0.0f32;
+    let mut k = 0usize;
+    while k < ks {
+        let idx = p - (st as i32) + (k as i32); // 本请求内局部索引
+        let v = if idx < 0 {
+            bf16_to_f32(*state_in.add(row * cd * st + c * st + (idx + st as i32) as usize))
+        } else {
+            // g - p + idx = 请求内 idx 的全局 token 下标（同请求段连续）
+            bf16_to_f32(*x.add(((g as i32 - p + idx) as usize) * cd + c))
+        };
+        acc = v * bf16_to_f32(*w.add(c * ks + k)) + acc;
+        k += 1;
+    }
+    let conv = f32_to_bf16(acc);
+    let v = bf16_to_f32(conv);
+    *out.add(g * cd + c) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+}
+
+/// conv 状态滚动：state_out = 请求窗口（旧 state ++ 本段 x）的末 kernel-1 个。
+/// j 升序时读槽位恒 > 写槽位（见 count<3 移位分析）——原地安全
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn conv_state_roll(
+    x: *const u16,        // [tokens, conv_dim]
+    state: *mut u16,      // [rows, conv_dim, kernel-1] 原地
+    row_start: *const u32, // [rows] 本段起点（tokens 轴）
+    row_count: *const u32, // [rows] 本段 token 数
+    conv_dim: u32,
+    kernel: u32,
+    rows: u32,
+) {
+    let cd = conv_dim as usize;
+    let st = (kernel - 1) as usize;
+    let i = tid() as usize;
+    if i >= rows as usize * cd {
+        return;
+    }
+    let (r, c) = (udiv(i, cd), urem(i, cd));
+    let base = r * cd * st + c * st;
+    let mut j = 0usize;
+    while j < st {
+        let idx = *row_count.add(r) as i32 - (st as i32) + (j as i32);
+        *state.add(base + j) = if idx < 0 {
+            *state.add(base + (idx + st as i32) as usize)
+        } else {
+            *x.add(((*row_start.add(r) as i32 + idx) as usize) * cd + c)
+        };
+        j += 1;
+    }
+}
+
+/// gated deltanet（recurrent correctness-first）：一块 = (请求行, v 头)，
+/// 一线程一 v 维（线程私有 state 行 S[v][0..k_dim]，全局内存 L1 驻留）。
+/// 每 token：q/k 逐头 l2norm（f32，eps=1e-6）→ q 再除 √k_dim →
+/// S·=exp(g)；kv_mem=ΣS·k_n；delta=(v−kv_mem)·β；S+=k_n⊗delta；
+/// out=ΣS·q_ns——与 torch_recurrent_gated_delta_rule 逐步同序，
+/// 累加 j 升序；core out 收 bf16（norm/gate 在 rms_norm_gated 另做）。
+/// 门控标量：β=sigmoid(b)，g=−exp(A_log)·softplus(a+dt_bias)
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn deltanet(
+    q: *const u16,        // [tokens, k_heads, k_dim]
+    k: *const u16,        // [tokens, k_heads, k_dim]
+    v: *const u16,        // [tokens, v_heads, v_dim]
+    a: *const u16,        // [tokens, v_heads]
+    b: *const u16,        // [tokens, v_heads]
+    a_log: *const f32,    // [v_heads]
+    dt_bias: *const u16,  // [v_heads]
+    state: *mut f32,      // [rows, v_heads, v_dim, k_dim]（in/out）
+    core_out: *mut u16,   // [tokens, v_heads*v_dim]
+    row_start: *const u32, // [rows]
+    row_count: *const u32, // [rows]
+    row_id: *const u32,    // [rows] → state 行
+    n_rows: u32,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    l2_eps: f32,
+) {
+    let bid = _block_idx_x() as usize;
+    if bid >= n_rows as usize * v_heads as usize {
+        return;
+    }
+    let (r, h) = (udiv(bid, v_heads as usize), urem(bid, v_heads as usize));
+    let (kd, vd) = (k_dim as usize, v_dim as usize);
+    let vh = v_heads as usize;
+    // v 头 ↔ k 头：repeat_interleave（v_heads/k_heads 倍）→ h·kh/vh
+    let kh = h * k_heads as usize / vh;
+    let vv = _thread_idx_x() as usize; // 本线程拥有的 v 维
+    if vv >= vd {
+        return;
+    }
+    let big_a = expf(*a_log.add(h));
+    let dtb = bf16_to_f32(*dt_bias.add(h));
+    let srow = state.add(((*row_id.add(r) as usize) * vh + h) * vd * kd + vv * kd);
+    let st = *row_start.add(r) as usize;
+    let cnt = *row_count.add(r) as usize;
+    let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32); // 参考是除 √kd：q_n/kd**0.5
+    let mut i = 0usize;
+    while i < cnt {
+        let g = st + i;
+        // 每 token 标量门（各线程冗余算——同序同式位同）
+        let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
+        let beta = 1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))));
+        // q/k l2norm：各线程顺序扫（j 升序同参考）
+        let qb = (g * k_heads as usize + kh) * kd;
+        let mut sq = 0.0f32;
+        let mut sk = 0.0f32;
+        let mut j = 0usize;
+        while j < kd {
+            let qv = bf16_to_f32(*q.add(qb + j));
+            let kv = bf16_to_f32(*k.add(qb + j));
+            sq = qv * qv + sq;
+            sk = kv * kv + sk;
+            j += 1;
+        }
+        let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
+        let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
+        // S *= decay
+        let mut j = 0usize;
+        while j < kd {
+            *srow.add(j) = *srow.add(j) * decay;
+            j += 1;
+        }
+        // kv_mem = Σ_j S[v][j]·k_n[j]（j 升序）
+        let mut kvm = 0.0f32;
+        let mut j = 0usize;
+        while j < kd {
+            kvm = *srow.add(j) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+            j += 1;
+        }
+        let vin = bf16_to_f32(*v.add((g * vh + h) * vd + vv));
+        let delta = (vin - kvm) * beta;
+        // S[v][j] += k_n[j]·delta
+        let mut j = 0usize;
+        while j < kd {
+            *srow.add(j) = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + *srow.add(j);
+            j += 1;
+        }
+        // out[v] = Σ_j S[v][j]·(q_n[j]/√kd)——更新后读（同参考序）
+        let mut o = 0.0f32;
+        let mut j = 0usize;
+        while j < kd {
+            o = *srow.add(j) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+            j += 1;
+        }
+        *core_out.add((g * vh + h) * vd + vv) = f32_to_bf16(o);
+        i += 1;
+    }
+}
+
+/// 带门 RMSNorm（deltanet 输出，Qwen3_5RMSNormGated 语义）：
+/// h=f32(x)；xn=h·rsqrt(mean(h²)+eps)；xb=bf16(xn)（唯一中间 round）；
+/// xw=w_f32·f32(xb)（f32 不收）；out=bf16(xw·silu(f32(z)))——末级单 round
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn rms_norm_gated(
+    x: *const u16,     // [rows, hidden]（core out bf16）
+    z: *const u16,     // [rows, hidden]（z 门）
+    w: *const f32,     // [hidden]（F32 权重）
+    out: *mut u16,
+    hidden: u32,
+    eps: f32,
+    rows: u32,
+) {
+    let r = tid();
+    if r < rows {
+        let h = hidden as usize;
+        let base = (r as usize) * h;
+        let mut acc = 0.0f32;
+        let mut i = 0usize;
+        while i < h {
+            let v = bf16_to_f32(*x.add(base + i));
+            acc = v * v + acc;
+            i += 1;
+        }
+        let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
+        let mut i = 0usize;
+        while i < h {
+            let xb = f32_to_bf16(bf16_to_f32(*x.add(base + i)) * inv);
+            let xw = *w.add(i) * bf16_to_f32(xb);
+            let zv = bf16_to_f32(*z.add(base + i));
+            *out.add(base + i) = f32_to_bf16(xw * (zv * (1.0f32 / (1.0f32 + expf(-zv)))));
+            i += 1;
+        }
+    }
+}
+
+/// 设备端行 argmax（bf16 logits → u32 索引）：一块一行（256 线程跨步扫，
+/// 各线程局部最优 → 全局 scratch → syncthreads → 线程 0 全序挑选）。
+/// 全序 (值严格大，或相等下标小) 与扫描序无关——归约确定
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn argmax_rows(
+    x: *const u16,     // [row_total, n] bf16
+    rows: *const u32,  // [s] 采样的全局行号
+    scratch: *mut u32, // [s, 256]×2（val_bits, idx 对）
+    out: *mut u32,     // [s]
+    n: u32,
+    s: u32,
+) {
+    let blk = _block_idx_x() as usize;
+    if blk >= s as usize {
+        return;
+    }
+    let lane = _thread_idx_x() as usize; // < 256（block 恒 256）
+    let base = *rows.add(blk) as usize * n as usize;
+    let mut bv = f32::NEG_INFINITY;
+    let mut bi = 0xffffffffu32;
+    let mut i = lane;
+    while i < n as usize {
+        let v = bf16_to_f32(*x.add(base + i));
+        if v > bv || (v == bv && (i as u32) < bi) {
+            bv = v;
+            bi = i as u32;
+        }
+        i += 256;
+    }
+    let sb = scratch.add(blk * 512);
+    *sb.add(lane * 2) = bv.to_bits();
+    *sb.add(lane * 2 + 1) = bi;
+    _syncthreads();
+    if lane == 0 {
+        let mut bv = f32::NEG_INFINITY;
+        let mut bi = 0xffffffffu32;
+        let mut l = 0usize;
+        while l < 256 {
+            let v = f32::from_bits(*sb.add(l * 2));
+            let idx = *sb.add(l * 2 + 1);
+            if v > bv || (v == bv && idx < bi) {
+                bv = v;
+                bi = idx;
+            }
+            l += 1;
+        }
+        *out.add(blk) = bi;
     }
 }

@@ -307,3 +307,301 @@ pub fn mul(a: &[u16], b: &[u16]) -> Vec<u16> {
         .map(|(&x, &y)| f32_to_bf16(bf16_to_f32(x) * bf16_to_f32(y)))
         .collect()
 }
+
+// ───────────────────── I1 竖切镜像（Qwen3.5 文本骨干） ─────────────────────
+// 与 kernels/ 新增 8 入口逐一同序同字面量。log/softplus 是 deltanet 门控链
+// 的对数域原语——位对齐纪律延伸进来。
+
+/// log2 自控路径（与 kernels::log2f 同式）：位分解 → √2 折半 → atanh 级数
+/// 截到 r¹¹ → 2/ln2 缩放。输入域 [1, 5e8]（softplus 喂的 1+e^x）
+pub fn log2f(z: f32) -> f32 {
+    const SQRT2: f32 = 1.4142135;
+    const LN2: f32 = 0.6931471805599453;
+    let bits = z.to_bits();
+    let e = ((bits >> 23) as i32) - 127;
+    let mut m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    let mut e = e;
+    if m > SQRT2 {
+        m = m * 0.5;
+        e += 1;
+    }
+    let r = (m - 1.0) / (m + 1.0);
+    let r2 = r * r;
+    let atanh = r
+        * (1.0 + r2 * (1.0 / 3.0 + r2 * (1.0 / 5.0 + r2 * (1.0 / 7.0 + r2 * (1.0 / 9.0 + r2 * (1.0 / 11.0))))));
+    e as f32 + atanh * (2.0 / LN2)
+}
+
+/// softplus：x>20 直通（torch 同阈），否则 ln(1+e^x) = log2(1+e^x)·ln2
+pub fn softplus(x: f32) -> f32 {
+    const LN2: f32 = 0.6931471805599453;
+    if x > 20.0 {
+        x
+    } else {
+        log2f(1.0 + expf(x)) * LN2
+    }
+}
+
+/// 零中心 RMSNorm（Qwen3_5RMSNorm 同语义）：out = x·rsqrt(mean(x²)+eps)·(1+w)，
+/// f32 域单次收 bf16——与 kernel 逐步同序
+pub fn rms_norm_zc(x: &[u16], w: &[u16], rows: usize, hidden: usize, eps: f32) -> Vec<u16> {
+    let mut out = vec![0u16; rows * hidden];
+    for r in 0..rows {
+        let base = r * hidden;
+        let mut acc = 0.0f32;
+        for i in 0..hidden {
+            let v = bf16_to_f32(x[base + i]);
+            acc = v * v + acc;
+        }
+        let inv = 1.0f32 / ((acc / hidden as f32 + eps).sqrt());
+        for i in 0..hidden {
+            let o = bf16_to_f32(x[base + i]) * inv * (1.0 + bf16_to_f32(w[i]));
+            out[base + i] = f32_to_bf16(o);
+        }
+    }
+    out
+}
+
+/// partial RoPE（单张量 [tokens, heads, head_dim]，每 token 一 pos）：
+/// 前 rot_dim 维 rotate_half 旋转、其余不动——与 kernel 同式同序。
+/// cos/sin 表输入（表构造见 rope_table；注意 HF 把表收 bf16 再用——
+/// executor 上载前应先收 bf16 再回展 f32，两侧共用同一张表即对齐）
+pub fn rope_pt(
+    x: &[u16],
+    cos: &[f32],
+    sin: &[f32],
+    pos: &[u32],
+    rot_dim: usize,
+    head_dim: usize,
+    heads: usize,
+) -> Vec<u16> {
+    let half = rot_dim / 2;
+    let mut out = x.to_vec();
+    for t in 0..pos.len() {
+        let ti = pos[t] as usize;
+        for h in 0..heads {
+            let row = t * heads * head_dim + h * head_dim;
+            for p in 0..half {
+                let (c, s) = (cos[ti * half + p], sin[ti * half + p]);
+                let (x1, x2) = (bf16_to_f32(x[row + p]), bf16_to_f32(x[row + half + p]));
+                out[row + p] = f32_to_bf16(x1 * c - x2 * s);
+                out[row + half + p] = f32_to_bf16(x2 * c + x1 * s);
+            }
+        }
+    }
+    out
+}
+
+/// 门控乘：out = x·sigmoid(g)，sigmoid = 1/(1+expf(−g))——与 kernel 同式
+pub fn sigmul(x: &[u16], g: &[u16]) -> Vec<u16> {
+    x.iter()
+        .zip(g)
+        .map(|(&v, &s)| {
+            let (v, s) = (bf16_to_f32(v), bf16_to_f32(s));
+            f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-s))))
+        })
+        .collect()
+}
+
+/// 深度wise 因果 conv1d + silu（两段 round：conv 收 bf16、激活再收）。
+/// tap 序 k 升序与 kernel 同；不足 3 步取 state_in——与 kernel 同址同序
+pub fn conv1d_dw(
+    x: &[u16],             // [tokens, conv_dim]
+    w: &[u16],             // [conv_dim, kernel]
+    state_in: &[u16],      // [rows, conv_dim, kernel-1]
+    tok_row: &[u32],       // [tokens]
+    tok_pos: &[u32],       // [tokens]
+    conv_dim: usize,
+    kernel: usize,
+) -> Vec<u16> {
+    let st = kernel - 1;
+    let mut out = vec![0u16; tok_row.len() * conv_dim];
+    for g in 0..tok_row.len() {
+        let (row, p) = (tok_row[g] as usize, tok_pos[g] as i32);
+        for c in 0..conv_dim {
+            let mut acc = 0.0f32;
+            for k in 0..kernel {
+                let idx = p - st as i32 + k as i32;
+                let v = if idx < 0 {
+                    bf16_to_f32(state_in[row * conv_dim * st + c * st + (idx + st as i32) as usize])
+                } else {
+                    bf16_to_f32(x[((g as i32 - p + idx) as usize) * conv_dim + c])
+                };
+                acc = v * bf16_to_f32(w[c * kernel + k]) + acc;
+            }
+            let conv = f32_to_bf16(acc);
+            let v = bf16_to_f32(conv);
+            out[g * conv_dim + c] = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+        }
+    }
+    out
+}
+
+/// conv 状态滚动：new = (旧 state ++ 本段 x) 的末 kernel-1 个。
+/// 返回新状态（kernel 原地——读槽位恒未被本线程写过，语义等价）
+pub fn conv_state_roll(
+    x: &[u16],
+    state: &[u16],
+    row_start: &[u32],
+    row_count: &[u32],
+    conv_dim: usize,
+    kernel: usize,
+) -> Vec<u16> {
+    let st = kernel - 1;
+    let mut out = state.to_vec();
+    for r in 0..row_start.len() {
+        for c in 0..conv_dim {
+            let base = r * conv_dim * st + c * st;
+            for j in 0..st {
+                let idx = row_count[r] as i32 - st as i32 + j as i32;
+                out[base + j] = if idx < 0 {
+                    state[base + (idx + st as i32) as usize]
+                } else {
+                    x[((row_start[r] as i32 + idx) as usize) * conv_dim + c]
+                };
+            }
+        }
+    }
+    out
+}
+
+/// gated deltanet 递推参考（与 kernel 同步序）：每 (row, v_head) 持
+/// S[v][0..k_dim] f32；token 循环内 decay→kvm→delta→S 更新→输出，
+/// 全部 j 升序顺序累加；l2norm 后 q 再除 √k_dim（除法非倒数乘）
+#[allow(clippy::too_many_arguments)]
+pub fn deltanet(
+    q: &[u16],        // [tokens, k_heads, k_dim]
+    k: &[u16],        // [tokens, k_heads, k_dim]
+    v: &[u16],        // [tokens, v_heads, v_dim]
+    a: &[u16],        // [tokens, v_heads]
+    b: &[u16],        // [tokens, v_heads]
+    a_log: &[f32],    // [v_heads]
+    dt_bias: &[u16],  // [v_heads]
+    state: &mut [f32], // [rows, v_heads, v_dim, k_dim]（in/out）
+    row_start: &[u32],
+    row_count: &[u32],
+    row_id: &[u32],
+    k_heads: usize,
+    v_heads: usize,
+    k_dim: usize,
+    v_dim: usize,
+    l2_eps: f32,
+) -> Vec<u16> {
+    let kd_sqrt = (k_dim as f32).sqrt();
+    let total = row_start
+        .iter()
+        .zip(row_count)
+        .map(|(&s, &c)| (s + c) as usize)
+        .max()
+        .unwrap_or(0); // 覆盖所有行的最大 token 下标
+    let mut out = vec![0u16; total * v_heads * v_dim];
+    for r in 0..row_start.len() {
+        let st = row_start[r] as usize;
+        let cnt = row_count[r] as usize;
+        for h in 0..v_heads {
+            let kh = h * k_heads / v_heads; // repeat_interleave 映射
+            let big_a = expf(a_log[h]);
+            let dtb = bf16_to_f32(dt_bias[h]);
+            // S[vv][j]，镜像 kernel 的线程私有行
+            let sbase = (row_id[r] as usize * v_heads + h) * v_dim * k_dim;
+            let mut s = vec![0f32; v_dim * k_dim];
+            s.copy_from_slice(&state[sbase..sbase + v_dim * k_dim]);
+            for i in 0..cnt {
+                let g = st + i;
+                let decay = expf(0.0 - big_a * softplus(bf16_to_f32(a[g * v_heads + h]) + dtb));
+                let beta = 1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(b[g * v_heads + h])));
+                let qb = (g * k_heads + kh) * k_dim;
+                // l2norm（j 升序同 kernel）
+                let (mut sq, mut sk) = (0.0f32, 0.0f32);
+                for j in 0..k_dim {
+                    let qv = bf16_to_f32(q[qb + j]);
+                    let kv = bf16_to_f32(k[qb + j]);
+                    sq = qv * qv + sq;
+                    sk = kv * kv + sk;
+                }
+                let invq = 1.0f32 / ((sq + l2_eps).sqrt());
+                let invk = 1.0f32 / ((sk + l2_eps).sqrt());
+                for vv in 0..v_dim {
+                    let srow = &mut s[vv * k_dim..][..k_dim];
+                    for j in 0..k_dim {
+                        srow[j] *= decay;
+                    }
+                    let mut kvm = 0.0f32;
+                    for j in 0..k_dim {
+                        kvm = srow[j] * (bf16_to_f32(k[qb + j]) * invk) + kvm;
+                    }
+                    let vin = bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
+                    let delta = (vin - kvm) * beta;
+                    for j in 0..k_dim {
+                        srow[j] = (bf16_to_f32(k[qb + j]) * invk) * delta + srow[j];
+                    }
+                    let mut o = 0.0f32;
+                    for j in 0..k_dim {
+                        o = srow[j] * ((bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                    }
+                    out[(g * v_heads + h) * v_dim + vv] = f32_to_bf16(o);
+                }
+            }
+            state[sbase..sbase + v_dim * k_dim].copy_from_slice(&s);
+        }
+    }
+    out
+}
+
+/// 带门 RMSNorm（Qwen3_5RMSNormGated 同语义）：xb=bf16(x·inv)（唯一中间
+/// round），xw=w_f32·f32(xb) 不收，末级 xw·silu(z) 单次收 bf16
+pub fn rms_norm_gated(x: &[u16], z: &[u16], w: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<u16> {
+    let mut out = vec![0u16; rows * hidden];
+    for r in 0..rows {
+        let base = r * hidden;
+        let mut acc = 0.0f32;
+        for i in 0..hidden {
+            let v = bf16_to_f32(x[base + i]);
+            acc = v * v + acc;
+        }
+        let inv = 1.0f32 / ((acc / hidden as f32 + eps).sqrt());
+        for i in 0..hidden {
+            let xb = f32_to_bf16(bf16_to_f32(x[base + i]) * inv);
+            let xw = w[i] * bf16_to_f32(xb);
+            let zv = bf16_to_f32(z[base + i]);
+            out[base + i] = f32_to_bf16(xw * (zv * (1.0f32 / (1.0f32 + expf(-zv)))));
+        }
+    }
+    out
+}
+
+/// 行 argmax 参考（bf16 → f32 比较，全序：值严格大或相等取小下标）。
+/// kernel 是跨步扫描+块内归约——全序保证与镜像的单遍扫描结果恒同
+pub fn argmax_rows(x: &[u16], rows: &[u32], n: usize) -> Vec<u32> {
+    rows.iter()
+        .map(|&r| {
+            let base = r as usize * n;
+            let mut bv = f32::NEG_INFINITY;
+            let mut bi = 0xffffffffu32;
+            for i in 0..n {
+                let v = bf16_to_f32(x[base + i]);
+                if v > bv || (v == bv && (i as u32) < bi) {
+                    bv = v;
+                    bi = i as u32;
+                }
+            }
+            bi
+        })
+        .collect()
+}
+
+/// GEMM 参考的 weight-transposed 形态（gemm_wt 对拍基准）：C[m,n] =
+/// A[m,k]·Wᵀ，W 按存储 [n,k] 直读——f64 累加（厂商库容差模式，g7）
+pub fn gemm_wt(a: &[u16], w: &[u16], m: usize, n: usize, k: usize) -> Vec<f64> {
+    let mut c = vec![0f64; m * n];
+    for r in 0..m {
+        for col in 0..n {
+            let mut acc = 0f64;
+            for i in 0..k {
+                acc += bf16_to_f32(a[r * k + i]) as f64 * bf16_to_f32(w[col * k + i]) as f64;
+            }
+            c[r * n + col] = acc;
+        }
+    }
+    c
+}

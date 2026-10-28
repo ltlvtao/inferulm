@@ -63,10 +63,19 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry embed("), "embed 入口缺失/被改名");
     assert!(ptx.contains(".entry add("), "add 入口缺失/被改名");
     assert!(ptx.contains(".entry mul("), "mul 入口缺失/被改名");
+    // I1 竖切（Qwen3.5 文本骨干）八入口
+    assert!(ptx.contains(".entry rms_norm_zc("), "rms_norm_zc 入口缺失/被改名");
+    assert!(ptx.contains(".entry rope_pt("), "rope_pt 入口缺失/被改名");
+    assert!(ptx.contains(".entry sigmul("), "sigmul 入口缺失/被改名");
+    assert!(ptx.contains(".entry conv1d_dw("), "conv1d_dw 入口缺失/被改名");
+    assert!(ptx.contains(".entry conv_state_roll("), "conv_state_roll 入口缺失/被改名");
+    assert!(ptx.contains(".entry deltanet("), "deltanet 入口缺失/被改名");
+    assert!(ptx.contains(".entry rms_norm_gated("), "rms_norm_gated 入口缺失/被改名");
+    assert!(ptx.contains(".entry argmax_rows("), "argmax_rows 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        11,
-        "导出 kernel 数应为 11（多了说明编译单元混入了别的入口）"
+        19,
+        "导出 kernel 数应为 19（多了说明编译单元混入了别的入口）"
     );
 }
 

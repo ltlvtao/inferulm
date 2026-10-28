@@ -27,6 +27,8 @@ const CUBLAS_COMPUTE_32F: i32 = 68;
 const LAYOUT_ORDER: i32 = 1; // cublasLtMatrixLayoutAttributes_t::ORDER
 const ORDER_ROW: u32 = 1; // cublasLtOrder_t::ROW
 const PREF_MAX_WORKSPACE: i32 = 1; // MatmulPreference::MAX_WORKSPACE_BYTES
+const MATMUL_DESC_TRANSB: i32 = 4; // cublasLtMatmulDescAttributes_t::TRANSB
+const OP_T: u32 = 1; // cublasOperation_t::CUBLAS_OP_T
 const WS_BYTES: usize = 32 << 20;
 
 /// 启发式结果（cublasLtMatmulHeuristicResult_t，repr(C) 对齐 ABI）
@@ -58,6 +60,7 @@ struct LtFns {
     desc_create: unsafe extern "C" fn(*mut *mut c_void, i32, i32) -> u32,
     layout_create: unsafe extern "C" fn(*mut *mut c_void, i32, u64, u64, i64) -> u32,
     layout_set: unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32,
+    desc_set: unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32,
     pref_create: unsafe extern "C" fn(*mut *mut c_void) -> u32,
     pref_set: unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32,
     heuristic: unsafe extern "C" fn(
@@ -78,8 +81,9 @@ pub struct BlasLt<'a> {
     ws: DevBuf<'a>,
     fns: LtFns,
     handle: *mut c_void,
-    /// 形状 → 解析产物（desc/layouts/algo）；命中即纯 launch
-    cache: RefCell<HashMap<(u32, u32, u32), ShapePlan>>,
+    /// 形状 → 解析产物（desc/layouts/algo）；命中即纯 launch。
+    /// key 的 bool 位 = weight 转置形态（gemm_wt）
+    cache: RefCell<HashMap<(u32, u32, u32, bool), ShapePlan>>,
 }
 
 macro_rules! sym {
@@ -118,6 +122,7 @@ impl BlasLt<'_> {
                 desc_create: sym!(lib, "cublasLtMatmulDescCreate", unsafe extern "C" fn(*mut *mut c_void, i32, i32) -> u32),
                 layout_create: sym!(lib, "cublasLtMatrixLayoutCreate", unsafe extern "C" fn(*mut *mut c_void, i32, u64, u64, i64) -> u32),
                 layout_set: sym!(lib, "cublasLtMatrixLayoutSetAttribute", unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32),
+                desc_set: sym!(lib, "cublasLtMatmulDescSetAttribute", unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32),
                 pref_create: sym!(lib, "cublasLtMatmulPreferenceCreate", unsafe extern "C" fn(*mut *mut c_void) -> u32),
                 pref_set: sym!(lib, "cublasLtMatmulPreferenceSetAttribute", unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> u32),
                 heuristic: sym!(lib, "cublasLtMatmulAlgoGetHeuristic", unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, *mut HeuristicResult, *mut i32) -> u32),
@@ -145,7 +150,27 @@ impl BlasLt<'_> {
 
     /// C = A·B（bf16 入出，f32 累加）。首次形状走 heuristic 解析并缓存
     pub fn gemm(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
-        let plan = self.plan(m, n, k);
+        self.launch_mm(a, b, c, m, n, k, self.plan(m, n, k, false), stream);
+    }
+
+    /// C = A·Wᵀ：W 按存储 [n,k] 行主序直读（nn.Linear 权重布局——模型
+    /// 投影的稳态形态，免转置拷贝）。desc 设 TRANSB=T，B layout 描述
+    /// 存储体 n×k、op 后成 k×n
+    pub fn gemm_wt(&self, a: &DevBuf, w: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        self.launch_mm(a, w, c, m, n, k, self.plan(m, n, k, true), stream);
+    }
+
+    fn launch_mm(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        m: u32,
+        n: u32,
+        k: u32,
+        plan: ShapePlan,
+        stream: &Stream,
+    ) {
         let (alpha, beta) = (1.0f32, 0.0f32);
         let st = unsafe {
             (self.fns.matmul)(
@@ -172,29 +197,42 @@ impl BlasLt<'_> {
 
     /// 形状解析：desc + 三 layout（ROW_ORDER）+ preference(工作区) +
     /// heuristic 首个可用 algo——全部一次性，缓存复用
-    fn plan(&self, m: u32, n: u32, k: u32) -> ShapePlan {
-        if let Some(p) = self.cache.borrow().get(&(m, n, k)) {
+    fn plan(&self, m: u32, n: u32, k: u32, wt: bool) -> ShapePlan {
+        if let Some(p) = self.cache.borrow().get(&(m, n, k, wt)) {
             return *p;
         }
-        let plan = self.resolve_plan(m, n, k);
-        self.cache.borrow_mut().insert((m, n, k), plan);
+        let plan = self.resolve_plan(m, n, k, wt);
+        self.cache.borrow_mut().insert((m, n, k, wt), plan);
         plan
     }
 
-    fn resolve_plan(&self, m: u32, n: u32, k: u32) -> ShapePlan {
+    fn resolve_plan(&self, m: u32, n: u32, k: u32, wt: bool) -> ShapePlan {
         unsafe {
             let f = &self.fns;
-            // desc：compute 32F + scale f32；opA/opB 默认 N（不显式设）
+            // desc：compute 32F + scale f32；opA 默认 N；wt 形态 opB=T
             let mut desc = std::ptr::null_mut();
             assert_eq!((f.desc_create)(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), 0, "desc_create");
+            if wt {
+                assert_eq!(
+                    (f.desc_set)(desc, MATMUL_DESC_TRANSB, &OP_T as *const u32 as *const c_void, 4),
+                    0,
+                    "desc TRANSB=T"
+                );
+            }
             let mk_layout = |rows: u64, cols: u64, ld: i64| -> *mut c_void {
                 let mut lay = std::ptr::null_mut();
                 assert_eq!((f.layout_create)(&mut lay, CUDA_R_16BF, rows, cols, ld), 0, "layout_create");
                 assert_eq!((f.layout_set)(lay, LAYOUT_ORDER, &ORDER_ROW as *const u32 as *const c_void, 4), 0, "layout ORDER=ROW");
                 lay
             };
-            let (lay_a, lay_b, lay_c) = (mk_layout(m as u64, k as u64, k as i64),
-                mk_layout(k as u64, n as u64, n as i64), mk_layout(m as u64, n as u64, n as i64));
+            // wt：B 按存储 n×k 描述（ld=k），TRANSB 后成 k×n 参与乘法
+            let lay_b = if wt {
+                mk_layout(n as u64, k as u64, k as i64)
+            } else {
+                mk_layout(k as u64, n as u64, n as i64)
+            };
+            let (lay_a, lay_c) =
+                (mk_layout(m as u64, k as u64, k as i64), mk_layout(m as u64, n as u64, n as i64));
             let mut pref = std::ptr::null_mut();
             assert_eq!((f.pref_create)(&mut pref), 0, "pref_create");
             let ws = WS_BYTES as u64;
