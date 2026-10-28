@@ -1,0 +1,16 @@
+{
+  "config": {
+    "concurrency": 100,
+    "num": 20000
+  },
+  "mode": "flood GET /v1/models",
+  "result": {
+    "errors": 0,
+    "latency_ms": {
+      "p50": 0.520536,
+      "p99": 1.5807410000000002
+    },
+    "qps": 133484.34595370202,
+    "wall_s": 0.149830303
+  }
+}

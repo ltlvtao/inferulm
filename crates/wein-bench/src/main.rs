@@ -62,6 +62,57 @@ fn percentile(mut v: Vec<f64>, p: f64) -> f64 {
     v[idx]
 }
 
+/// GET /v1/models 洪泛：量 router（accept/parse/route/小 JSON 响应）的 QPS 上限。
+async fn flood(args: &Args) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let url = format!("{}/v1/models", args.url);
+    for _ in 0..20 {
+        let _ = client.get(&url).send().await;
+    }
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+    let wall0 = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..args.num {
+        let sem = sem.clone();
+        let client = client.clone();
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let t0 = Instant::now();
+            let ok = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
+            (ok, t0.elapsed().as_secs_f64() * 1e3)
+        }));
+    }
+    let results = futures::future::join_all(handles).await.into_iter().map(|h| h.unwrap()).collect::<Vec<_>>();
+    let wall = wall0.elapsed().as_secs_f64();
+
+    let lat: Vec<f64> = results.iter().map(|(_, ms)| *ms).collect();
+    let errors = results.iter().filter(|(ok, _)| !ok).count();
+    let qps = args.num as f64 / wall;
+    let report = json!({
+        "mode": "flood GET /v1/models",
+        "config": {"concurrency": args.concurrency, "num": args.num},
+        "result": {
+            "errors": errors,
+            "qps": qps,
+            "latency_ms": {"p50": percentile(lat.clone(), 0.50), "p99": percentile(lat.clone(), 0.99)},
+            "wall_s": wall,
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        eprintln!("report written to {path}");
+    }
+    if errors > 0 {
+        std::process::exit(1);
+    }
+}
+
 async fn one_request(client: &reqwest::Client, url: &str, model: &str, max_tokens: u32) -> ReqStat {
     let mut stat = ReqStat::default();
     let t0 = Instant::now();
@@ -135,6 +186,13 @@ async fn one_request(client: &reqwest::Client, url: &str, model: &str, max_token
 #[tokio::main]
 async fn main() {
     let args = parse_args();
+
+    // --flood：纯路由吞吐上限测量（GET /v1/models，不进引擎）。
+    // 回答"router 本身能跑多少 QPS"——与流式 token 泵是两种工况。
+    if std::env::args().any(|a| a == "--flood") {
+        return flood(&args).await;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
