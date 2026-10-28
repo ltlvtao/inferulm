@@ -25,8 +25,11 @@ curl -N localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 
 # 并发性能验收（今天打 mock，之后打真实引擎——同一把尺子）
 cargo run -p wein-bench -- --url http://127.0.0.1:8080 --concurrency 100 --num 200 \
-  --max-tokens 32 --warmup \
+  --max-tokens 32 --repeat 3 --warmup \
   --smoke "ttft_p99_ms<=100;itl_p99_ms<=20;tps_min>=5000;errors_max<=0"
+
+# 性能基线电池（归因阶梯 L0/L1/L1'，报告入 bench-reports/battery-*/，方法论见 bench-reports/BASELINE.md）
+bench/battery.sh release
 ```
 
 ## TDD 推进路线（外→内，每层验收先行）
