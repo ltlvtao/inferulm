@@ -1,0 +1,14 @@
+[package]
+name = "wein-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 纯 CPU 侧：模型配置 / safetensors 权重目录 / tokenizer 接线。
+# 不依赖 workspace 内任何 crate（依赖阶梯：serve→engine→{sched,memory,exec,model}→kernel→platform），
+# 也不依赖 GPU——设备上载是 wein-exec 的事。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = "0.9"
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "esaxx_fast"] }
