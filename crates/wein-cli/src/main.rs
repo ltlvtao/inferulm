@@ -24,6 +24,7 @@ fn main() {
     let port: u16 = arg(&args, "--port", "8080").parse().unwrap();
     let model = arg(&args, "--model", "mock-model");
     let engine_kind = arg(&args, "--engine", "mock");
+    let exec_kind = arg(&args, "--exec", "scripted");
     let prefill_ms: u64 = arg(&args, "--prefill-delay-ms", "2").parse().unwrap();
     let token_ms: u64 = arg(&args, "--token-delay-ms", "1").parse().unwrap();
 
@@ -40,7 +41,7 @@ fn main() {
         // 块容量按 bench 负载给宽裕值——量的是记账开销，不制造抢占噪声）
         let engine: EngineHandle = match engine_kind.as_str() {
             "core" => {
-                let mut cfg = CoreConfig::scripted(pieces, Duration::from_millis(token_ms));
+                let mut cfg = CoreConfig::scripted(pieces.clone(), Duration::from_millis(token_ms));
                 if args.iter().any(|a| a == "--memory") {
                     cfg.memory = Some(wein_memory::state::MemConfig {
                         block_size: 16,
@@ -48,7 +49,18 @@ fn main() {
                         low_watermark: 0.1,
                     });
                 }
-                EngineCore::spawn(cfg).0
+                if exec_kind == "toy" {
+                    // 真 exec：DeviceSession + toy 模型（L3 归因电池）。
+                    // 组装在 cli 层——engine 不依赖 exec（§2 依赖单向）
+                    let toy = wein_exec::ToyExecutor::open(wein_exec::ToyConfig::default())
+                        .unwrap_or_else(|e| {
+                            eprintln!("toy exec 打开失败：{e}");
+                            std::process::exit(1)
+                        });
+                    EngineCore::spawn_with(cfg, Box::new(toy)).0
+                } else {
+                    EngineCore::spawn(cfg).0
+                }
             }
             _ => MockEngine::spawn(MockScript {
                 prefill_delay: Duration::from_millis(prefill_ms),
@@ -63,7 +75,8 @@ fn main() {
             .await
             .expect("bind failed");
         let mem_tag = if args.iter().any(|a| a == "--memory") { "+memory" } else { "" };
-        println!("wein ({engine_kind}{mem_tag}) listening on http://{addr}  model={model}");
+        let exec_tag = if engine_kind == "core" && exec_kind == "toy" { "+toy" } else { "" };
+        println!("wein ({engine_kind}{mem_tag}{exec_tag}) listening on http://{addr}  model={model}");
         tokio::signal::ctrl_c().await.ok();
     });
 }

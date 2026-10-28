@@ -9,6 +9,7 @@ members = [
     "crates/wein-cli",
     "crates/wein-bench",
     "crates/wein-kernel",
+    "crates/wein-exec",
 ]
 exclude = [
     # kernels/ 由 wein-kernel/build.rs 以独立 cargo 调用构建（nvptx64 目标 + build-std），

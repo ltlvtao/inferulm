@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 wein-engine = { path = "../wein-engine" }
+wein-exec = { path = "../wein-exec" }
 wein-memory = { path = "../wein-memory" }
 wein-serve = { path = "../wein-serve" }
 tokio = { workspace = true }

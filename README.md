@@ -5,7 +5,7 @@
 设计文档见 [`../design/`](../design/)（01-strategy / 02-architecture）。
 开发方法：**TDD 外→内**——验收用例先于实现，从 serve 层向内核层推进。
 
-## 当前状态（M0 第五层：trait Op 注册表 + wein-platform 最小面）
+## 当前状态（M0 第七层：exec 真身——DeviceSession + toy 模型 + cuBLASLt）
 
 - `wein-serve`：OpenAI-compatible HTTP/SSE（chat/completions + completions + models），增量 detokenizer（UTF-8 边界安全），stop 参数截断 + 引擎取消，断连自动取消
 - `wein-sched`：统一 token 预算调度器（纯逻辑零依赖）——无 prefill/decode phase（token 债统一建模）、chunked prefill、抢占 = recompute（债 = prompt + 已生成）、FIFO 准入、BatchBuffer 增量 op、DeferredRelease；容量侧可插拔（`CapacityModel`，默认聚合 token 模型）
@@ -13,6 +13,7 @@
 - `wein-memory`：paged KV 布局 / BlockPool（LIFO + rc + DeferredRelease + 水位）/ radix 前缀缓存（pin 驱逐免疫，LRU 级联驱逐）/ req_to_token / `MemState` 容量语义——零依赖 crate，经引擎侧 `PoolCapacity` 适配器接入 `CapacityModel` 钩子
 - `wein-kernel`：cuda 冒烟（§13-2 三线全过）——`kernels/` 子 crate 纯 Rust→PTX（nightly + abi_ptx/stdarch_nvptx feature，无 nvcc）+ dlopen(libcuda) 最小 Driver API 面（零 toolkit 依赖）+ 高层 Gpu/Module/Func/Stream/DevBuf；**trait Op 注册表**（§4）：启动时按 `HardwareProfile` resolve 一次 → `OpTable` 具体类型槽位（无 Box<dyn>/字符串查表），失败 = Degrade 三元组；**M0 算子清单七算子齐**（rms_norm/rope/silu/W8A8 动态量化/KV scatter/varlen paged attention 全 GPU↔CPU golden 位对齐；**GEMM 走 cuBLASLt**（§4 标准算子走厂商库）：dlopen 零构建依赖、形状粒度 algo 缓存、容差对齐模式）+ CPU 参考实现（`reference`，独立代码路径）+ golden vector 框架（每算子一文件，cuda/asc 共享，§4）；**exp/RNE 自控数值路径**（exp2 多项式、round-half-even 位实现——禁 MUFU 近似与默认 round）
 - `wein-platform`：三层能力模型（§3）——`Device` PCI vendor 零依赖探测（无任何 vendor SDK）/ `HardwareProfile` 不可变画像（supports + block_size 平台注入：CUDA 16 / 昇腾 128）/ `Degrade` 声明式降级三元组（不隐式硬改配置的类型化载体）
+- `wein-exec`：exec 层真身——`DeviceSession`（探测→画像→`OpTable::resolve`→流，一次装配全程只读）+ `ToyExecutor`（单块 toy 模型：M0 算子清单全走真路径、KV 进 BlockPool 分页池、host 贪心 argmax；实现 engine 的 `Executor`，组装经 `EngineCore::spawn_with` 发生在 cli 层）+ 独立 CPU 镜像（x2 数值诚实对照端）；调度合同钉死：追平步段尾采样 / 纯 decode 前向 seq 尾 / 空 prompt 落 BOS / 抢占清前向游标重放
 - `wein-cli`：`wein serve --mock` 起 mock 服务
 - `wein-bench`：并发性能验收工具（TTFT/ITL/吞吐 + smoke 阈值门禁）
 
@@ -32,7 +33,7 @@ cargo run -p wein-bench -- --url http://127.0.0.1:8080 --concurrency 100 --num 2
   --max-tokens 32 --repeat 3 --warmup \
   --smoke "ttft_p99_ms<=100;itl_p99_ms<=20;tps_min>=5000;errors_max<=0"
 
-# 性能基线电池（归因阶梯 L0/L1/L1'/L2/L2'/L2m，报告入 bench-reports/battery-*/，方法论见 bench-reports/BASELINE.md）
+# 性能基线电池（归因阶梯 L0/L1/L1'/L2/L2'/L2m/L3，报告入 bench-reports/battery-*/，方法论见 bench-reports/BASELINE.md）
 bench/battery.sh release
 ```
 
@@ -45,10 +46,11 @@ bench/battery.sh release
 5. **trait Op 注册表** ✅：`OpTable` 启动时 resolve（arch 档位裁决，o1/o3 确定性；o2 无卡 Err = Degrade 三元组）+ 首算子 `rms_norm`（同一 kernel 双 launch 档位，o5 两档 golden 位一致）+ golden vector 框架（o6 缺失生成/回读对拍/漂移须显式重生成；asc 接入复用同一文件）+ `wein-platform` 最小面（pf1-pf3）；**数值对齐纪律**：只正确舍入原语、行内顺序累加、bf16→f32 精确——o4 GPU↔CPU 参考位对齐一次达成
 6. **M0 算子清单** ✅（o7-o13）：五算子齐入表——rope（half-split，cos/sin 表为输入图捕获友好）/ silu（sigmoid 走**自控 exp2 多项式**，两侧同字面量同 Horner 序）/ W8A8 动态量化（逐 token amax→RNE 半偶，i8+f32 scale 双输出位对齐）/ KV scatter（页表寻址跨块写，与 memory 层 token 记账同构；"未触及槽位不碰"语义在对拍中钉死）/ varlen paged attention（GQA、因果、两遍法 correctness-first，W2 flash 分块）；exp/RNE 均自控实现（禁 MUFU 近似/默认 round）——**o8/o9/o12 位对齐一次达成**；k2 抓住运行数整除的 panic 桩 call（换 unchecked_div/rem）与数组下标检查（换裸指针）
 7. **cuBLASLt 最小 FFI** ✅（g1-g6）：dlopen libcublasLt（pip wheel 提取到 `vendor/`，`WEIN_CUBLASLT` 可覆盖）+ bf16 入出/f32 累加（tensor core）+ 每形状 desc/layout/heuristic 解析一次缓存 + 库缺 = Degrade；**容差对齐**（f64 参考 ± 1 bf16 ulp，实测最差 69% 容差占用）+ 重跑位确定 + 2048³ 吞吐 canary **125.6 TFLOPS**（BASELINE §7）——golden 框架自此两模式：自控算子位对齐 / 厂商库算子容差
-8. 逐层替换 mock，验收套件始终不变——后续：`Executor` 从 ScriptedExecutor 换真实 exec 线程（OpTable 接进引擎）、Qwen3.5 竖切（I1）
+8. **exec 真身** ✅（x1-x7）：三骨架算子（embed gather / 残差 add / 门控 mul，o14 位对齐）补齐十槽；`ToyExecutor` 把 OpTable + cuBLASLt + BlockPool 分页 KV 接进引擎（`spawn_with` 组装在 cli，依赖单向无环）；**x2 设备↔CPU 镜像逐位相等**（K=128 的 TC f32 累加误差被 bf16 网格吸收，容差 0% 占用）；x3 双执行器确定性；x4 位置敏感（rope 真接线）；x5 跨页 KV（40 token → 3 页）；x6 引擎集成零漂移 + 取消 Aborted；x7 步时延金丝雀（批 4 decode 中位 ~1.3ms，对照 launch 4.69µs——exec 层优化账本翻开）。**真发现 ×2**：① CUDA context 线程局部——engine 任务跨 worker 迁移须 `bind_thread`；② `step_delay=0` 时 `sleep(ZERO)` 立即就绪不 yield，单线程 runtime 里引擎任务饿死同行任务（x6 用 multi_thread flavor 钉死）
+9. 后续：Qwen3.5 竖切（I1：safetensors 权重加载 + tokenizers + 一层真前向）、图捕获 NONE→FIG（W2）
 
 ## 规约
 
-- 依赖只许向下：`serve → engine → {sched, memory, exec, model} → kernel → platform`（02-architecture §2）
+- 依赖只许向下：`serve/cli → engine → {sched, memory} → kernel → platform`；exec 实现 engine 的 trait（exec→engine 单向），组装在 serve/cli 层（02-architecture §2 无环）
 - 引擎边界只经 `EngineHandle::{submit, cancel}` + 事件流，禁止旁路
 - 每个集成里程碑跑一次 `wein-bench` 并把 JSON 报告归档

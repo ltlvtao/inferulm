@@ -26,8 +26,8 @@
 //! W2 flash 分块 / 多头并行时 golden 不变，重对拍即可。
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
-    GemmOp, KvScatterOp, OpTable, PagedAttnOp, RopeOp, RmsNormOp, SiluOp,
-    W8A8QuantOp,
+    AddOp, EmbedOp, GemmOp, KvScatterOp, MulOp, OpTable, PagedAttnOp, RopeOp,
+    RmsNormOp, SiluOp, W8A8QuantOp,
 };
 use wein_kernel::reference;
 use wein_platform::{Device, HardwareProfile};
@@ -70,6 +70,9 @@ fn o7_op_table_all_m0_slots() {
     assert_eq!(t.kv_scatter.name(), "kv_scatter/cuda");
     assert_eq!(t.paged_attn.name(), "paged_attn/cuda");
     assert_eq!(t.gemm.name(), "gemm/cuda-lt");
+    assert_eq!(t.embed.name(), "embed/cuda");
+    assert_eq!(t.add.name(), "add/cuda");
+    assert_eq!(t.mul.name(), "mul/cuda");
 }
 
 /// o8 · rope 位对齐：half-split（Llama/Qwen），位置含空隙（表寻址真值）
@@ -358,6 +361,47 @@ fn o13_golden_files_roundtrip_m0() {
             g.bpr as u32, g.block_size as u32, g.q_heads as u32, g.kv_heads as u32, g.head_dim as u32, tokens as u32, &stream);
         stream.sync();
         assert_bits("paged_attn golden", &dout.read_to_vec(), &g.out);
+    }
+}
+
+/// o14 · exec 骨架三算子位对齐：embed gather（路由查表）/ add（残差）/
+/// mul（silu×up）——全逐元素无归约，位对齐模式（自控 kernel 侧）
+#[test]
+fn o14_embed_add_mul_golden_bitwise() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    // embed：vocab 256 × hidden 128，取乱序 id（含重复 id——gather 纯读）
+    let (vocab, hidden) = (256usize, 128usize);
+    let w: Vec<u16> = (0..(vocab * hidden) as u64)
+        .map(|i| reference::f32_to_bf16(reference::splitmix_f32(i)))
+        .collect();
+    let ids: Vec<u32> = vec![0, 5, 255, 17, 5];
+    let mut expect = vec![0u16; ids.len() * hidden];
+    for (t_, &id) in ids.iter().enumerate() {
+        expect[t_ * hidden..(t_ + 1) * hidden].copy_from_slice(&w[id as usize * hidden..][..hidden]);
+    }
+    let (dw, did) = (gpu.alloc_from_slice(&w), gpu.alloc_from_slice(&ids));
+    let dout = gpu.alloc_bytes(ids.len() * hidden * 2);
+    t.embed.run(&did, &dw, &dout, hidden as u32, ids.len() as u32, &stream);
+    stream.sync();
+    assert_bits("embed", &dout.read_to_vec(), &expect);
+
+    // add / mul：n=1000（非 block 整数倍之外再取 n=4097 一组）
+    for n in [1000usize, 4097] {
+        let a: Vec<u16> = (0..n as u64).map(|i| reference::f32_to_bf16(reference::splitmix_f32(i ^ 0x1111) * 3.0)).collect();
+        let b: Vec<u16> = (0..n as u64).map(|i| reference::f32_to_bf16(reference::splitmix_f32(i ^ 0x2222) * 3.0)).collect();
+        let (ea, em): (Vec<u16>, Vec<u16>) = (
+            (0..n).map(|i| reference::f32_to_bf16(reference::bf16_to_f32(a[i]) + reference::bf16_to_f32(b[i]))).collect(),
+            (0..n).map(|i| reference::f32_to_bf16(reference::bf16_to_f32(a[i]) * reference::bf16_to_f32(b[i]))).collect(),
+        );
+        let (da, db) = (gpu.alloc_from_slice(&a), gpu.alloc_from_slice(&b));
+        let (o1, o2) = (gpu.alloc_bytes(n * 2), gpu.alloc_bytes(n * 2));
+        t.add.run(&da, &db, &o1, n as u32, &stream);
+        t.mul.run(&da, &db, &o2, n as u32, &stream);
+        stream.sync();
+        assert_bits(&format!("add n={n}"), &o1.read_to_vec(), &ea);
+        assert_bits(&format!("mul n={n}"), &o2.read_to_vec(), &em);
     }
 }
 

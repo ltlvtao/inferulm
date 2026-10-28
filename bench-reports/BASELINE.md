@@ -16,7 +16,7 @@
 | **L2 engine core** | 调度决策 + 批组装开销 | 真调度器 + 脚本执行器（`--engine core --token-delay-ms 0`） | TTFT p50/p99、ITL mean | ✅ 在测（schedule_ns 细粒度插桩待 exec 层，现用 EngineStats.steps 计数） |
 | **L2' 节拍泵(调度器)** | 真调度器下的端到端 | 1ms/步 | ITL mean（与 L1' 之差 = 调度层叠加开销） | ✅ 在测 |
 | **L2m 内存层记账** | BlockPool 水位/radix/DeferredRelease 的热路径成本 | `--engine core --memory --token-delay-ms 0` | ITL mean（与 L2 之差 = 内存层叠加开销） | ✅ 在测 |
-| L3 exec/图 | 提交与回放开销 | 真执行层 | launch→replay 时延、图命中率 | ⏳ |
+| L3 exec/图 | 提交与回放开销 | 真执行层（`--engine core --exec toy`，真 GPU 步；图档 NONE） | TTFT p50/p99、ITL mean、tps | ✅ 在测 |
 | L4 kernel | 算子真算力 | 真算子 | 每 op 耗时（图内探针） | ⏳ |
 
 ## 2. 噪声纪律
@@ -42,6 +42,11 @@
 - **L2 与 L1 的 tps 不可直接比**：mock 是每请求独立任务逐 token 唤醒；EngineCore 整批
   同步交付（32 步管 100 流），天然平滑——L2 tps 309k 对 L1 tps 81k 的优势是模型差，
   不是 serve 层回归。同节拍对照只看 L2' vs L1'。
+- **L3 与 L2 的 tps 不可直接比**：L2 执行器是零成本脚本；L3 是真 GPU 前向
+  （每步 16 launch + GEMM×7 + 上传/回读，x7 金丝雀 ~0.6ms/步）。L3 的账 =
+  exec 步真算成本 + 批并发摊薄（批 100 时 ITL mean 0.80ms/流 ≈ 整批一步）。
+  电池还顺带抓到过长寿性缺陷（块表行不回收，第 513 次 admit 炸引擎任务，
+  run2/3 全空——x8 回归钉）。
 
 ## 4. 未来插桩（随实现落地，设计现在就定死）
 
@@ -68,6 +73,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | 30c3b01 | release | 170,528 | 10.15 / 12.46 | 0.89 | 1.70 | — | — | — | — | 首基线；ITL 双峰发现（§3） |
 | 2026-10-28 | 6200950+core | release | 170,415 | 10.84 / 12.25 | — | — | 1.11 / 2.68 | 0.027 | 1.69 | — | engine core 首测（battery-20261028-144250）；L2'≈L1'：调度层叠加≈0；L2/L1 tps 模型差见 §3 |
 | 2026-10-28 | +memory | release | 168,289 | 10.56 / 12.21 | — | — | 1.18 / 4.98 | 0.022 | 1.67 | 0.035 | 内存层首测（battery-20261028-152856）；L2m−L2 = +13µs/token，tps 持平（312.6k vs 313.1k）；宽裕块容量——纯记账账 |
+| 2026-10-28 | +exec | release | 168,890 | 10.20 / 12.31 | — | — | 1.15 / 3.08 | 0.041 | 1.72 | 0.043 | exec 真身首测（battery-20261028-215639）：**L3 TTFT p50 6.76ms / p99 14.27ms / ITL mean 0.80ms / tps 47.1k**（toy 真 GPU 步，其余层噪声带内）；行回收缺陷修复后三重复全健康 |
 
 ## 7. kernel 侧微基准（设备端首测，随 exec/kernel 里程碑追加）
 
@@ -77,6 +83,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +kernel | 同上 | PTX JIT 冷/热（跨进程） | 冷 170ms → 热 96ms | 含进程启动+cuInit 固定开销；驱动缓存文件落盘复用（k7，§13-2 ①） |
 | 2026-10-28 | +kernel | 同上 | bf16 点积位对齐 | GPU≡CPU 位位相等 | 512 线程×64 段（k6，§13-2 ②）；PTX `.target sm_70` JIT→sm_89 |
 | 2026-10-28 | +gemm | 同上 | GEMM 吞吐 canary（2048³ bf16） | **125.6 TFLOPS** | cuBLASLt 12.9.2（pip wheel 提取，vendor/）；峰值 ~165 的 76%；g6 金丝雀，下限门禁 10 防非 TC 回退 |
+| 2026-10-28 | +exec | 同上 | exec 步时延 canary（批 4 纯 decode） | **中位 611 µs/步** | 一步 = 5 上传（alloc+H2D）+ 16 launch + GEMM×7 + sync + logits 回读；x7 金丝雀；对照 launch 4.69µs——exec 层优化账（W2：常驻上传缓冲/图捕获/切片回读） |
 
 launch 4.69µs 是 L3（exec 层）落地时的对照基线：纯 Rust→PTX 路线在 WSL 上的
 单 kernel 提交成本在此，exec 步的图捕获/回放收益按此尺度衡量。

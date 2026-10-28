@@ -1,0 +1,16 @@
+[package]
+name = "wein-exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wein-kernel = { path = "../wein-kernel" }
+wein-platform = { path = "../wein-platform" }
+wein-memory = { path = "../wein-memory" }
+wein-sched = { path = "../wein-sched" }
+# Executor trait 在 engine 定义，exec 实现它——依赖边 exec→engine 单向；
+# 组装（spawn_with）发生在 cli/serve 层，engine 不依赖 exec（02 §2 无环）
+wein-engine = { path = "../wein-engine" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

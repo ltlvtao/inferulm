@@ -297,6 +297,43 @@ pub unsafe extern "ptx-kernel" fn w8a8_quant(
     }
 }
 
+/// embed gather：out[t·hidden+e] = w[id[t]·hidden+e]——纯读路由查表，
+/// 位拷贝无数值（id 合法性是 host 责任：vocab 越界 = 未定义）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn embed(
+    ids: *const u32,
+    w: *const u16,
+    out: *mut u16,
+    hidden: u32,
+    tokens: u32,
+) {
+    let h = hidden as usize;
+    let i = tid() as usize;
+    if i >= tokens as usize * h {
+        return;
+    }
+    let (t, e) = (udiv(i, h), urem(i, h));
+    *out.add(t * h + e) = *w.add(*ids.add(t) as usize * h + e);
+}
+
+/// bf16 加（残差）：f32 域加法 RNE 收 bf16——f32+bf16→bf16 与参考同式
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn add(a: *const u16, b: *const u16, out: *mut u16, n: u32) {
+    let i = tid() as usize;
+    if i < n as usize {
+        *out.add(i) = f32_to_bf16(bf16_to_f32(*a.add(i)) + bf16_to_f32(*b.add(i)));
+    }
+}
+
+/// bf16 乘（门控：silu(g)·u）：f32 域乘法 RNE 收 bf16
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn mul(a: *const u16, b: *const u16, out: *mut u16, n: u32) {
+    let i = tid() as usize;
+    if i < n as usize {
+        *out.add(i) = f32_to_bf16(bf16_to_f32(*a.add(i)) * bf16_to_f32(*b.add(i)));
+    }
+}
+
 /// KV scatter write：新 token 的 K/V 按 (seq,pos) 页表寻址写入 paged 池。
 /// 一线程一 (t,e) 槽内元素——纯拷贝，未触及槽位不碰（池属调度层所有）
 #[no_mangle]

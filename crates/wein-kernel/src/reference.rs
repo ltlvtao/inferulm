@@ -281,3 +281,29 @@ pub fn gemm(a: &[u16], b: &[u16], m: usize, n: usize, k: usize) -> Vec<f64> {
     }
     c
 }
+
+/// embed gather 参考：out[t·hidden+e] = w[id[t]·hidden+e]（位拷贝，与 kernel 同式）
+pub fn embed(ids: &[u32], w: &[u16], hidden: usize) -> Vec<u16> {
+    let mut out = vec![0u16; ids.len() * hidden];
+    for (t, &id) in ids.iter().enumerate() {
+        out[t * hidden..(t + 1) * hidden]
+            .copy_from_slice(&w[id as usize * hidden..][..hidden]);
+    }
+    out
+}
+
+/// bf16 加参考（残差）：f32 域加法 RNE 收 bf16
+pub fn add(a: &[u16], b: &[u16]) -> Vec<u16> {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| f32_to_bf16(bf16_to_f32(x) + bf16_to_f32(y)))
+        .collect()
+}
+
+/// bf16 乘参考（门控）：f32 域乘法 RNE 收 bf16
+pub fn mul(a: &[u16], b: &[u16]) -> Vec<u16> {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| f32_to_bf16(bf16_to_f32(x) * bf16_to_f32(y)))
+        .collect()
+}

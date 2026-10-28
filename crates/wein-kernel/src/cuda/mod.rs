@@ -15,6 +15,7 @@ pub use cublaslt::BlasLt;
 /// 已初始化的 GPU（设备 0 的主上下文已 current）
 pub struct Gpu {
     drv: Driver,
+    ctx: *mut std::ffi::c_void,
     arch: String,
     name: String,
     cc: (i32, i32),
@@ -40,7 +41,15 @@ impl Gpu {
             .map_err(|e| e.to_string())?;
         let ctx = drv.primary_ctx_retain(0).map_err(|e| e.to_string())?;
         drv.ctx_set_current(ctx).map_err(|e| e.to_string())?;
-        Ok(Self { drv, arch: format!("sm_{maj}{min}"), name, cc: (maj, min), count })
+        Ok(Self { drv, ctx, arch: format!("sm_{maj}{min}"), name, cc: (maj, min), count })
+    }
+
+    /// 把 primary context 设为**当前线程** current（Driver API 的 context 是
+    /// 线程局部的——probe 只在调用线程 current）。跨线程消费（engine 任务
+    /// 可在 worker 间迁移）在进入设备路径前统一调用；幂等且亚微秒。
+    /// 单线程消费者无需关心（probe 时已 current）
+    pub fn bind_thread(&self) {
+        self.drv.ctx_set_current(self.ctx).expect("cuCtxSetCurrent");
     }
 
     pub fn device_count(&self) -> i32 {

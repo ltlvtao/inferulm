@@ -45,6 +45,9 @@ pub struct OpTable<'a> {
     pub kv_scatter: KvScatterCuda<'a>,
     pub paged_attn: PagedAttnCuda<'a>,
     pub gemm: GemmLt<'a>,
+    pub embed: EmbedCuda<'a>,
+    pub add: AddCuda<'a>,
+    pub mul: MulCuda<'a>,
 }
 
 impl OpTable<'_> {
@@ -90,6 +93,9 @@ impl OpTable<'_> {
         let w8a8_quant = QuantCuda { gpu, f: m.func("w8a8_quant") };
         let kv_scatter = KvScatterCuda { gpu, f: m.func("kv_scatter") };
         let paged_attn = PagedAttnCuda { gpu, f: m.func("paged_attn") };
+        let embed = EmbedCuda { gpu, f: m.func("embed") };
+        let add = AddCuda { gpu, f: m.func("add") };
+        let mul = MulCuda { gpu, f: m.func("mul") };
         // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
         let gemm = GemmLt { lt: Box::new(
             crate::cuda::BlasLt::open(gpu).map_err(|e| vec![Degrade {
@@ -98,7 +104,74 @@ impl OpTable<'_> {
                 impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
             }])?,
         )};
-        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm })
+        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul })
+    }
+}
+
+// ───────────────────── exec 骨架三算子（§4）：embed 路由查表 / 残差加 / 门控乘 ─────────────────────
+
+/// embed gather：out[t·hidden+e] = w[id[t]·hidden+e]（位拷贝无数值）
+pub trait EmbedOp {
+    /// ids: [tokens] u32；w: [vocab, hidden] bf16；out: [tokens, hidden] bf16
+    fn run(&self, ids: &DevBuf, w: &DevBuf, out: &DevBuf, hidden: u32, tokens: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct EmbedCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl EmbedOp for EmbedCuda<'_> {
+    fn run(&self, ids: &DevBuf, w: &DevBuf, out: &DevBuf, hidden: u32, tokens: u32, stream: &Stream) {
+        let n = tokens * hidden;
+        let args = crate::kernel_args![*ids, *w, *out, hidden, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "embed/cuda"
+    }
+}
+
+/// bf16 残差加：out = a + b（f32 域 RNE 收 bf16）
+pub trait AddOp {
+    fn run(&self, a: &DevBuf, b: &DevBuf, out: &DevBuf, n: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct AddCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl AddOp for AddCuda<'_> {
+    fn run(&self, a: &DevBuf, b: &DevBuf, out: &DevBuf, n: u32, stream: &Stream) {
+        let args = crate::kernel_args![*a, *b, *out, n];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "add/cuda"
+    }
+}
+
+/// bf16 门控乘：out = a · b（f32 域 RNE 收 bf16）
+pub trait MulOp {
+    fn run(&self, a: &DevBuf, b: &DevBuf, out: &DevBuf, n: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct MulCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl MulOp for MulCuda<'_> {
+    fn run(&self, a: &DevBuf, b: &DevBuf, out: &DevBuf, n: u32, stream: &Stream) {
+        let args = crate::kernel_args![*a, *b, *out, n];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "mul/cuda"
     }
 }
 
