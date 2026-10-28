@@ -3,11 +3,14 @@
 //! 冒烟实验（§13-2）的对象；W2 扩 trait Op 注册表时，launch 的形状从这里长。
 //! 主上下文进程生命周期保活（primary ctx 不释放——引擎即进程，冒烟不做
 //! 情景化上下文管理）。
+pub mod cublaslt;
 pub mod driver;
 
 use std::ffi::c_void;
 
 use driver::Driver;
+
+pub use cublaslt::BlasLt;
 
 /// 已初始化的 GPU（设备 0 的主上下文已 current）
 pub struct Gpu {

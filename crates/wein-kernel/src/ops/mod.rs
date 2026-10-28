@@ -44,6 +44,7 @@ pub struct OpTable<'a> {
     pub w8a8_quant: QuantCuda<'a>,
     pub kv_scatter: KvScatterCuda<'a>,
     pub paged_attn: PagedAttnCuda<'a>,
+    pub gemm: GemmLt<'a>,
 }
 
 impl OpTable<'_> {
@@ -89,7 +90,15 @@ impl OpTable<'_> {
         let w8a8_quant = QuantCuda { gpu, f: m.func("w8a8_quant") };
         let kv_scatter = KvScatterCuda { gpu, f: m.func("kv_scatter") };
         let paged_attn = PagedAttnCuda { gpu, f: m.func("paged_attn") };
-        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn })
+        // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
+        let gemm = GemmLt { lt: Box::new(
+            crate::cuda::BlasLt::open(gpu).map_err(|e| vec![Degrade {
+                key: "kernel.gemm",
+                reason: format!("libcublasLt 打不开：{e}"),
+                impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
+            }])?,
+        )};
+        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm })
     }
 }
 
@@ -350,5 +359,29 @@ impl PagedAttnOp for PagedAttnCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "paged_attn/cuda"
+    }
+}
+
+// ───────────────────── GEMM：标准算子走厂商库（§4） ─────────────────────
+
+/// GEMM 家族 trait：C = A·B。数值合同 bf16 入出 + f32 累加（tensor core）；
+/// 累加序在厂商库内——对齐标准是容差（golden 两模式的厂商库侧，g2）
+pub trait GemmOp {
+    /// a: [m,k] / b: [k,n] / c: [m,n]，bf16 行主序
+    fn run(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+/// cuBLASLt 档（Box 持有：BlasLt 带工作区与符号库生命周期）
+pub struct GemmLt<'a> {
+    pub(crate) lt: Box<crate::cuda::BlasLt<'a>>,
+}
+
+impl GemmOp for GemmLt<'_> {
+    fn run(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        self.lt.gemm(a, b, c, m, n, k, stream)
+    }
+    fn name(&self) -> &'static str {
+        "gemm/cuda-lt"
     }
 }

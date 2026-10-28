@@ -265,3 +265,19 @@ pub fn paged_attn(
     }
     out
 }
+
+/// GEMM 参考（f64 累加）：容差对齐的基准端（厂商库算子不做位对齐——
+/// 累加序在库内，合同是 ±1 bf16 ulp，g2 准则）
+pub fn gemm(a: &[u16], b: &[u16], m: usize, n: usize, k: usize) -> Vec<f64> {
+    let mut c = vec![0f64; m * n];
+    for r in 0..m {
+        for col in 0..n {
+            let mut acc = 0f64;
+            for i in 0..k {
+                acc += bf16_to_f32(a[r * k + i]) as f64 * bf16_to_f32(b[i * n + col]) as f64;
+            }
+            c[r * n + col] = acc;
+        }
+    }
+    c
+}

@@ -26,7 +26,8 @@
 //! W2 flash 分块 / 多头并行时 golden 不变，重对拍即可。
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
-    KvScatterOp, OpTable, PagedAttnOp, RopeOp, RmsNormOp, SiluOp, W8A8QuantOp,
+    GemmOp, KvScatterOp, OpTable, PagedAttnOp, RopeOp, RmsNormOp, SiluOp,
+    W8A8QuantOp,
 };
 use wein_kernel::reference;
 use wein_platform::{Device, HardwareProfile};
@@ -68,6 +69,7 @@ fn o7_op_table_all_m0_slots() {
     assert_eq!(t.w8a8_quant.name(), "w8a8_quant/cuda");
     assert_eq!(t.kv_scatter.name(), "kv_scatter/cuda");
     assert_eq!(t.paged_attn.name(), "paged_attn/cuda");
+    assert_eq!(t.gemm.name(), "gemm/cuda-lt");
 }
 
 /// o8 · rope 位对齐：half-split（Llama/Qwen），位置含空隙（表寻址真值）

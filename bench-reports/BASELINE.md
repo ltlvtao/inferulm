@@ -76,6 +76,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +kernel | RTX 4090 (sm_89) @WSL 驱动 610.57 | launch 均摊 | **4.69 µs/次** | 1 万次连续提交+末尾一次 sync；k8 金丝雀 |
 | 2026-10-28 | +kernel | 同上 | PTX JIT 冷/热（跨进程） | 冷 170ms → 热 96ms | 含进程启动+cuInit 固定开销；驱动缓存文件落盘复用（k7，§13-2 ①） |
 | 2026-10-28 | +kernel | 同上 | bf16 点积位对齐 | GPU≡CPU 位位相等 | 512 线程×64 段（k6，§13-2 ②）；PTX `.target sm_70` JIT→sm_89 |
+| 2026-10-28 | +gemm | 同上 | GEMM 吞吐 canary（2048³ bf16） | **125.6 TFLOPS** | cuBLASLt 12.9.2（pip wheel 提取，vendor/）；峰值 ~165 的 76%；g6 金丝雀，下限门禁 10 防非 TC 回退 |
 
 launch 4.69µs 是 L3（exec 层）落地时的对照基线：纯 Rust→PTX 路线在 WSL 上的
 单 kernel 提交成本在此，exec 步的图捕获/回放收益按此尺度衡量。
