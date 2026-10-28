@@ -179,7 +179,9 @@ fn o18_sigmul_golden_bitwise() {
 }
 
 /// o19 · 因果深度卷积 + 状态滚动位对齐：varlen 两段（count 5 与 2——
-/// 后者走 state 移位路径），tap 跨段取 state、滚动后状态对拍
+/// 后者走 state 移位路径），tap 跨段取 state、滚动后状态对拍。
+/// 状态行经 row_id 非平凡间接（span 0→行 2、span 1→行 0）——池按请求行
+/// 分账，若 kernel 拿 span 序号当行号写，行 2 留零、行 0 被串写，本条现形
 #[test]
 fn o19_conv_golden_bitwise() {
     let Some(gpu) = gpu() else { return };
@@ -187,22 +189,27 @@ fn o19_conv_golden_bitwise() {
     let t = table(&gpu);
     let (conv_dim, kernel) = (16usize, 4usize);
     let (row_start, row_count): (Vec<u32>, Vec<u32>) = (vec![0, 5], vec![5, 2]);
+    let row_id: Vec<u32> = vec![2, 0]; // 状态池 3 行，两段各占非本征行
+    let pool_rows = 3usize;
     let tokens: usize = row_count.iter().sum::<u32>() as usize; // 7
-    // tok_row/tok_pos 展开两段（executor 同款布局）
+    // tok_row/tok_pos 展开两段（executor 同款：tok_row = 请求状态行）
     let mut tok_row = Vec::new();
     let mut tok_pos = Vec::new();
     for (r, &c) in row_count.iter().enumerate() {
         for p in 0..c {
-            tok_row.push(r as u32);
+            tok_row.push(row_id[r]);
             tok_pos.push(p);
         }
     }
     let x = vec_bf16(0xc0ffee, tokens * conv_dim, 2.0);
     let w = vec_bf16(0xd0d0, conv_dim * kernel, 0.5);
-    // 旧状态（行 1 只处理 2 步——滚动会读它的旧槽位）
-    let st_old = vec_bf16(0xe77e, row_start.len() * conv_dim * (kernel - 1), 2.0);
+    // 旧状态（span 1 只 2 步——滚动走读旧槽位的移位路径）
+    let st_old = vec_bf16(0xe77e, pool_rows * conv_dim * (kernel - 1), 2.0);
     let expect_conv = reference::conv1d_dw(&x, &w, &st_old, &tok_row, &tok_pos, conv_dim, kernel);
-    let expect_state = reference::conv_state_roll(&x, &st_old, &row_start, &row_count, conv_dim, kernel);
+    let expect_state = reference::conv_state_roll(&x, &st_old, &row_start, &row_count, &row_id, conv_dim, kernel);
+    // 未触行（行 1）必须原样
+    let untouched = &st_old[conv_dim * (kernel - 1)..2 * conv_dim * (kernel - 1)];
+    assert_eq!(&expect_state[conv_dim * (kernel - 1)..2 * conv_dim * (kernel - 1)], untouched);
 
     let (dx, dw, ds_in) = (gpu.alloc_from_slice(&x), gpu.alloc_from_slice(&w), gpu.alloc_from_slice(&st_old));
     let (dtr, dtp) = (gpu.alloc_from_slice(&tok_row), gpu.alloc_from_slice(&tok_pos));
@@ -212,9 +219,13 @@ fn o19_conv_golden_bitwise() {
     assert_bits("conv1d_dw", &dout.read_to_vec(), &expect_conv);
 
     // 滚动：dst=旧状态上传（原地语义），跑完回读对拍
-    let (drs, drc) = (gpu.alloc_from_slice(&row_start), gpu.alloc_from_slice(&row_count));
+    let (drs, drc, dri) = (
+        gpu.alloc_from_slice(&row_start),
+        gpu.alloc_from_slice(&row_count),
+        gpu.alloc_from_slice(&row_id),
+    );
     let dstate = gpu.alloc_from_slice(&st_old);
-    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, conv_dim as u32, kernel as u32, row_start.len() as u32, &stream);
+    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &dri, conv_dim as u32, kernel as u32, row_start.len() as u32, &stream);
     stream.sync();
     assert_bits("conv_state_roll", &dstate.read_to_vec(), &expect_state);
 }

@@ -151,6 +151,17 @@ impl DevBuf<'_> {
     pub fn len_bytes(&self) -> usize {
         self.bytes
     }
+    /// 异步字节清零（流上排队——与后续 launch 保序）
+    pub fn zero_on(&self, stream: &Stream) {
+        self.drv.memset_d8(self.ptr, 0, self.bytes, stream.handle).expect("cuMemsetD8Async");
+    }
+    /// 区间字节清零（状态池单行回收零化：行内偏移 + 字节数）
+    pub fn zero_range_on(&self, start: usize, len: usize, stream: &Stream) {
+        assert!(start + len <= self.bytes, "零化区间越界");
+        self.drv
+            .memset_d8(self.ptr + start as u64, 0, len, stream.handle)
+            .expect("cuMemsetD8Async");
+    }
     pub fn read_to_vec<T: Copy + Default>(&self) -> Vec<T> {
         let n = self.bytes / std::mem::size_of::<T>();
         let mut v = vec![T::default(); n];

@@ -51,6 +51,7 @@ pub struct Driver {
     cu_mem_free: unsafe extern "C" fn(u64) -> CuResult,
     cu_memcpy_htod: unsafe extern "C" fn(u64, *const c_void, usize) -> CuResult,
     cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> CuResult,
+    cu_memset_d8: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResult,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResult,
     cu_launch_kernel: unsafe extern "C" fn(
@@ -90,6 +91,7 @@ impl Driver {
                 cu_mem_free: try_get(&lib, &["cuMemFree_v2", "cuMemFree"])?,
                 cu_memcpy_htod: try_get(&lib, &["cuMemcpyHtoD_v2", "cuMemcpyHtoD"])?,
                 cu_memcpy_dtoh: try_get(&lib, &["cuMemcpyDtoH_v2", "cuMemcpyDtoH"])?,
+                cu_memset_d8: try_get(&lib, &["cuMemsetD8Async"])?,
                 cu_stream_create: try_get(&lib, &["cuStreamCreate"])?,
                 cu_stream_synchronize: try_get(&lib, &["cuStreamSynchronize"])?,
                 cu_launch_kernel: try_get(&lib, &["cuLaunchKernel"])?,
@@ -195,6 +197,10 @@ impl Driver {
             unsafe { (self.cu_memcpy_dtoh)(dst.as_mut_ptr().cast(), src, dst.len()) },
             "cuMemcpyDtoH",
         )
+    }
+    /// 异步字节清零（流上排队——状态池行回收的零化用）
+    pub(crate) fn memset_d8(&self, dst: u64, byte: u8, n: usize, stream: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_memset_d8)(dst, byte, n, stream) }, "cuMemsetD8Async")
     }
     pub(crate) fn stream_create(&self) -> Result<*mut c_void, CuError> {
         let mut s = std::ptr::null_mut();

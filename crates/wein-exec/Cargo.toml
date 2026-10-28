@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 wein-kernel = { path = "../wein-kernel" }
+wein-model = { path = "../wein-model" }
 wein-platform = { path = "../wein-platform" }
 wein-memory = { path = "../wein-memory" }
 wein-sched = { path = "../wein-sched" }

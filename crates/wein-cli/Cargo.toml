@@ -8,6 +8,7 @@ license.workspace = true
 wein-engine = { path = "../wein-engine" }
 wein-exec = { path = "../wein-exec" }
 wein-memory = { path = "../wein-memory" }
+wein-model = { path = "../wein-model" }
 wein-serve = { path = "../wein-serve" }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }

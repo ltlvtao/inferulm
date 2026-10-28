@@ -1958,6 +1958,7 @@ dependencies = [
  "wein-engine",
  "wein-exec",
  "wein-memory",
+ "wein-model",
  "wein-serve",
 ]
 
@@ -1980,6 +1981,7 @@ dependencies = [
  "wein-engine",
  "wein-kernel",
  "wein-memory",
+ "wein-model",
  "wein-platform",
  "wein-sched",
 ]
@@ -2029,7 +2031,9 @@ dependencies = [
  "tokio",
  "tracing",
  "wein-engine",
+ "wein-exec",
  "wein-memory",
+ "wein-model",
 ]
 
 [[package]]

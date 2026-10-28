@@ -17,3 +17,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 wein-memory = { path = "../wein-memory" }
 reqwest = { workspace = true }
+# 仅测试用（q11 真模型 e2e）——产品依赖方向不变（§2 单向）
+wein-exec = { path = "../wein-exec" }
+wein-model = { path = "../wein-model" }

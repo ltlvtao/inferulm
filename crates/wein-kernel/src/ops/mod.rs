@@ -339,7 +339,8 @@ impl Conv1dDwOp for Conv1dDwCuda<'_> {
     }
 }
 
-/// conv 状态滚动：state ←（旧 state ++ 本段 x）末 kernel-1 个（原地）
+/// conv 状态滚动：state ←（旧 state ++ 本段 x）末 kernel-1 个（原地）。
+/// 状态池按请求行分账——span r 写 **row_id[r]** 段（与 deltanet 同间接）
 pub trait ConvStateRollOp {
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -348,6 +349,7 @@ pub trait ConvStateRollOp {
         state: &DevBuf,
         row_start: &DevBuf,
         row_count: &DevBuf,
+        row_id: &DevBuf,
         conv_dim: u32,
         kernel: u32,
         rows: u32,
@@ -369,13 +371,15 @@ impl ConvStateRollOp for ConvStateRollCuda<'_> {
         state: &DevBuf,
         row_start: &DevBuf,
         row_count: &DevBuf,
+        row_id: &DevBuf,
         conv_dim: u32,
         kernel: u32,
         rows: u32,
         stream: &Stream,
     ) {
         let n = rows * conv_dim;
-        let args = crate::kernel_args![*x, *state, *row_start, *row_count, conv_dim, kernel, rows];
+        let args =
+            crate::kernel_args![*x, *state, *row_start, *row_count, *row_id, conv_dim, kernel, rows];
         self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
     }
     fn name(&self) -> &'static str {

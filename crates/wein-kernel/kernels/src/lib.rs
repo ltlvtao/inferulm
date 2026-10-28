@@ -554,7 +554,8 @@ pub unsafe extern "ptx-kernel" fn rope_pt(
 }
 
 /// 门控乘（注意力输出门 / 任意 sigmoid 门）：out = x·sigmoid(g)。
-/// sigmoid = 1/(1+expf(−g))——自控 exp 路径，与 silu 同源
+/// sigmoid = 1/(1+expf(−g)) 自控 exp 路径；sigmoid 先收 bf16 再乘
+/// （HF torch.sigmoid 在 bf16 张量上先落存储、attn 输出后乘——同两跳 round）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn sigmul(
     x: *const u16,
@@ -566,7 +567,8 @@ pub unsafe extern "ptx-kernel" fn sigmul(
     if i < n as usize {
         let v = bf16_to_f32(*x.add(i));
         let s = bf16_to_f32(*g.add(i));
-        *out.add(i) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-s))));
+        let sig = f32_to_bf16(1.0f32 / (1.0f32 + expf(-s)));
+        *out.add(i) = f32_to_bf16(v * bf16_to_f32(sig));
     }
 }
 
@@ -618,9 +620,10 @@ pub unsafe extern "ptx-kernel" fn conv1d_dw(
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn conv_state_roll(
     x: *const u16,        // [tokens, conv_dim]
-    state: *mut u16,      // [rows, conv_dim, kernel-1] 原地
+    state: *mut u16,      // [rows, conv_dim, kernel-1] 原地，行号经 row_id 间接
     row_start: *const u32, // [rows] 本段起点（tokens 轴）
     row_count: *const u32, // [rows] 本段 token 数
+    row_id: *const u32,   // [rows] 本段请求的状态行号
     conv_dim: u32,
     kernel: u32,
     rows: u32,
@@ -632,7 +635,7 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
         return;
     }
     let (r, c) = (udiv(i, cd), urem(i, cd));
-    let base = r * cd * st + c * st;
+    let base = *row_id.add(r) as usize * cd * st + c * st;
     let mut j = 0usize;
     while j < st {
         let idx = *row_count.add(r) as i32 - (st as i32) + (j as i32);
@@ -695,9 +698,10 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     let mut i = 0usize;
     while i < cnt {
         let g = st + i;
-        // 每 token 标量门（各线程冗余算——同序同式位同）
+        // 每 token 标量门（各线程冗余算——同序同式位同）。
+        // β 先收 bf16（HF b.sigmoid() 在 bf16 张量上、recurrent 内再展 f32）
         let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
-        let beta = 1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))));
+        let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
         // q/k l2norm：各线程顺序扫（j 升序同参考）
         let qb = (g * k_heads as usize + kh) * kd;
         let mut sq = 0.0f32;

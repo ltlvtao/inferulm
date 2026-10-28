@@ -392,13 +392,14 @@ pub fn rope_pt(
     out
 }
 
-/// 门控乘：out = x·sigmoid(g)，sigmoid = 1/(1+expf(−g))——与 kernel 同式
+/// 门控乘：out = x·sigmoid(g)——sigmoid 先收 bf16（HF 同两跳 round），与 kernel 同式
 pub fn sigmul(x: &[u16], g: &[u16]) -> Vec<u16> {
     x.iter()
         .zip(g)
         .map(|(&v, &s)| {
             let (v, s) = (bf16_to_f32(v), bf16_to_f32(s));
-            f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-s))))
+            let sig = f32_to_bf16(1.0f32 / (1.0f32 + expf(-s)));
+            f32_to_bf16(v * bf16_to_f32(sig))
         })
         .collect()
 }
@@ -437,13 +438,15 @@ pub fn conv1d_dw(
     out
 }
 
-/// conv 状态滚动：new = (旧 state ++ 本段 x) 的末 kernel-1 个。
-/// 返回新状态（kernel 原地——读槽位恒未被本线程写过，语义等价）
+/// conv 状态滚动：new = (旧 state ++ 本段 x) 的末 kernel-1 个，span r 落在
+/// **row_id[r]** 段（状态池按请求行分账）。返回新状态（kernel 原地——
+/// 读槽位恒未被本线程写过，语义等价）
 pub fn conv_state_roll(
     x: &[u16],
     state: &[u16],
     row_start: &[u32],
     row_count: &[u32],
+    row_id: &[u32],
     conv_dim: usize,
     kernel: usize,
 ) -> Vec<u16> {
@@ -451,7 +454,7 @@ pub fn conv_state_roll(
     let mut out = state.to_vec();
     for r in 0..row_start.len() {
         for c in 0..conv_dim {
-            let base = r * conv_dim * st + c * st;
+            let base = row_id[r] as usize * conv_dim * st + c * st;
             for j in 0..st {
                 let idx = row_count[r] as i32 - st as i32 + j as i32;
                 out[base + j] = if idx < 0 {
@@ -509,7 +512,8 @@ pub fn deltanet(
             for i in 0..cnt {
                 let g = st + i;
                 let decay = expf(0.0 - big_a * softplus(bf16_to_f32(a[g * v_heads + h]) + dtb));
-                let beta = 1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(b[g * v_heads + h])));
+                // β 先收 bf16（HF b.sigmoid() 在 bf16 张量上）——与 kernel 同两跳
+                let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(b[g * v_heads + h])))));
                 let qb = (g * k_heads + kh) * k_dim;
                 // l2norm（j 升序同 kernel）
                 let (mut sq, mut sk) = (0.0f32, 0.0f32);
