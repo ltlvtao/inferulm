@@ -55,10 +55,15 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry vec_add_f32("), "vec_add_f32 入口缺失/被改名");
     assert!(ptx.contains(".entry bf16_dot("), "bf16_dot 入口缺失/被改名");
     assert!(ptx.contains(".entry rms_norm("), "rms_norm 入口缺失/被改名");
+    assert!(ptx.contains(".entry rope("), "rope 入口缺失/被改名");
+    assert!(ptx.contains(".entry silu("), "silu 入口缺失/被改名");
+    assert!(ptx.contains(".entry w8a8_quant("), "w8a8_quant 入口缺失/被改名");
+    assert!(ptx.contains(".entry kv_scatter("), "kv_scatter 入口缺失/被改名");
+    assert!(ptx.contains(".entry paged_attn("), "paged_attn 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        3,
-        "导出 kernel 数应为 3（多了说明编译单元混入了别的入口）"
+        8,
+        "导出 kernel 数应为 8（多了说明编译单元混入了别的入口）"
     );
 }
 

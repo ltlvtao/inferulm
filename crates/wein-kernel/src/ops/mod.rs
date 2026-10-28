@@ -39,7 +39,11 @@ pub enum RmsNormImpl<'a> {
 /// 算子表：启动时 resolve 一次，全程只读
 pub struct OpTable<'a> {
     pub rms_norm: RmsNormImpl<'a>,
-    // M0 清单其余算子（rope/silu/varlen attention/量化/KV scatter）逐个入表
+    pub rope: RopeCuda<'a>,
+    pub silu: SiluCuda<'a>,
+    pub w8a8_quant: QuantCuda<'a>,
+    pub kv_scatter: KvScatterCuda<'a>,
+    pub paged_attn: PagedAttnCuda<'a>,
 }
 
 impl OpTable<'_> {
@@ -78,7 +82,14 @@ impl OpTable<'_> {
         } else {
             RmsNormImpl::Row { gpu, f }
         };
-        Ok(OpTable { rms_norm })
+        // 其余 M0 算子同模块取入口（几何无档位之分——一维、线程间无归约）
+        let m = gpu.load_module(&ptx);
+        let rope = RopeCuda { gpu, f: m.func("rope") };
+        let silu = SiluCuda { gpu, f: m.func("silu") };
+        let w8a8_quant = QuantCuda { gpu, f: m.func("w8a8_quant") };
+        let kv_scatter = KvScatterCuda { gpu, f: m.func("kv_scatter") };
+        let paged_attn = PagedAttnCuda { gpu, f: m.func("paged_attn") };
+        Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn })
     }
 }
 
@@ -123,5 +134,221 @@ impl RmsNormOp for RmsNormImpl<'_> {
             RmsNormImpl::Row { .. } => "rms_norm/cuda-row",
             RmsNormImpl::Blocked { .. } => "rms_norm/cuda-blocked",
         }
+    }
+}
+
+// ───────────────────── M0 清单其余算子（§4）：一维几何，槽位预留档位演化 ─────────────────────
+
+/// rope：half-split（Llama/Qwen 形态）。cos/sin 表是**输入**（host 生成上传，
+/// 图捕获友好）——kernel 只做 apply，表生成在 reference::rope_table
+pub trait RopeOp {
+    /// q/k: [tokens, rot_dim] bf16；cos/sin: [max_pos, rot_dim/2] f32；
+    /// pos: [tokens] u32；out 同 q/k 形状
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        cos: &DevBuf,
+        sin: &DevBuf,
+        pos: &DevBuf,
+        out_q: &DevBuf,
+        out_k: &DevBuf,
+        tokens: u32,
+        rot_dim: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct RopeCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl RopeOp for RopeCuda<'_> {
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        cos: &DevBuf,
+        sin: &DevBuf,
+        pos: &DevBuf,
+        out_q: &DevBuf,
+        out_k: &DevBuf,
+        tokens: u32,
+        rot_dim: u32,
+        stream: &Stream,
+    ) {
+        let half = rot_dim / 2;
+        let n = tokens * half;
+        let args = crate::kernel_args![*q, *k, *cos, *sin, *pos, *out_q, *out_k, rot_dim, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "rope/cuda"
+    }
+}
+
+/// silu：out = x·sigmoid(x)。sigmoid 的 exp 走自控 exp2 多项式
+/// （kernels/reference 同字面量同 Horner 序——禁 MUFU 近似，对齐可达）
+pub trait SiluOp {
+    fn run(&self, x: &DevBuf, out: &DevBuf, n: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct SiluCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl SiluOp for SiluCuda<'_> {
+    fn run(&self, x: &DevBuf, out: &DevBuf, n: u32, stream: &Stream) {
+        let args = crate::kernel_args![*x, *out, n];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "silu/cuda"
+    }
+}
+
+/// W8A8 动态量化：逐 token amax → scale=amax/127 → RNE 半偶取整。
+/// i8 q + f32 scale 双输出（weight-only 之外，激活量化喂 W8A8 GEMM）
+pub trait W8A8QuantOp {
+    /// x: [tokens, hidden] bf16；q: [tokens, hidden] i8；scale: [tokens] f32
+    fn run(&self, x: &DevBuf, q: &DevBuf, scale: &DevBuf, tokens: u32, hidden: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct QuantCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl W8A8QuantOp for QuantCuda<'_> {
+    fn run(&self, x: &DevBuf, q: &DevBuf, scale: &DevBuf, tokens: u32, hidden: u32, stream: &Stream) {
+        // 一线程一 token（amax 顺序扫在行内完成——与参考同序）
+        let args = crate::kernel_args![*x, *q, *scale, hidden, tokens];
+        self.gpu.launch(&self.f, tokens.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "w8a8_quant/cuda"
+    }
+}
+
+/// KV scatter write：新 token 的 K/V 写入 paged KV。
+/// 槽位寻址 slot = block_table[seq·bpr + pos/bs]·bs + pos%bs，槽内
+/// [heads, head_dim] —— 与 wein-memory plan_kv 的 token 记账同构
+pub trait KvScatterOp {
+    /// src_k/src_v: [tokens, head_elems] bf16；k_dst/v_dst: paged 池
+    /// （未触及槽位原样保留——池属调度层所有，kernel 只写自己的槽）
+    fn run(
+        &self,
+        src_k: &DevBuf,
+        src_v: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        k_dst: &DevBuf,
+        v_dst: &DevBuf,
+        bpr: u32,
+        block_size: u32,
+        head_elems: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct KvScatterCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl KvScatterOp for KvScatterCuda<'_> {
+    fn run(
+        &self,
+        src_k: &DevBuf,
+        src_v: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        k_dst: &DevBuf,
+        v_dst: &DevBuf,
+        bpr: u32,
+        block_size: u32,
+        head_elems: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * head_elems;
+        let args = crate::kernel_args![*src_k, *src_v, *block_table, *seq_ids, *positions,
+            *k_dst, *v_dst, bpr, block_size, head_elems, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "kv_scatter/cuda"
+    }
+}
+
+/// varlen paged attention（correctness-first：单线程两遍扫 KV，W2 再 flash 分块）。
+/// 每 (token, q_head) 一线程：pos 位置的 query 因果只看 0..=pos；
+/// GQA：kv 头 = qh % kv_heads
+pub trait PagedAttnOp {
+    /// q: [tokens, q_heads, head_dim] bf16；k/v_cache: paged 池；out 同 q。
+    /// q_scale 为输入（host 算 1/sqrt(head_dim)）——kernel 不做 sqrt
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct PagedAttnCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl PagedAttnOp for PagedAttnCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * q_heads;
+        let args = crate::kernel_args![*q, *k_cache, *v_cache, *block_table, *seq_ids, *positions,
+            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "paged_attn/cuda"
     }
 }

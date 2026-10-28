@@ -47,6 +47,86 @@ pub fn f32_to_bf16(x: f32) -> u16 {
     ((bits + 0x7fff + lsb) >> 16) as u16
 }
 
+/// |x|：位实现（清符号位）——语义与 std 的 abs 恒等（非 NaN 域），
+/// 不依赖 f32 方法面（core_float_math #137578 迁移中，自控为上）
+#[inline(always)]
+fn fabs(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0x7fff_ffff)
+}
+
+/// 整除/取余（无除零检查——除数是形状参数，host 侧保证非零）。
+/// rustc 对运行数除数默认插 panic 桩（PTX 里成 call），no_std kernel 禁 call
+#[inline(always)]
+fn udiv(x: usize, y: usize) -> usize {
+    unsafe { core::intrinsics::unchecked_div(x, y) }
+}
+#[inline(always)]
+fn urem(x: usize, y: usize) -> usize {
+    unsafe { core::intrinsics::unchecked_rem(x, y) }
+}
+
+/// paged KV 槽位寻址：slot = block_table[s·bpr + j/bs]·bs + j%bs——与
+/// wein-memory plan_kv 的 token 记账同构（[page][block_size][heads,head_dim]）
+#[inline(always)]
+fn slot_of(bt: *const u32, s: usize, j: usize, bpr: usize, bs: usize) -> usize {
+    let blk = udiv(j, bs);
+    let off = urem(j, bs);
+    unsafe { *bt.add(s * bpr + blk) as usize * bs + off }
+}
+
+/// floor：intrinsic（LLVM→cvt.rmi.f32.f32，精确算子非近似）。
+/// 注意此 nightly 上浮点 intrinsic 是泛型 const fn（floorf32 名已不存在）
+#[inline(always)]
+fn floor(x: f32) -> f32 {
+    core::intrinsics::floor::<f32>(x)
+}
+
+/// exp 自控路径（与 reference::expf 同字面量同 Horner 序——位对齐的
+/// 可达性依据；禁 MUFU ex2 近似）。t = x·log2e → k=⌊t⌋、f=t−k∈[0,1)
+/// → 2^f 七次 Horner → 指数域加 k（尾数不动，精确）
+#[inline(always)]
+fn expf(x: f32) -> f32 {
+    const LOG2E: f32 = 1.4426950408889634;
+    // a_n = ln2^n / n!（截断误差 ≤1.4e-6 ≪ bf16 分辨率）
+    const A7: f32 = 1.5252733804059838e-05;
+    const A6: f32 = 0.00015403530393381606;
+    const A5: f32 = 0.0013333558146428441;
+    const A4: f32 = 0.009618129107628477;
+    const A3: f32 = 0.055504108664821576;
+    const A2: f32 = 0.2402265069591007;
+    const A1: f32 = 0.6931471805599453;
+    const A0: f32 = 1.0;
+    let t = x * LOG2E;
+    let kf = floor(t);
+    let f = t - kf; // [0,1)，Sterbenz 精确
+    let mut p = A7;
+    p = p * f + A6;
+    p = p * f + A5;
+    p = p * f + A4;
+    p = p * f + A3;
+    p = p * f + A2;
+    p = p * f + A1;
+    p = p * f + A0;
+    f32::from_bits(((p.to_bits() as i32).wrapping_add((kf as i32) << 23)) as u32)
+}
+
+/// RNE 半偶取整到整值 f32（自控实现，与 reference::rne 同式——量化取整
+/// 语义要自己钉，round() 默认行为不可依赖）
+#[inline(always)]
+fn rne(x: f32) -> f32 {
+    let fl = floor(x);
+    let d = x - fl;
+    if d > 0.5 {
+        fl + 1.0
+    } else if d < 0.5 {
+        fl
+    } else if (fl.to_bits() & 1) == 0 {
+        fl
+    } else {
+        fl + 1.0
+    }
+}
+
 /// 向量加（f32 逐位可对齐——k5 的对象；也是 k8 launch 开销测量的载体）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn vec_add_f32(
@@ -124,7 +204,7 @@ pub unsafe extern "ptx-kernel" fn rms_norm(
             acc = v * v + acc;
             i += 1;
         }
-        let denom = unsafe { core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps) };
+        let denom = core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
         let inv = 1.0f32 / denom;
         let mut i = 0usize;
         while i < h {
@@ -132,5 +212,196 @@ pub unsafe extern "ptx-kernel" fn rms_norm(
             *out.add(base + i) = f32_to_bf16(o);
             i += 1;
         }
+    }
+}
+
+/// RoPE（half-split，Llama/Qwen 形态）。cos/sin 表是输入（host 生成上传，
+/// 图捕获友好）——kernel 只做 apply。每线程一对 (t,p)，同一 pos 同时处理
+/// q 与 k（表项只读一次）。out = (x1·c − x2·s, x2·c + x1·s)
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn rope(
+    q: *const u16,
+    k: *const u16,
+    cos: *const f32,
+    sin: *const f32,
+    pos: *const u32,
+    out_q: *mut u16,
+    out_k: *mut u16,
+    rot_dim: u32,
+    tokens: u32,
+) {
+    let half = (rot_dim / 2) as usize;
+    let rd = rot_dim as usize;
+    let i = tid() as usize;
+    if i >= tokens as usize * half {
+        return;
+    }
+    let (t, p) = (udiv(i, half), urem(i, half));
+    let ti = *pos.add(t) as usize;
+    let c = *cos.add(ti * half + p);
+    let s = *sin.add(ti * half + p);
+    let (x1, x2) = (bf16_to_f32(*q.add(t * rd + p)), bf16_to_f32(*q.add(t * rd + half + p)));
+    *out_q.add(t * rd + p) = f32_to_bf16(x1 * c - x2 * s);
+    *out_q.add(t * rd + half + p) = f32_to_bf16(x2 * c + x1 * s);
+    let (x1, x2) = (bf16_to_f32(*k.add(t * rd + p)), bf16_to_f32(*k.add(t * rd + half + p)));
+    *out_k.add(t * rd + p) = f32_to_bf16(x1 * c - x2 * s);
+    *out_k.add(t * rd + half + p) = f32_to_bf16(x2 * c + x1 * s);
+}
+
+/// SiLU：out = x·sigmoid(x)，sigmoid = 1/(1+expf(−x))——逐元素，
+/// 线程间无交互（几何不影响数值）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn silu(x: *const u16, out: *mut u16, n: u32) {
+    let i = tid() as usize;
+    if i < n as usize {
+        let v = bf16_to_f32(*x.add(i));
+        *out.add(i) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+    }
+}
+
+/// W8A8 动态量化（逐 token）：amax → scale=amax/127 → RNE 半偶 → clamp ±127。
+/// 一线程一 token（顺序扫 hidden，与参考同序）；scale=0 时 q 全 0
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn w8a8_quant(
+    x: *const u16,
+    q: *mut i8,
+    scale: *mut f32,
+    hidden: u32,
+    tokens: u32,
+) {
+    let t = tid() as usize;
+    if t >= tokens as usize {
+        return;
+    }
+    let h = hidden as usize;
+    let base = t * h;
+    let mut amax = 0.0f32;
+    let mut i = 0usize;
+    while i < h {
+        let a = fabs(bf16_to_f32(*x.add(base + i)));
+        amax = if a > amax { a } else { amax };
+        i += 1;
+    }
+    if amax == 0.0 {
+        *scale.add(t) = 0.0;
+        return;
+    }
+    let sc = amax / 127.0;
+    *scale.add(t) = sc;
+    let mut i = 0usize;
+    while i < h {
+        let r = rne(bf16_to_f32(*x.add(base + i)) / sc);
+        let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
+        *q.add(base + i) = r as i8;
+        i += 1;
+    }
+}
+
+/// KV scatter write：新 token 的 K/V 按 (seq,pos) 页表寻址写入 paged 池。
+/// 一线程一 (t,e) 槽内元素——纯拷贝，未触及槽位不碰（池属调度层所有）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn kv_scatter(
+    src_k: *const u16,
+    src_v: *const u16,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    k_dst: *mut u16,
+    v_dst: *mut u16,
+    bpr: u32,
+    block_size: u32,
+    head_elems: u32,
+    tokens: u32,
+) {
+    let he = head_elems as usize;
+    let i = tid() as usize;
+    if i >= tokens as usize * he {
+        return;
+    }
+    let (t, e) = (udiv(i, he), urem(i, he));
+    let slot = slot_of(block_table, *seq_ids.add(t) as usize, *positions.add(t) as usize,
+        bpr as usize, block_size as usize);
+    *k_dst.add(slot * he + e) = *src_k.add(t * he + e);
+    *v_dst.add(slot * he + e) = *src_v.add(t * he + e);
+}
+
+/// varlen paged attention（correctness-first 两遍法）：一线程一 (t,qh)，
+/// 因果只看 0..=pos；GQA：kv 头 = qh%kv_heads。pass1 记分取 max →
+/// pass2 p_j=expf(s_j−m) 顺序累加分母 → 逐 e 加权 V（j 升序，与参考同序）。
+/// M0 正确性档：单线程扫全 KV，序列长上限 256（W2 flash 分块移除此限）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn paged_attn(
+    q: *const u16,
+    k_cache: *const u16,
+    v_cache: *const u16,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+) {
+    const MAX_LEN: usize = 256;
+    let hd = head_dim as usize;
+    let qh_n = q_heads as usize;
+    let i = tid() as usize;
+    if i >= tokens as usize * qh_n {
+        return;
+    }
+    let (t, qh) = (udiv(i, qh_n), urem(i, qh_n));
+    let kh = urem(qh, kv_heads as usize);
+    let s = *seq_ids.add(t) as usize;
+    let pos = *positions.add(t) as usize;
+    if pos + 1 > MAX_LEN {
+        return; // 超限不写——启动期容量检查的责任在 exec 层（W2 移除）
+    }
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_heads as usize * hd;
+    let qbase = i * hd;
+
+    // sc 经裸指针访问（数组下标检查在 PTX 里成 panic 桩 call——
+    // pos+1 ≤ MAX_LEN 已由上方 return 保证）
+    let mut sc = [0.0f32; MAX_LEN];
+    let scp = sc.as_mut_ptr();
+    let mut m = f32::NEG_INFINITY;
+    let mut j = 0usize;
+    while j <= pos {
+        let kbase = slot_of(block_table, s, j, bpr, bs) * he + kh * hd;
+        let mut dot = 0.0f32;
+        let mut d = 0usize;
+        while d < hd {
+            let a = bf16_to_f32(*q.add(qbase + d));
+            let b = bf16_to_f32(*k_cache.add(kbase + d));
+            dot = a * b + dot;
+            d += 1;
+        }
+        *scp.add(j) = dot * q_scale;
+        let scj = *scp.add(j);
+        m = if scj > m { scj } else { m };
+        j += 1;
+    }
+    let mut denom = 0.0f32;
+    let mut j = 0usize;
+    while j <= pos {
+        *scp.add(j) = expf(*scp.add(j) - m);
+        denom = *scp.add(j) + denom;
+        j += 1;
+    }
+    let mut e = 0usize;
+    while e < hd {
+        let mut acc = 0.0f32;
+        let mut j = 0usize;
+        while j <= pos {
+            let vbase = slot_of(block_table, s, j, bpr, bs) * he + kh * hd;
+            acc = *scp.add(j) * bf16_to_f32(*v_cache.add(vbase + e)) + acc;
+            j += 1;
+        }
+        *out.add(qbase + e) = f32_to_bf16(acc / denom);
+        e += 1;
     }
 }
