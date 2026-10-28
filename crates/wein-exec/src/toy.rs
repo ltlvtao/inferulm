@@ -10,10 +10,15 @@
 //! - 纯 decode：前向 seq 尾（上步采样追加、尚未前向的那个 token）
 //! - 空 prompt：`admitted` 时落 BOS(0)——调度器看长度 0 直接走 decode
 //! - 抢占重入：`preempted` 清前向游标（重放对同样 KV 覆盖写，确定性下幂等）
+//!
+//! 图档位（§7，w 系验收）：`graph_buckets` 非空 = FULL_DECODE——桶集合
+//! 共用单输入存储（常驻 DevBuf，每步整段覆写），纯 decode 步路由到 ≥m
+//! 的最小桶图回放，批尾 sink 行（块表末行 + 专属页）吸收 padding；混合步
+//! 走 eager。空桶集 = NONE（x 系保持每步分配的 eager 直发）
 use std::collections::HashMap;
 
 use wein_engine::Executor;
-use wein_kernel::cuda::DevBuf;
+use wein_kernel::cuda::{DevBuf, GraphExec};
 use wein_kernel::ops::{
     AddOp, EmbedOp, GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormOp, RopeOp, SiluOp,
 };
@@ -37,6 +42,10 @@ pub struct ToyConfig {
     pub max_pos: u32,
     pub seed: u64,
     pub eps: f32,
+    /// FULL_DECODE 图档桶集合（§7 图档位谱系）。空 = NONE（默认，eager
+    /// 直发）；非空须严格升序、≥1、最大桶 ≤ t_max(1024)。m 超最大桶的步
+    /// 回落 eager。M0 不实现 exec update 的桶间迁移——每桶独立捕获
+    pub graph_buckets: Vec<u32>,
 }
 
 impl Default for ToyConfig {
@@ -55,6 +64,7 @@ impl Default for ToyConfig {
             max_pos: 256, // paged_attn M0 上限（序列长 ≤ 256，W2 flash 分块移除）
             seed: 42,
             eps: 1e-6,
+            graph_buckets: Vec::new(),
         }
     }
 }
@@ -74,6 +84,19 @@ impl ToyConfig {
         }
         if self.vocab < 2 {
             return Err("vocab 至少 2".into());
+        }
+        let b = &self.graph_buckets;
+        if !b.is_empty() {
+            if b[0] < 1 {
+                return Err(format!("graph_buckets 须 ≥ 1（首桶 {}）", b[0]));
+            }
+            if b.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!("graph_buckets 须严格升序：{b:?}"));
+            }
+            const T_MAX: u32 = 1024;
+            if *b.last().unwrap() > T_MAX {
+                return Err(format!("最大桶 {} 超 t_max {T_MAX}", b.last().unwrap()));
+            }
         }
         Ok(())
     }
@@ -140,7 +163,7 @@ struct WDev {
     lm: DevBuf<'static>,
 }
 
-/// 前向 scratch（按 T_MAX 一次分配；上传缓冲每步分配——M0 简化，W2 常驻）
+/// 前向 scratch（按 T_MAX 一次分配；eager 上传缓冲每步分配，图档输入常驻覆写）
 struct ScrDev {
     x: DevBuf<'static>,
     n1: DevBuf<'static>,
@@ -171,6 +194,27 @@ struct ReqState {
     blocks: Vec<u32>,
 }
 
+/// FULL_DECODE 图档（§7）：桶集合共用**单输入存储**（常驻 DevBuf——设备
+/// 指针烤进图节点，数据每步 upload_on 整段覆写），sink 行（块表末行 +
+/// 专属页）吸收桶尾 padding。execs 与 buckets 下标对齐。
+/// 声明序即析构序：本结构先于 session 析构——GraphExec 的 'static 钉扎
+/// （borrow session.stream 的短命借用提为 'static）与 stream/table 同一论证
+struct GraphMode {
+    sink_row: u32,
+    b_max: u32,
+    buckets: Vec<u32>,
+    in_ids: DevBuf<'static>,
+    in_pos: DevBuf<'static>,
+    in_seq: DevBuf<'static>,
+    /// rope 以 (token,头) 为行——pos 按头数展开
+    in_posq: DevBuf<'static>,
+    /// 全块表常驻镜像（每步覆写——页保证先于上传）
+    in_bt: DevBuf<'static>,
+    execs: Vec<GraphExec<'static>>,
+    /// 图路径前向计数（w 系验收：证路径确实被走到）
+    replays: u64,
+}
+
 // 独占持有全部设备句柄；exec 单线程驱动（§5）——同 DeviceSession 的论证
 unsafe impl Send for ToyExecutor {}
 
@@ -192,6 +236,8 @@ pub struct ToyExecutor {
     /// 已回收块表行（admitted 取用——行必须可回收，否则服务器在第
     /// max_rows 次 admit 后死掉：battery run2/3 全空抓到的长寿性缺陷）
     free_rows: Vec<u32>,
+    /// 可分配块表行上限（图档让出末行作 sink——NONE 时 = max_rows）
+    row_capacity: u32,
     // 派生常量（validate 后缓存）
     q_elems: usize,
     kv_elems: usize,
@@ -199,7 +245,9 @@ pub struct ToyExecutor {
     max_rows: usize,
     bpr: usize,
     q_scale: f32,
-    // 会话最后声明 = 最后析构
+    /// FULL_DECODE 图档（None = NONE——每步分配的 eager 直发）
+    graph: Option<GraphMode>,
+    // 会话最后声明 = 最后析构（graph 的 exec/buffer 钉扎依赖此序）
     session: DeviceSession,
 }
 
@@ -222,7 +270,8 @@ impl ToyExecutor {
             reference::rope_table(cfg.max_pos as usize, cfg.head_dim as usize / 2, 10000.0);
         let kv_bytes = cfg.num_pages as usize * cfg.block_size as usize * ke * 2;
         let bf = |n: usize| n * 2; // bf16 字节数
-        Ok(ToyExecutor {
+        let row_capacity = max_rows as u32 - u32::from(!cfg.graph_buckets.is_empty());
+        let mut ex = ToyExecutor {
             w: WDev {
                 embed: pin!(gpu.alloc_from_slice(&w.embed)),
                 rms1: pin!(gpu.alloc_from_slice(&w.rms1)),
@@ -263,15 +312,76 @@ impl ToyExecutor {
             bt_host: vec![0u32; max_rows * bpr],
             next_row: 0,
             free_rows: Vec::new(),
+            row_capacity,
             q_elems: qe,
             kv_elems: ke,
             t_max,
             max_rows,
             bpr,
             q_scale: 1.0f32 / (cfg.head_dim as f32).sqrt(),
+            graph: None,
             cfg,
             session,
-        })
+        };
+        if !ex.cfg.graph_buckets.is_empty() {
+            ex.build_graphs()?;
+        }
+        Ok(ex)
+    }
+
+    /// FULL_DECODE 图建造（open 期一次）：sink 行落位 + 常驻输入存储 +
+    /// 各桶「预热→捕获→实例化」。此后纯 decode 步按 ≥m 最小桶回放。
+    /// 捕获窗口内零隐式同步（§4 安全规则，gr5 守卫兜底）——上传与预热
+    /// 全部在 begin_capture 之前完成
+    fn build_graphs(&mut self) -> Result<(), String> {
+        let buckets = self.cfg.graph_buckets.clone();
+        let b_max = *buckets.last().unwrap() as usize;
+        let sink_row = (self.max_rows - 1) as u32;
+        // sink 专属页：padding 行的 KV 写垃圾只落此页，永不分配给请求
+        let sink_page = self.pool.alloc().ok_or("页池耗尽——sink 行需要 1 页")?;
+        self.bt_host[sink_row as usize * self.bpr] = sink_page;
+        let gpu = self.session.gpu();
+        let stream = self.session.stream();
+        let qh = self.cfg.q_heads as usize;
+        let (in_ids, in_pos, in_seq, in_posq, in_bt): (DevBuf<'static>, DevBuf<'static>, DevBuf<'static>, DevBuf<'static>, DevBuf<'static>) = (
+            pin!(gpu.alloc_bytes(b_max * 4)),
+            pin!(gpu.alloc_bytes(b_max * 4)),
+            pin!(gpu.alloc_bytes(b_max * 4)),
+            pin!(gpu.alloc_bytes(b_max * qh * 4)),
+            pin!(gpu.alloc_bytes(self.max_rows * self.bpr * 4)),
+        );
+        // 捕获期输入：全行指向 sink（tok 0 / pos 0）——真实数据回放前覆写
+        in_ids.upload_on(&vec![0u32; b_max], stream);
+        in_pos.upload_on(&vec![0u32; b_max], stream);
+        in_seq.upload_on(&vec![sink_row; b_max], stream);
+        in_posq.upload_on(&vec![0u32; b_max * qh], stream);
+        in_bt.upload_on(&self.bt_host, stream);
+        stream.sync();
+        let mut execs = Vec::with_capacity(buckets.len());
+        for &b in &buckets {
+            // 预热：同形状直发一次（cuBLASLt heuristic/PTX 模块落缓存——
+            // gr4 合同：缓存命中后 gemm 是纯 launch，捕获安全）
+            self.run_forward(b, &in_ids, &in_pos, &in_seq, &in_posq, &in_bt);
+            stream.sync();
+            // 捕获 → 实例化：录的是 kernel 序，不是数据快照（gr2）
+            stream.begin_capture();
+            self.run_forward(b, &in_ids, &in_pos, &in_seq, &in_posq, &in_bt);
+            let exec: GraphExec<'static> = pin!(stream.end_capture().instantiate());
+            execs.push(exec);
+        }
+        self.graph = Some(GraphMode {
+            sink_row,
+            b_max: b_max as u32,
+            buckets,
+            in_ids,
+            in_pos,
+            in_seq,
+            in_posq,
+            in_bt,
+            execs,
+            replays: 0,
+        });
+        Ok(())
     }
 
     pub fn cfg(&self) -> &ToyConfig {
@@ -292,13 +402,18 @@ impl ToyExecutor {
         self.reqs.get(&id).map(|s| s.blocks.len()).unwrap_or(0)
     }
 
+    /// 图回放步数（w 系验收：证图路径确实被走到；NONE 档恒 0）
+    pub fn graph_replays(&self) -> u64 {
+        self.graph.as_ref().map(|g| g.replays).unwrap_or(0)
+    }
+
     /// 前向一个 token（纯原语，不动 forwarded——x2/x4 逐步探针用）。
+    /// 单行即纯 decode 形状——图档下走桶回放（w1 用它做位级对拍）。
     /// 返回该位置 logits（bf16 存储 → f32）
     pub fn forward_one(&mut self, id: ReqId, token: u32, pos: u32) -> Vec<f32> {
         let row = self.reqs.get(&id).map(|s| s.row).unwrap_or_else(|| panic!("forward_one：未知请求 {id}"));
         self.ensure_pages(id, pos as usize);
-        let logits = self.forward_batch(&[(row, token, pos)]);
-        logits
+        self.forward_rows(&[(row, token, pos)], true)
     }
 
     /// 直跑完整生成（测试/CLI 便利面；不经过调度器）。
@@ -346,7 +461,7 @@ impl ToyExecutor {
             let next = {
                 self.reqs.get_mut(&1).unwrap().forwarded += 1;
                 self.ensure_pages(1, pos);
-                let logits = self.forward_batch(&[(row, tok_in, pos as u32)]);
+                let logits = self.forward_rows(&[(row, tok_in, pos as u32)], true);
                 crate::argmax(&logits)
             };
             out.push(next);
@@ -387,7 +502,7 @@ impl ToyExecutor {
         }
     }
 
-    /// 批前向（全部 M0 算子真路径）。rows: (块表行, token, 位置)。
+    /// 批前向（全部 M0 算子真路径，eager 直发）。rows: (块表行, token, 位置)。
     /// 返回 [T, vocab] f32（bf16 存储 → f32）。步内一次 sync（读 logits）
     fn forward_batch(&mut self, rows: &[(u32, u32, u32)]) -> Vec<f32> {
         // context 线程局部：engine 任务可在 worker 间迁移，进入设备路径先绑
@@ -397,18 +512,14 @@ impl ToyExecutor {
         for &(_, _, pos) in rows {
             assert!((pos as usize) < 256, "位置 {pos} 超 paged_attn M0 上限 256");
         }
-        let (gpu, stream, tb) = (self.session.gpu(), self.session.stream(), self.session.table());
-        let (h, i, v) =
-            (self.cfg.hidden as usize, self.cfg.inter as usize, self.cfg.vocab as usize);
-        let (qe, ke) = (self.q_elems, self.kv_elems);
-        let (qh, kvh, hd) =
-            (self.cfg.q_heads as u32, self.cfg.kv_heads as u32, self.cfg.head_dim as u32);
+        let gpu = self.session.gpu();
+        let stream = self.session.stream();
+        let qh = self.cfg.q_heads as usize;
         let ids: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let pos: Vec<u32> = rows.iter().map(|r| r.2).collect();
         let seqs: Vec<u32> = rows.iter().map(|r| r.0).collect();
         // rope 以 (token,头) 为行——pos 按头数展开（每头同 pos）
-        let posq: Vec<u32> =
-            pos.iter().flat_map(|&p| std::iter::repeat_n(p, qh as usize)).collect();
+        let posq: Vec<u32> = pos.iter().flat_map(|&p| std::iter::repeat_n(p, qh)).collect();
         let (d_ids, d_pos, d_seq, d_posq, d_bt) = (
             gpu.alloc_from_slice(&ids),
             gpu.alloc_from_slice(&pos),
@@ -416,41 +527,129 @@ impl ToyExecutor {
             gpu.alloc_from_slice(&posq),
             gpu.alloc_from_slice(&self.bt_host),
         );
+        self.run_forward(t as u32, &d_ids, &d_pos, &d_seq, &d_posq, &d_bt);
+        stream.sync();
+        // 上传缓冲在此之后才析构（sync 已过，无在飞 kernel）
+        let v = self.cfg.vocab as usize;
+        let bits: Vec<u16> = self.scr.logits.read_to_vec();
+        bits[..t * v].iter().map(|&b| reference::bf16_to_f32(b)).collect()
+    }
+
+    /// 前向 kernel 序（模型序，不含上传/sync/回读）——eager 直发与图捕获
+    /// 共用同一条序列：图是录制不是重写，位一致合同的实现前提（gr1）
+    fn run_forward(
+        &self,
+        t: u32,
+        d_ids: &DevBuf,
+        d_pos: &DevBuf,
+        d_seq: &DevBuf,
+        d_posq: &DevBuf,
+        d_bt: &DevBuf,
+    ) {
+        let stream = self.session.stream();
+        let tb = self.session.table();
+        let (h, i, v) =
+            (self.cfg.hidden as usize, self.cfg.inter as usize, self.cfg.vocab as usize);
+        let (qe, ke) = (self.q_elems, self.kv_elems);
+        let (qh, kvh, hd) =
+            (self.cfg.q_heads as u32, self.cfg.kv_heads as u32, self.cfg.head_dim as u32);
         let eps = self.cfg.eps;
         // ── 前向（顺序 = 调度无关的模型序；rope 原地（线程读写自分元素对））──
-        tb.embed.run(&d_ids, &self.w.embed, &self.scr.x, h as u32, t as u32, stream);
-        tb.rms_norm.run(&self.scr.x, &self.w.rms1, &self.scr.n1, t as u32, h as u32, eps, stream);
-        tb.gemm.run(&self.scr.n1, &self.w.wq, &self.scr.q, t as u32, qe as u32, h as u32, stream);
-        tb.gemm.run(&self.scr.n1, &self.w.wk, &self.scr.k, t as u32, ke as u32, h as u32, stream);
-        tb.gemm.run(&self.scr.n1, &self.w.wv, &self.scr.v, t as u32, ke as u32, h as u32, stream);
+        tb.embed.run(d_ids, &self.w.embed, &self.scr.x, h as u32, t, stream);
+        tb.rms_norm.run(&self.scr.x, &self.w.rms1, &self.scr.n1, t, h as u32, eps, stream);
+        tb.gemm.run(&self.scr.n1, &self.w.wq, &self.scr.q, t, qe as u32, h as u32, stream);
+        tb.gemm.run(&self.scr.n1, &self.w.wk, &self.scr.k, t, ke as u32, h as u32, stream);
+        tb.gemm.run(&self.scr.n1, &self.w.wv, &self.scr.v, t, ke as u32, h as u32, stream);
         tb.rope.run(
-            &self.scr.q, &self.scr.k, &self.cos, &self.sin, &d_posq,
-            &self.scr.q, &self.scr.k, (t as u32) * qh, hd, stream,
+            &self.scr.q, &self.scr.k, &self.cos, &self.sin, d_posq,
+            &self.scr.q, &self.scr.k, t * qh, hd, stream,
         );
         tb.kv_scatter.run(
-            &self.scr.k, &self.scr.v, &d_bt, &d_seq, &d_pos,
-            &self.k_pool, &self.v_pool, self.bpr as u32, self.cfg.block_size, ke as u32, t as u32,
+            &self.scr.k, &self.scr.v, d_bt, d_seq, d_pos,
+            &self.k_pool, &self.v_pool, self.bpr as u32, self.cfg.block_size, ke as u32, t,
             stream,
         );
         tb.paged_attn.run(
-            &self.scr.q, &self.k_pool, &self.v_pool, &d_bt, &d_seq, &d_pos,
+            &self.scr.q, &self.k_pool, &self.v_pool, d_bt, d_seq, d_pos,
             &self.scr.attn, self.q_scale, self.bpr as u32, self.cfg.block_size,
-            qh, kvh, hd, t as u32, stream,
+            qh, kvh, hd, t, stream,
         );
-        tb.gemm.run(&self.scr.attn, &self.w.wo, &self.scr.o, t as u32, h as u32, qe as u32, stream);
-        tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, (t * h) as u32, stream);
-        tb.rms_norm.run(&self.scr.h2, &self.w.rms2, &self.scr.n2, t as u32, h as u32, eps, stream);
-        tb.gemm.run(&self.scr.n2, &self.w.wg, &self.scr.g, t as u32, i as u32, h as u32, stream);
-        tb.gemm.run(&self.scr.n2, &self.w.wu, &self.scr.u, t as u32, i as u32, h as u32, stream);
-        tb.silu.run(&self.scr.g, &self.scr.act, (t * i) as u32, stream);
-        tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, (t * i) as u32, stream);
-        tb.gemm.run(&self.scr.m, &self.w.wd, &self.scr.d, t as u32, h as u32, i as u32, stream);
-        tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.h3, (t * h) as u32, stream);
-        tb.gemm.run(&self.scr.h3, &self.w.lm, &self.scr.logits, t as u32, v as u32, h as u32, stream);
+        tb.gemm.run(&self.scr.attn, &self.w.wo, &self.scr.o, t, h as u32, qe as u32, stream);
+        tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, t * h as u32, stream);
+        tb.rms_norm.run(&self.scr.h2, &self.w.rms2, &self.scr.n2, t, h as u32, eps, stream);
+        tb.gemm.run(&self.scr.n2, &self.w.wg, &self.scr.g, t, i as u32, h as u32, stream);
+        tb.gemm.run(&self.scr.n2, &self.w.wu, &self.scr.u, t, i as u32, h as u32, stream);
+        tb.silu.run(&self.scr.g, &self.scr.act, t * i as u32, stream);
+        tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t * i as u32, stream);
+        tb.gemm.run(&self.scr.m, &self.w.wd, &self.scr.d, t, h as u32, i as u32, stream);
+        tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.h3, t * h as u32, stream);
+        tb.gemm.run(&self.scr.h3, &self.w.lm, &self.scr.logits, t, v as u32, h as u32, stream);
+    }
+
+    /// 步前向统一入口：pure_decode（每行独立请求的 1-token 步）且桶覆盖 →
+    /// 图回放；否则 eager 直发。混合步/prefill 永远 eager——图只在纯
+    /// decode 档（批形状固定，无 host 侧数据依赖控制流，§4 入图安全规则）
+    fn forward_rows(&mut self, rows: &[(u32, u32, u32)], pure_decode: bool) -> Vec<f32> {
+        if pure_decode && !rows.is_empty() {
+            if let Some(bi) = self.bucket_for(rows.len()) {
+                return self.forward_graph(bi, rows);
+            }
+        }
+        self.forward_batch(rows)
+    }
+
+    /// ≥m 的最小桶下标；超最大桶 → None（回落 eager）
+    fn bucket_for(&self, m: usize) -> Option<usize> {
+        let g = self.graph.as_ref()?;
+        if m > g.b_max as usize {
+            return None;
+        }
+        g.buckets.iter().position(|&b| b as usize >= m)
+    }
+
+    /// 图回放前向：前 m 行真数据，其余行由 sink 吸收（tok 0 / pos 0 /
+    /// seq=sink——KV 垃圾只落 sink 专属页）。输入按 **b_max 整段覆写**上传
+    /// （桶共享单输入存储：各桶图录共享缓冲的 narrow view），一次 graph
+    /// launch 重放全 kernel 序，回读前 m 行 logits
+    fn forward_graph(&mut self, b_idx: usize, rows: &[(u32, u32, u32)]) -> Vec<f32> {
+        self.session.gpu().bind_thread();
+        let (b, cap, m, sink, qh) = {
+            let g = self.graph.as_ref().expect("forward_graph 须图档");
+            (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row, self.cfg.q_heads as usize)
+        };
+        assert!(m > 0 && m <= b, "桶路由合同：m {m} ≤ 桶 {b}");
+        for &(_, _, pos) in rows {
+            assert!((pos as usize) < 256, "位置 {pos} 超 paged_attn M0 上限 256");
+        }
+        // host 组装：b_max 全量（默认值 = sink 吸收行），前 m 行写真数据
+        let mut ids = vec![0u32; cap];
+        let mut pos = vec![0u32; cap];
+        let mut seq = vec![sink; cap];
+        let mut posq = vec![0u32; cap * qh];
+        for (j, &(r, tok, p)) in rows.iter().enumerate() {
+            ids[j] = tok;
+            pos[j] = p;
+            seq[j] = r;
+            for k in 0..qh {
+                posq[j * qh + k] = p;
+            }
+        }
+        let stream = self.session.stream();
+        {
+            let g = self.graph.as_ref().expect("forward_graph 须图档");
+            g.in_ids.upload_on(&ids, stream);
+            g.in_pos.upload_on(&pos, stream);
+            g.in_seq.upload_on(&seq, stream);
+            g.in_posq.upload_on(&posq, stream);
+            // 页保证已先于本调用完成（step/generate 合同）——bt_host 是最新账
+            g.in_bt.upload_on(&self.bt_host, stream);
+            g.execs[b_idx].launch(stream);
+        }
         stream.sync();
-        // 上传缓冲在此之后才析构（sync 已过，无在飞 kernel）
+        self.graph.as_mut().unwrap().replays += 1;
+        let v = self.cfg.vocab as usize;
         let bits: Vec<u16> = self.scr.logits.read_to_vec();
-        bits[..t * v].iter().map(|&b| reference::bf16_to_f32(b)).collect()
+        bits[..m * v].iter().map(|&x| reference::bf16_to_f32(x)).collect()
     }
 }
 
@@ -464,7 +663,11 @@ impl Executor for ToyExecutor {
         // 空 prompt → BOS(0)：调度器看长度 0 直接 decode，首步前向 BOS
         let seq = if prompt.is_empty() { vec![0u32] } else { prompt.to_vec() };
         let row = self.free_rows.pop().unwrap_or_else(|| {
-            assert!(self.next_row < self.max_rows as u32, "块表行耗尽（{}）——M0 toy 上限", self.max_rows);
+            assert!(
+                self.next_row < self.row_capacity,
+                "块表行耗尽（{}，图档含 sink 让位 1 行）——M0 toy 上限",
+                self.row_capacity
+            );
             let r = self.next_row;
             self.next_row += 1;
             r
@@ -524,9 +727,10 @@ impl Executor for ToyExecutor {
         for (id, upto) in need {
             self.ensure_pages(id, upto);
         }
-        // 4. 前向 + 贪心（采样行各自的 logits 行）
+        // 4. 前向 + 贪心（采样行各自的 logits 行）。prefill 空 = 纯 decode
+        //    步（每行独立请求）→ 图档候选；否则 eager
         let rows: Vec<(u32, u32, u32)> = batch.iter().map(|r| (r.row, r.tok, r.pos)).collect();
-        let logits = self.forward_batch(&rows);
+        let logits = self.forward_rows(&rows, plan.prefill.is_empty());
         let v = self.cfg.vocab as usize;
         let mut out = Vec::new();
         for (id, row_i) in samples {

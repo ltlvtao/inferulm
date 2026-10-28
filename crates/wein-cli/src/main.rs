@@ -56,13 +56,25 @@ fn main() {
         //
         // --exec qwen：Qwen3.5-4B 真权重（I1 竖切）——exec 即节拍器
         // （脚本件/步延迟不参与），--model 给模型目录（safetensors+tokenizer）
+        // --graph：FULL_DECODE 图档（W2 §7）——纯 decode 步走桶图回放
         let use_qwen = engine_kind == "core" && exec_kind == "qwen";
+        let use_graph = args.iter().any(|a| a == "--graph");
+        let graph_buckets: Vec<u32> = vec![1, 2, 4, 8, 16, 32];
         let (engine, tok): (EngineHandle, Arc<dyn Tokenizer>) = if use_qwen {
             let dir = PathBuf::from(&model);
-            let ex = wein_exec::Qwen35Executor::open(&dir).unwrap_or_else(|e| {
-                eprintln!("qwen exec 打开失败（--model 需为模型目录）：{e}");
-                std::process::exit(1)
-            });
+            let ex = if use_graph {
+                wein_exec::Qwen35Executor::open_graph(&dir, graph_buckets.clone()).unwrap_or_else(
+                    |e| {
+                        eprintln!("qwen 图档打开失败（--model 需为模型目录）：{e}");
+                        std::process::exit(1)
+                    },
+                )
+            } else {
+                wein_exec::Qwen35Executor::open(&dir).unwrap_or_else(|e| {
+                    eprintln!("qwen exec 打开失败（--model 需为模型目录）：{e}");
+                    std::process::exit(1)
+                })
+            };
             let hf = wein_model::HfTokenizer::open(&dir).unwrap_or_else(|e| {
                 eprintln!("tokenizer 打开失败：{e}");
                 std::process::exit(1)
@@ -88,11 +100,14 @@ fn main() {
                     if exec_kind == "toy" {
                         // 真 exec：DeviceSession + toy 模型（L3 归因电池）。
                         // 组装在 cli 层——engine 不依赖 exec（§2 依赖单向）
-                        let toy = wein_exec::ToyExecutor::open(wein_exec::ToyConfig::default())
-                            .unwrap_or_else(|e| {
-                                eprintln!("toy exec 打开失败：{e}");
-                                std::process::exit(1)
-                            });
+                        let mut tcfg = wein_exec::ToyConfig::default();
+                        if use_graph {
+                            tcfg.graph_buckets = graph_buckets.clone();
+                        }
+                        let toy = wein_exec::ToyExecutor::open(tcfg).unwrap_or_else(|e| {
+                            eprintln!("toy exec 打开失败：{e}");
+                            std::process::exit(1)
+                        });
                         EngineCore::spawn_with(cfg, Box::new(toy)).0
                     } else {
                         EngineCore::spawn(cfg).0
@@ -113,12 +128,13 @@ fn main() {
             .await
             .expect("bind failed");
         let mem_tag = if args.iter().any(|a| a == "--memory") { "+memory" } else { "" };
+        let graph_tag = if use_graph { "+graph" } else { "" };
         let exec_tag = if engine_kind == "core" && exec_kind == "toy" {
-            "+toy"
+            format!("+toy{graph_tag}")
         } else if use_qwen {
-            "+qwen"
+            format!("+qwen{graph_tag}")
         } else {
-            ""
+            graph_tag.to_string()
         };
         println!("wein ({engine_kind}{mem_tag}{exec_tag}) listening on http://{addr}  model={model}");
         tokio::signal::ctrl_c().await.ok();

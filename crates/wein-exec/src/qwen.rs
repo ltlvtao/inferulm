@@ -16,11 +16,17 @@
 //!
 //! 调度合同与 ToyExecutor 同钉（x6/x7 验收）：追平段尾即采样位；批内同
 //! 请求行连续（conv/deltanet 的段语义前提——forward_batch 构造处有断言）。
+//!
+//! 图档位（§7，qg 系验收）：`open_graph` = FULL_DECODE——纯 decode 步的
+//! span/gather/采样行表是桶形的纯函数（固化上传一次），数据五缓冲
+//! （ids/pos/seqs/rid/bt）常驻每步覆写；argmax 烤进图尾。sink 行（块表
+//! 末行 + 专属页 + 专属状态行）吸收桶尾 padding。`open` = NONE（q 系
+//! 保持 eager）
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use wein_engine::Executor;
-use wein_kernel::cuda::{DevBuf, Stream};
+use wein_kernel::cuda::{DevBuf, GraphExec, Stream};
 use wein_kernel::ops::{
     AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetOp, EmbedOp, GemmOp, KvScatterOp,
     MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SigmulOp, SiluOp,
@@ -124,6 +130,56 @@ struct ReqState {
     blocks: Vec<u32>,
 }
 
+/// FULL_DECODE 图档（§7；机制由 w 系在 toy 钉死，此处为 32 层真模型装配）。
+/// 数据五缓冲每步覆写；固化输入（span/gather/采样行表）是纯 decode 桶形
+/// 的纯函数，上传一次永不再动——各桶图录共享缓冲的 narrow view。
+/// 声明序先于 session：'static 钉扎（borrow session.stream 的短命借用提为
+/// 'static）与 stream/table 同一论证
+struct QGraphMode {
+    sink_row: u32,
+    b_max: u32,
+    buckets: Vec<u32>,
+    // —— 每步覆写（设备指针烤进图节点，数据 live）——
+    in_ids: DevBuf<'static>,
+    in_pos: DevBuf<'static>,
+    in_seqs: DevBuf<'static>,
+    /// 纯 decode 下 row_id 与 tok_row 同内容（每行一段，段主即行主）
+    in_rid: DevBuf<'static>,
+    /// 全块表常驻镜像（页保证先于上传）
+    in_bt: DevBuf<'static>,
+    // —— 固化输入（桶形纯函数；图节点指向这些缓冲，必须与 execs 同寿）——
+    fx_start: DevBuf<'static>,   // [0..b_max)
+    fx_count: DevBuf<'static>,   // [1; b_max]
+    fx_tpos: DevBuf<'static>,    // [0; b_max]（段内局部位恒 0）
+    fx_rows: DevBuf<'static>,    // argmax 采样行 [0..b_max)
+    fx_iq: DevBuf<'static>,
+    fx_ig: DevBuf<'static>,
+    fx_ilq: DevBuf<'static>,
+    fx_ilk: DevBuf<'static>,
+    fx_ilv: DevBuf<'static>,
+    execs: Vec<GraphExec<'static>>,
+    /// 图路径前向计数（qg 系验收：证路径确实被走到）
+    replays: u64,
+}
+
+/// 前向输入束——eager 临时缓冲与图档常驻缓冲同构喂法（run_forward 共用）
+struct FwdIn<'a> {
+    ids: &'a DevBuf<'a>,
+    pos: &'a DevBuf<'a>,
+    seqs: &'a DevBuf<'a>,
+    bt: &'a DevBuf<'a>,
+    start: &'a DevBuf<'a>,
+    count: &'a DevBuf<'a>,
+    rid: &'a DevBuf<'a>,
+    trow: &'a DevBuf<'a>,
+    tpos: &'a DevBuf<'a>,
+    iq: &'a DevBuf<'a>,
+    ig: &'a DevBuf<'a>,
+    ilq: &'a DevBuf<'a>,
+    ilk: &'a DevBuf<'a>,
+    ilv: &'a DevBuf<'a>,
+}
+
 // 独占设备句柄，exec 单线程驱动（§5）——同 DeviceSession 论证
 unsafe impl Send for Qwen35Executor {}
 
@@ -147,11 +203,15 @@ pub struct Qwen35Executor {
     bt_host: Vec<u32>,
     next_row: u32,
     free_rows: Vec<u32>,
+    /// 可分配块表行上限（图档让出末行作 sink——NONE 时 = MAX_ROWS）
+    row_capacity: u32,
     // 派生常量
     lin_row: usize, // 线性层状态单行字节数
     conv_row: usize, // conv 状态单行字节数
     bpr: usize,
     q_scale: f32,
+    /// FULL_DECODE 图档（None = NONE——eager 直发）
+    graph: Option<QGraphMode>,
     session: DeviceSession,
 }
 
@@ -299,12 +359,132 @@ impl Qwen35Executor {
             bt_host: vec![0u32; MAX_ROWS * bpr_of()],
             next_row: 0,
             free_rows: Vec::new(),
+            row_capacity: MAX_ROWS as u32,
             lin_row,
             conv_row,
             bpr: bpr_of(),
             q_scale,
+            graph: None,
             session,
         })
+    }
+
+    /// FULL_DECODE 图档开启（NONE 档走 `open`）。桶集合须非空、严格升序、
+    /// ≥1 且最大桶 ≤ T_MAX。open 后追加建造：sink 行落位 + 固化输入 +
+    /// 各桶「预热→捕获→实例化」——捕获窗口内零隐式同步（§4，gr5 守卫）
+    pub fn open_graph(dir: &Path, buckets: Vec<u32>) -> Result<Self, String> {
+        if buckets.is_empty() {
+            return Err("图档桶集合不能为空（NONE 档用 open）".into());
+        }
+        if buckets.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(format!("桶集合须严格升序：{buckets:?}"));
+        }
+        if buckets[0] < 1 || *buckets.last().unwrap() as usize > T_MAX {
+            return Err(format!("桶集越界（须 ≥1 且最大 ≤ {T_MAX}）：{buckets:?}"));
+        }
+        let mut ex = Self::open(dir)?;
+        ex.row_capacity = MAX_ROWS as u32 - 1; // sink 让位——须在首个 admit 前定死
+        ex.build_graphs(buckets)?;
+        Ok(ex)
+    }
+
+    fn build_graphs(&mut self, buckets: Vec<u32>) -> Result<(), String> {
+        let b_max = *buckets.last().unwrap() as usize;
+        let sink_row = (MAX_ROWS - 1) as u32;
+        // sink 专属页 + 状态行零化：padding 的 KV/递推垃圾只落自己的页与行
+        let sink_page = self.pool.alloc().ok_or("页池耗尽——sink 行需要 1 页")?;
+        self.bt_host[sink_row as usize * self.bpr] = sink_page;
+        self.zero_row_state(sink_row, self.session.stream());
+
+        let gpu = self.session.gpu();
+        let stream = self.session.stream();
+        let nqh = self.cfg.num_heads as usize;
+        // 每步覆写数据缓冲（b_max 全量——各桶图录 narrow view）
+        let in_ids: DevBuf<'static> = pin!(gpu.alloc_bytes(b_max * 4));
+        let in_pos: DevBuf<'static> = pin!(gpu.alloc_bytes(b_max * 4));
+        let in_seqs: DevBuf<'static> = pin!(gpu.alloc_bytes(b_max * 4));
+        let in_rid: DevBuf<'static> = pin!(gpu.alloc_bytes(b_max * 4));
+        let in_bt: DevBuf<'static> = pin!(gpu.alloc_bytes(MAX_ROWS * self.bpr * 4));
+        // 固化输入：纯 decode 桶形的纯函数
+        let start: Vec<u32> = (0..b_max as u32).collect();
+        let fx_start: DevBuf<'static> = pin!(gpu.alloc_from_slice(&start));
+        let fx_count: DevBuf<'static> = pin!(gpu.alloc_from_slice(&vec![1u32; b_max]));
+        let fx_tpos: DevBuf<'static> = pin!(gpu.alloc_from_slice(&vec![0u32; b_max]));
+        let fx_rows: DevBuf<'static> = pin!(gpu.alloc_from_slice(&start)); // argmax 采样行
+        let ids_q: Vec<u32> =
+            (0..b_max).flat_map(|t| (0..nqh).map(move |h| (t * 2 * nqh + 2 * h) as u32)).collect();
+        let ids_gate: Vec<u32> =
+            (0..b_max).flat_map(|t| (0..nqh).map(move |h| (t * 2 * nqh + 2 * h + 1) as u32)).collect();
+        let ids_lq: Vec<u32> = (0..b_max).map(|t| (t * 4) as u32).collect();
+        let ids_lk: Vec<u32> = (0..b_max).map(|t| (t * 4 + 1) as u32).collect();
+        let ids_lv: Vec<u32> = (0..b_max).map(|t| (t * 2 + 1) as u32).collect();
+        let fx_iq: DevBuf<'static> = pin!(gpu.alloc_from_slice(&ids_q));
+        let fx_ig: DevBuf<'static> = pin!(gpu.alloc_from_slice(&ids_gate));
+        let fx_ilq: DevBuf<'static> = pin!(gpu.alloc_from_slice(&ids_lq));
+        let fx_ilk: DevBuf<'static> = pin!(gpu.alloc_from_slice(&ids_lk));
+        let fx_ilv: DevBuf<'static> = pin!(gpu.alloc_from_slice(&ids_lv));
+        // 捕获期输入全指 sink（tok 0 / pos 0）——真实数据回放前覆写
+        in_ids.upload_on(&vec![0u32; b_max], stream);
+        in_pos.upload_on(&vec![0u32; b_max], stream);
+        in_seqs.upload_on(&vec![sink_row; b_max], stream);
+        in_rid.upload_on(&vec![sink_row; b_max], stream);
+        in_bt.upload_on(&self.bt_host, stream);
+        stream.sync();
+
+        let inp = FwdIn {
+            ids: &in_ids,
+            pos: &in_pos,
+            seqs: &in_seqs,
+            bt: &in_bt,
+            start: &fx_start,
+            count: &fx_count,
+            rid: &in_rid,
+            trow: &in_rid,
+            tpos: &fx_tpos,
+            iq: &fx_iq,
+            ig: &fx_ig,
+            ilq: &fx_ilq,
+            ilk: &fx_ilk,
+            ilv: &fx_ilv,
+        };
+        let voc = self.cfg.vocab_size as u32;
+        let mut execs = Vec::with_capacity(buckets.len());
+        for &b in &buckets {
+            // 预热：同形状直发一次（cuBLASLt heuristic/PTX 模块落缓存——gr4）
+            self.run_forward(b, b, &inp);
+            stream.sync();
+            // 捕获 → 实例化；采样烤进图尾：argmax s=B、采样行 [0..B)
+            stream.begin_capture();
+            self.run_forward(b, b, &inp);
+            self.session.table().argmax_rows.run(
+                &self.scr.logits, &fx_rows, &self.scr.am_scratch, &self.scr.am_out, voc, b, stream,
+            );
+            let exec: GraphExec<'static> = pin!(stream.end_capture().instantiate());
+            execs.push(exec);
+        }
+        stream.sync();
+        self.graph = Some(QGraphMode {
+            sink_row,
+            b_max: b_max as u32,
+            buckets,
+            in_ids,
+            in_pos,
+            in_seqs,
+            in_rid,
+            in_bt,
+            fx_start,
+            fx_count,
+            fx_tpos,
+            fx_rows,
+            fx_iq,
+            fx_ig,
+            fx_ilq,
+            fx_ilk,
+            fx_ilv,
+            execs,
+            replays: 0,
+        });
+        Ok(())
     }
 
     pub fn cfg(&self) -> &Qwen35Config {
@@ -321,6 +501,11 @@ impl Qwen35Executor {
 
     pub fn pages_of(&self, id: ReqId) -> usize {
         self.reqs.get(&id).map(|s| s.blocks.len()).unwrap_or(0)
+    }
+
+    /// 图回放步数（qg 系验收：证图路径确实被走到；NONE 档恒 0）
+    pub fn graph_replays(&self) -> u64 {
+        self.graph.as_ref().map(|g| g.replays).unwrap_or(0)
     }
 
     /// 单 token 前向探针（不动 forwarded——q5 逐步对拍用）：返回该位全词表
@@ -381,7 +566,7 @@ impl Qwen35Executor {
             let next = {
                 self.reqs.get_mut(&1).unwrap().forwarded += 1;
                 self.ensure_pages(1, pos);
-                self.forward_batch(&[(row, tok_in, pos as u32)], &[0])[0]
+                self.forward_rows(&[(row, tok_in, pos as u32)], &[0], true)[0]
             };
             out.push(next);
             self.reqs.get_mut(&1).unwrap().seq.push(next);
@@ -521,13 +706,52 @@ impl Qwen35Executor {
             gpu.alloc_from_slice(&ids_lk),
             gpu.alloc_from_slice(&ids_lv),
         );
+        let inp = FwdIn {
+            ids: &d_ids,
+            pos: &d_pos,
+            seqs: &d_seqs,
+            bt: &d_bt,
+            start: &d_start,
+            count: &d_count,
+            rid: &d_rid,
+            trow: &d_trow,
+            tpos: &d_tpos,
+            iq: &d_iq,
+            ig: &d_ig,
+            ilq: &d_ilq,
+            ilk: &d_ilk,
+            ilv: &d_ilv,
+        };
+        self.run_forward(t as u32, n_rows, &inp);
+
+        // ── 采样（设备端 argmax；只回读采样行的 u32）──
+        if samples.is_empty() {
+            stream.sync();
+            return Vec::new();
+        }
+        let s = samples.len() as u32;
+        assert!((s as usize) <= t, "采样行数超批");
+        let d_rows = gpu.alloc_from_slice(samples);
+        tb.argmax_rows.run(
+            &self.scr.logits, &d_rows, &self.scr.am_scratch, &self.scr.am_out,
+            self.cfg.vocab_size as u32, s, stream,
+        );
+        stream.sync();
+        let out: Vec<u32> = self.scr.am_out.read_to_vec();
+        out[..s as usize].to_vec()
+    }
+
+    /// 前向 kernel 序（embed → 32 层 → final norm + logits；不含采样/
+    /// sync/回读）——eager 直发与图捕获共用同一条序列（gr1 位一致合同）
+    fn run_forward(&self, t32: u32, n_rows: u32, inp: &FwdIn) {
+        let stream = self.session.stream();
+        let tb = self.session.table();
         let eps = self.cfg.rms_eps;
         let (h, ii, voc) =
             (self.cfg.hidden_size as u32, self.cfg.inter_size as u32, self.cfg.vocab_size as u32);
-        let t32 = t as u32;
 
         // ── embed ──
-        tb.embed.run(&d_ids, &self.embed, &self.scr.x, h, t32, stream);
+        tb.embed.run(inp.ids, &self.embed, &self.scr.x, h, t32, stream);
 
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
         let mut lin_i = 0usize;
@@ -539,8 +763,8 @@ impl Qwen35Executor {
                     let (qh_n, kvh, hd) = (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
                     let he = kvh * hd;
                     tb.gemm.run_wt(&self.scr.n1, &w.qg, &self.scr.qg, t32, 2 * qh_n * hd, h, stream);
-                    tb.embed.run(&d_iq, &self.scr.qg, &self.scr.qh, hd, t32 * qh_n, stream);
-                    tb.embed.run(&d_ig, &self.scr.qg, &self.scr.gate, hd, t32 * qh_n, stream);
+                    tb.embed.run(inp.iq, &self.scr.qg, &self.scr.qh, hd, t32 * qh_n, stream);
+                    tb.embed.run(inp.ig, &self.scr.qg, &self.scr.gate, hd, t32 * qh_n, stream);
                     // 零中心 norm 在 head_dim 上（原地：行私有读写，安全）
                     tb.rms_norm_zc.run(&self.scr.qh, &w.qn, &self.scr.qh, t32 * qh_n, hd, eps, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.k, &self.scr.kh, t32, he, h, stream);
@@ -548,20 +772,20 @@ impl Qwen35Executor {
                     tb.rms_norm_zc.run(&self.scr.kh, &w.kn, &self.scr.kh, t32 * kvh, hd, eps, stream);
                     let rd = self.cfg.rot_dim();
                     tb.rope_pt.run(
-                        &self.scr.qh, &self.cos, &self.sin, &d_pos, &self.scr.qh, rd, hd, qh_n,
+                        &self.scr.qh, &self.cos, &self.sin, inp.pos, &self.scr.qh, rd, hd, qh_n,
                         t32, stream,
                     );
                     tb.rope_pt.run(
-                        &self.scr.kh, &self.cos, &self.sin, &d_pos, &self.scr.kh, rd, hd, kvh,
+                        &self.scr.kh, &self.cos, &self.sin, inp.pos, &self.scr.kh, rd, hd, kvh,
                         t32, stream,
                     );
                     tb.kv_scatter.run(
-                        &self.scr.kh, &self.scr.vh, &d_bt, &d_seqs, &d_pos, &self.k_pool[full_i],
+                        &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[full_i],
                         &self.v_pool[full_i], self.bpr as u32, BLOCK, he, t32, stream,
                     );
                     tb.paged_attn.run(
-                        &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], &d_bt, &d_seqs,
-                        &d_pos, &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh,
+                        &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt, inp.seqs,
+                        inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh,
                         hd, t32, stream,
                     );
                     tb.sigmul.run(
@@ -581,23 +805,23 @@ impl Qwen35Executor {
                     let cd = 2 * keyd + vald;
                     tb.gemm.run_wt(&self.scr.n1, &w.qkv, &self.scr.qkv, t32, cd, h, stream);
                     tb.conv1d_dw.run(
-                        &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc, &d_trow,
-                        &d_tpos, cd, self.cfg.conv_kernel, t32, stream,
+                        &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc, inp.trow,
+                        inp.tpos, cd, self.cfg.conv_kernel, t32, stream,
                     );
                     tb.conv_state_roll.run(
-                        &self.scr.qkvc, &self.conv_state[lin_i], &d_start, &d_count, &d_rid, cd,
+                        &self.scr.qkvc, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
                         self.cfg.conv_kernel, n_rows, stream,
                     );
-                    tb.embed.run(&d_ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
-                    tb.embed.run(&d_ilk, &self.scr.qkvc, &self.scr.ks, keyd, t32, stream);
-                    tb.embed.run(&d_ilv, &self.scr.qkvc, &self.scr.vs, vald, t32, stream);
+                    tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
+                    tb.embed.run(inp.ilk, &self.scr.qkvc, &self.scr.ks, keyd, t32, stream);
+                    tb.embed.run(inp.ilv, &self.scr.qkvc, &self.scr.vs, vald, t32, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.z, &self.scr.z, t32, vald, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.b, &self.scr.bb, t32, 32, h, stream);
                     tb.deltanet.run(
                         &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
-                        &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, &d_start,
-                        &d_count, &d_rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, stream,
+                        &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
+                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, stream,
                     );
                     tb.rms_norm_gated.run(
                         &self.scr.core, &self.scr.z, &w.norm, &self.scr.normed, t32 * vh_n, vd,
@@ -619,21 +843,69 @@ impl Qwen35Executor {
         // ── final norm + logits（tie：embed 兼作 lm_head 的 W[n,k]）──
         tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
         tb.gemm.run_wt(&self.scr.n2, &self.embed, &self.scr.logits, t32, voc, h, stream);
+    }
 
-        // ── 采样（设备端 argmax；只回读采样行的 u32）──
-        if samples.is_empty() {
-            stream.sync();
-            return Vec::new();
+    /// 步前向统一入口：pure_decode（每行独立请求的 1-token 步，采样行
+    /// = 全部行）且桶覆盖 → 图回放；否则 eager 直发。混合步/prefill 永远
+    /// eager（图只在纯 decode 档——批形状固定，§4 入图安全规则）
+    fn forward_rows(&mut self, rows: &[(u32, u32, u32)], samples: &[u32], pure_decode: bool) -> Vec<u32> {
+        if pure_decode && !rows.is_empty() && samples.len() == rows.len() {
+            if let Some(bi) = self.bucket_for(rows.len()) {
+                return self.forward_graph(bi, rows);
+            }
         }
-        let s = samples.len() as u32;
-        assert!((s as usize) <= t, "采样行数超批");
-        let d_rows = gpu.alloc_from_slice(samples);
-        tb.argmax_rows.run(
-            &self.scr.logits, &d_rows, &self.scr.am_scratch, &self.scr.am_out, voc, s, stream,
-        );
+        self.forward_batch(rows, samples)
+    }
+
+    /// ≥m 的最小桶下标；超最大桶 → None（回落 eager）
+    fn bucket_for(&self, m: usize) -> Option<usize> {
+        let g = self.graph.as_ref()?;
+        if m > g.b_max as usize {
+            return None;
+        }
+        g.buckets.iter().position(|&b| b as usize >= m)
+    }
+
+    /// 图回放前向：前 m 行真数据，其余行由 sink 吸收（tok 0 / pos 0 /
+    /// seq=sink——KV/递推垃圾只落 sink 专属页与状态行）。数据五缓冲按
+    /// b_max 整段覆写，一次 graph launch 重放全 kernel 序（含图尾 argmax），
+    /// 只回读前 m 个采样 u32
+    fn forward_graph(&mut self, b_idx: usize, rows: &[(u32, u32, u32)]) -> Vec<u32> {
+        self.session.gpu().bind_thread();
+        let (b, cap, m, sink) = {
+            let g = self.graph.as_ref().expect("forward_graph 须图档");
+            (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row)
+        };
+        assert!(m > 0 && m <= b, "桶路由合同：m {m} ≤ 桶 {b}");
+        for &(_, _, pos) in rows {
+            assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
+        }
+        // host 组装：b_max 全量（默认值 = sink 吸收行），前 m 行写真数据
+        let mut ids = vec![0u32; cap];
+        let mut pos = vec![0u32; cap];
+        let mut seqs = vec![sink; cap];
+        let mut rid = vec![sink; cap];
+        for (j, &(r, tok, p)) in rows.iter().enumerate() {
+            ids[j] = tok;
+            pos[j] = p;
+            seqs[j] = r;
+            rid[j] = r;
+        }
+        let stream = self.session.stream();
+        {
+            let g = self.graph.as_ref().expect("forward_graph 须图档");
+            g.in_ids.upload_on(&ids, stream);
+            g.in_pos.upload_on(&pos, stream);
+            g.in_seqs.upload_on(&seqs, stream);
+            g.in_rid.upload_on(&rid, stream);
+            // 页保证已先于本调用完成（step/generate 合同）——bt_host 是最新账
+            g.in_bt.upload_on(&self.bt_host, stream);
+            g.execs[b_idx].launch(stream);
+        }
         stream.sync();
+        self.graph.as_mut().unwrap().replays += 1;
         let out: Vec<u32> = self.scr.am_out.read_to_vec();
-        out[..s as usize].to_vec()
+        out[..m].to_vec()
     }
 }
 
@@ -667,8 +939,9 @@ impl Executor for Qwen35Executor {
         let seq = if prompt.is_empty() { vec![0u32] } else { prompt.to_vec() };
         let row = self.free_rows.pop().unwrap_or_else(|| {
             assert!(
-                (self.next_row as usize) < MAX_ROWS,
-                "块表行耗尽（{MAX_ROWS}）——I1 并发上限"
+                self.next_row < self.row_capacity,
+                "块表行耗尽（{}，图档含 sink 让位 1 行）——I1 并发上限",
+                self.row_capacity
             );
             let r = self.next_row;
             self.next_row += 1;
@@ -729,10 +1002,11 @@ impl Executor for Qwen35Executor {
         for (id, upto) in need {
             self.ensure_pages(id, upto);
         }
-        // 4. 前向 + 设备端贪心
+        // 4. 前向 + 设备端贪心。prefill 空 = 纯 decode 步（每行独立请求、
+        //    采样行 = 全部行）→ 图档候选；否则 eager
         let rows: Vec<(u32, u32, u32)> = batch.iter().map(|r| (r.row, r.tok, r.pos)).collect();
         let sample_rows: Vec<u32> = samples.iter().map(|s| s.1 as u32).collect();
-        let toks = self.forward_batch(&rows, &sample_rows);
+        let toks = self.forward_rows(&rows, &sample_rows, plan.prefill.is_empty());
         let mut out = Vec::new();
         for ((id, _), tok) in samples.iter().zip(toks) {
             if let Some(st) = self.reqs.get_mut(id) {

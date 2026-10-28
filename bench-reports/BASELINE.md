@@ -75,6 +75,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +memory | release | 168,289 | 10.56 / 12.21 | — | — | 1.18 / 4.98 | 0.022 | 1.67 | 0.035 | 内存层首测（battery-20261028-152856）；L2m−L2 = +13µs/token，tps 持平（312.6k vs 313.1k）；宽裕块容量——纯记账账 |
 | 2026-10-28 | +exec | release | 168,890 | 10.20 / 12.31 | — | — | 1.15 / 3.08 | 0.041 | 1.72 | 0.043 | exec 真身首测（battery-20261028-215639）：**L3 TTFT p50 6.76ms / p99 14.27ms / ITL mean 0.80ms / tps 47.1k**（toy 真 GPU 步，其余层噪声带内）；行回收缺陷修复后三重复全健康 |
 | 2026-10-29 | +qwen | release | 165,559 | 10.78 / 12.10 | — | — | 1.05 / 4.59 | 0.036 | 1.65 | 0.058 | 真模型竖切首测（battery-20261029-002042，I1）：**L3q TTFT p50 72.35ms / ITL p50 30.91ms / tps 115.7 / errors 0**（Qwen3.5-4B 真权重，轻载 c=4/n=8/12tok——满负荷 profile 撞 exec 批界不适用）；ITL≈q9 单步账（33.7ms 中位），TTFT=追平+首步；conv 状态行间接缺陷（span 序号≠状态行号）q8 双胞胎实验定位，o19 升级钉住 |
+| 2026-10-29 | +graph | release | 169,691 | — | — | — | 1.13 / 2.18 | 0.027 | 1.64 | 0.037 | W2 图档首测（battery-20261029-013037，`--graph` FULL_DECODE 桶{1..32}回放）：**L3q+ ITL p50 28.79ms vs L3q 31.28ms（−8.0%）、tps 122.1 vs 115.4（+5.8%）、TTFT p50 72.29 vs 75.64ms、errors 0**；单步对照 qg3 图先测防热身漂移（§7）；混合步/prefill 仍 eager（sink 行吸收桶 padding）；其余层噪声带内 |
 
 ## 7. kernel 侧微基准（设备端首测，随 exec/kernel 里程碑追加）
 
@@ -85,6 +86,8 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +kernel | 同上 | bf16 点积位对齐 | GPU≡CPU 位位相等 | 512 线程×64 段（k6，§13-2 ②）；PTX `.target sm_70` JIT→sm_89 |
 | 2026-10-28 | +gemm | 同上 | GEMM 吞吐 canary（2048³ bf16） | **125.6 TFLOPS** | cuBLASLt 12.9.2（pip wheel 提取，vendor/）；峰值 ~165 的 76%；g6 金丝雀，下限门禁 10 防非 TC 回退 |
 | 2026-10-28 | +exec | 同上 | exec 步时延 canary（批 4 纯 decode） | **中位 611 µs/步** | 一步 = 5 上传（alloc+H2D）+ 16 launch + GEMM×7 + sync + logits 回读；x7 金丝雀；对照 launch 4.69µs——exec 层优化账（W2：常驻上传缓冲/图捕获/切片回读） |
+| 2026-10-29 | +graph | 同上 | 图档步时延 canary（toy，批 50 步中位） | eager 680 µs → 图 528 µs（**1.29×**） | w3 金丝雀；toy 步 launch 债占比高（16 kernel/步），图收益 = 全 launch + 5 次分配/上传转常驻覆写 |
+| 2026-10-29 | +graph | 同上 | 图档步时延 canary（Qwen3.5-4B，单请求 decode 20 步中位） | eager 26.9 ms → 图 25.1 ms（**−6.7%**） | qg3 金丝雀，图先测（热身漂移偏向后测的 eager）；大模型步 GEMM 主导（8.4GB 权重读/token），图收益 = 32 层 launch 债（~160 kernel/步）+ 14 次分配/同步上传；端到端 L3q+ ITL −8.0%（§6） |
 
 launch 4.69µs 是 L3（exec 层）落地时的对照基线：纯 Rust→PTX 路线在 WSL 上的
 单 kernel 提交成本在此，exec 步的图捕获/回放收益按此尺度衡量。

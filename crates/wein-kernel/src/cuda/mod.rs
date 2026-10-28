@@ -6,11 +6,28 @@
 pub mod cublaslt;
 pub mod driver;
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use driver::Driver;
 
 pub use cublaslt::BlasLt;
+
+// ── 捕获区间守卫（§4 图捕获安全规则：ZoS forbid_cuda_sync 的 Rust 化）──
+// 捕获中的隐式同步（sync / 回读 / 同步 H2D / 分配）会污染或炸掉图——
+// debug 构建直接 panic（意外同步零容忍）；release 静默（守卫是开发期纪律）
+thread_local! {
+    static CAPTURING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 当前线程是否在流捕获区间内（begin..end 之间）
+pub fn capturing() -> bool {
+    CAPTURING.with(|c| c.get())
+}
+
+fn capture_guard() {
+    debug_assert!(!capturing(), "捕获区间内禁止隐式同步/分配——图会被污染（§4 安全规则）");
+}
 
 /// 已初始化的 GPU（设备 0 的主上下文已 current）
 pub struct Gpu {
@@ -81,9 +98,11 @@ impl Gpu {
     }
 
     pub fn alloc_bytes(&self, bytes: usize) -> DevBuf<'_> {
+        capture_guard();
         DevBuf { drv: &self.drv, ptr: self.drv.mem_alloc(bytes).expect("cuMemAlloc"), bytes }
     }
     pub fn alloc_from_slice<T: Copy>(&self, slice: &[T]) -> DevBuf<'_> {
+        capture_guard();
         let buf = self.alloc_bytes(slice.len() * std::mem::size_of::<T>());
         self.drv.memcpy_htod(buf.ptr, unsafe { as_bytes(slice) }).expect("cuMemcpyHtoD");
         buf
@@ -128,7 +147,67 @@ pub struct Stream<'a> {
 
 impl Stream<'_> {
     pub fn sync(&self) {
+        capture_guard();
         self.drv.stream_synchronize(self.handle).expect("cuStreamSynchronize");
+    }
+
+    /// 进入流捕获：此后的 launch 序列录制进图（THREAD_LOCAL 模式）。
+    /// 区间内隐式同步/分配在 debug 构建直接 panic（§4 安全规则）
+    pub fn begin_capture(&self) {
+        self.drv.stream_begin_capture(self.handle).expect("cuStreamBeginCapture");
+        CAPTURING.with(|c| c.set(true));
+    }
+
+    /// 结束捕获，返回图。设备指针烤进节点、数据留在缓冲——回放读执行时内存
+    pub fn end_capture(&self) -> Graph<'_> {
+        CAPTURING.with(|c| c.set(false));
+        let handle = self.drv.stream_end_capture(self.handle).expect("cuStreamEndCapture");
+        Graph { drv: self.drv, handle }
+    }
+}
+
+/// 已捕获的图（CUgraph）。`instantiate` 得可回放 exec；拓扑演化须重捕。
+/// 生命周期只锚 Driver（exec 可与图本体脱离——图 Drop 不缚 exec）
+pub struct Graph<'a> {
+    drv: &'a Driver,
+    handle: *mut c_void,
+}
+
+impl<'a> Graph<'a> {
+    /// 实例化为可回放体（一次性上传到设备——launch 热路径零解析）
+    pub fn instantiate(&self) -> GraphExec<'a> {
+        let exec = self.drv.graph_instantiate(self.handle).expect("cuGraphInstantiateWithFlags");
+        GraphExec { drv: self.drv, handle: exec }
+    }
+}
+
+impl Drop for Graph<'_> {
+    fn drop(&mut self) {
+        self.drv.graph_destroy(self.handle).expect("cuGraphDestroy");
+    }
+}
+
+/// 实例化图（CUgraphExec）——回放体。`update` 做参数重绑（拓扑须同）
+pub struct GraphExec<'a> {
+    drv: &'a Driver,
+    handle: *mut c_void,
+}
+
+impl GraphExec<'_> {
+    /// 回放（流上排队，一次 launch 提交全图 kernel 序）
+    pub fn launch(&self, stream: &Stream) {
+        self.drv.graph_launch(self.handle, stream.handle).expect("cuGraphLaunch");
+    }
+
+    /// 参数重绑：同拓扑的新图烤进本 exec（免重实例化；分桶/缓冲迁移的更新路）
+    pub fn update(&self, graph: &Graph) {
+        self.drv.graph_exec_update(self.handle, graph.handle).expect("cuGraphExecUpdate");
+    }
+}
+
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        self.drv.graph_exec_destroy(self.handle).expect("cuGraphExecDestroy");
     }
 }
 
@@ -163,12 +242,23 @@ impl DevBuf<'_> {
             .expect("cuMemsetD8Async");
     }
     pub fn read_to_vec<T: Copy + Default>(&self) -> Vec<T> {
+        capture_guard();
         let n = self.bytes / std::mem::size_of::<T>();
         let mut v = vec![T::default(); n];
         let byte_len = n * std::mem::size_of::<T>();
         let dst = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), byte_len) };
         self.drv.memcpy_dtoh(dst, self.ptr).expect("cuMemcpyDtoH");
         v
+    }
+
+    /// 异步整段覆写上传（流上排队——常驻输入缓冲的每步写入口）。
+    /// 切片长度须与缓冲字节容量对齐（整段覆写语义，防残留）
+    pub fn upload_on<T: Copy>(&self, slice: &[T], stream: &Stream) {
+        let n = slice.len() * std::mem::size_of::<T>();
+        assert_eq!(n, self.bytes, "upload_on 整段覆写：{n} 字节 ≠ 缓冲 {} 字节", self.bytes);
+        self.drv
+            .memcpy_htod_async(self.ptr, slice.as_ptr().cast(), n, stream.handle)
+            .expect("cuMemcpyHtoDAsync");
     }
 }
 

@@ -54,6 +54,21 @@ pub struct Driver {
     cu_memset_d8: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResult,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResult,
+    cu_memcpy_htod_async:
+        unsafe extern "C" fn(u64, *const c_void, usize, *mut c_void) -> CuResult,
+    cu_stream_begin_capture: unsafe extern "C" fn(*mut c_void, c_int) -> CuResult,
+    cu_stream_end_capture: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuResult,
+    cu_graph_instantiate_with_flags:
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResult,
+    cu_graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult,
+    cu_graph_exec_update: unsafe extern "C" fn(
+        *mut c_void,  // CUgraphExec
+        *mut c_void,  // CUgraph
+        *mut c_void,  // CUgraphNode* errorNode（可空）
+        *mut c_int,   // CUgraphExecUpdateResult*（可空）
+    ) -> CuResult,
+    cu_graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResult,
+    cu_graph_exec_destroy: unsafe extern "C" fn(*mut c_void) -> CuResult,
     cu_launch_kernel: unsafe extern "C" fn(
         *mut c_void, // CUfunction
         u32, u32, u32, // grid x/y/z
@@ -94,6 +109,20 @@ impl Driver {
                 cu_memset_d8: try_get(&lib, &["cuMemsetD8Async"])?,
                 cu_stream_create: try_get(&lib, &["cuStreamCreate"])?,
                 cu_stream_synchronize: try_get(&lib, &["cuStreamSynchronize"])?,
+                cu_memcpy_htod_async: try_get(
+                    &lib,
+                    &["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"],
+                )?,
+                cu_stream_begin_capture: try_get(&lib, &["cuStreamBeginCapture"])?,
+                cu_stream_end_capture: try_get(&lib, &["cuStreamEndCapture"])?,
+                cu_graph_instantiate_with_flags: try_get(
+                    &lib,
+                    &["cuGraphInstantiateWithFlags"],
+                )?,
+                cu_graph_launch: try_get(&lib, &["cuGraphLaunch"])?,
+                cu_graph_exec_update: try_get(&lib, &["cuGraphExecUpdate"])?,
+                cu_graph_destroy: try_get(&lib, &["cuGraphDestroy"])?,
+                cu_graph_exec_destroy: try_get(&lib, &["cuGraphExecDestroy"])?,
                 cu_launch_kernel: try_get(&lib, &["cuLaunchKernel"])?,
                 _lib: lib,
             };
@@ -209,6 +238,60 @@ impl Driver {
     }
     pub(crate) fn stream_synchronize(&self, s: *mut c_void) -> Result<(), CuError> {
         self.check(unsafe { (self.cu_stream_synchronize)(s) }, "cuStreamSynchronize")
+    }
+    /// 异步 H2D（流上排队——常驻输入缓冲的每步覆写上传）
+    pub(crate) fn memcpy_htod_async(
+        &self,
+        dst: u64,
+        src: *const c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(
+            unsafe { (self.cu_memcpy_htod_async)(dst, src, n, stream) },
+            "cuMemcpyHtoDAsync",
+        )
+    }
+    /// 进入流捕获（THREAD_LOCAL 模式：别的线程的潜在同步不误伤本捕获）
+    pub(crate) fn stream_begin_capture(&self, s: *mut c_void) -> Result<(), CuError> {
+        const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
+        self.check(
+            unsafe { (self.cu_stream_begin_capture)(s, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) },
+            "cuStreamBeginCapture",
+        )
+    }
+    pub(crate) fn stream_end_capture(&self, s: *mut c_void) -> Result<*mut c_void, CuError> {
+        let mut g = std::ptr::null_mut();
+        self.check(unsafe { (self.cu_stream_end_capture)(s, &mut g) }, "cuStreamEndCapture")?;
+        Ok(g)
+    }
+    pub(crate) fn graph_instantiate(&self, g: *mut c_void) -> Result<*mut c_void, CuError> {
+        let mut exec = std::ptr::null_mut();
+        self.check(
+            unsafe { (self.cu_graph_instantiate_with_flags)(&mut exec, g, 0) },
+            "cuGraphInstantiateWithFlags",
+        )?;
+        Ok(exec)
+    }
+    pub(crate) fn graph_launch(
+        &self,
+        exec: *mut c_void,
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_graph_launch)(exec, stream) }, "cuGraphLaunch")
+    }
+    /// 参数重绑（拓扑须同——update 合同；错误经 error_node/update_result 诊断）
+    pub(crate) fn graph_exec_update(&self, exec: *mut c_void, g: *mut c_void) -> Result<(), CuError> {
+        self.check(
+            unsafe { (self.cu_graph_exec_update)(exec, g, std::ptr::null_mut(), std::ptr::null_mut()) },
+            "cuGraphExecUpdate",
+        )
+    }
+    pub(crate) fn graph_destroy(&self, g: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_graph_destroy)(g) }, "cuGraphDestroy")
+    }
+    pub(crate) fn graph_exec_destroy(&self, exec: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_graph_exec_destroy)(exec) }, "cuGraphExecDestroy")
     }
     pub(crate) fn launch(
         &self,
