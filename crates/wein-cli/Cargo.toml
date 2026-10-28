@@ -1,0 +1,11 @@
+[package]
+name = "wein-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wein-engine = { path = "../wein-engine" }
+wein-serve = { path = "../wein-serve" }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

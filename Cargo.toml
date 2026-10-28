@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wein-engine",
+    "crates/wein-serve",
+    "crates/wein-cli",
+    "crates/wein-bench",
+]
+
+# W1 后续补 wein-platform / wein-kernel / wein-memory / wein-sched / wein-exec / wein-model（02-architecture §2）
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+async-stream = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = true
