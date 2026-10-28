@@ -1,0 +1,7 @@
+# 纯 Rust→PTX 的工具链钉子（冒烟结论，2026-10-28）：
+# - nightly 必须（abi_ptx #38788 / stdarch_nvptx #111199 均未稳定）
+# - 组件 llvm-bitcode-linker（nvptx 链接步骤）+ rust-std-nvptx64-nvidia-cuda
+#   （预编译 std——build-std 不再需要，rust-src 仅作后备）
+# 全部经 rsproxy 镜像安装：rustup component add <名> --toolchain nightly
+[build]
+target = "nvptx64-nvidia-cuda"

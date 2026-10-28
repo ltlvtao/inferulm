@@ -1,0 +1,15 @@
+[package]
+name = "wein-kernels"
+version = "0.1.0"
+edition = "2021"
+
+# cdylib 在 nvptx64 目标上的产物即 PTX 文本（libwein_kernels.ptx）
+[lib]
+crate-type = ["cdylib"]
+
+# 脱离外层 workspace：本 crate 由 wein-kernel/build.rs 以独立 cargo 调用构建
+[workspace]
+
+[profile.release]
+opt-level = 3
+debug = false

@@ -1,0 +1,14 @@
+[package]
+name = "wein-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "算子层：cuda/ 纯 Rust→PTX + driver 绑定（02-architecture §4，冒烟实验 §13-2）"
+
+[dependencies]
+libloading = "0.8"
+
+[dev-dependencies]
+
+[[bin]]
+name = "jit-cache-probe"
+path = "src/bin/jit_cache_probe.rs"

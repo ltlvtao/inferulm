@@ -5,12 +5,13 @@
 设计文档见 [`../design/`](../design/)（01-strategy / 02-architecture）。
 开发方法：**TDD 外→内**——验收用例先于实现，从 serve 层向内核层推进。
 
-## 当前状态（M0 第三层：memory）
+## 当前状态（M0 第四层：kernel，cuda 冒烟）
 
 - `wein-serve`：OpenAI-compatible HTTP/SSE（chat/completions + completions + models），增量 detokenizer（UTF-8 边界安全），stop 参数截断 + 引擎取消，断连自动取消
 - `wein-sched`：统一 token 预算调度器（纯逻辑零依赖）——无 prefill/decode phase（token 债统一建模）、chunked prefill、抢占 = recompute（债 = prompt + 已生成）、FIFO 准入、BatchBuffer 增量 op、DeferredRelease；容量侧可插拔（`CapacityModel`，默认聚合 token 模型）
 - `wein-engine`：边界协议（Submit/Cancel + 事件流）+ **EngineCore**（调度器 + 可插拔 `Executor` 组装）+ MockEngine（对照组）；`EngineStats` 为 L2/L2m 插桩载体
 - `wein-memory`：paged KV 布局 / BlockPool（LIFO + rc + DeferredRelease + 水位）/ radix 前缀缓存（pin 驱逐免疫，LRU 级联驱逐）/ req_to_token / `MemState` 容量语义——零依赖 crate，经引擎侧 `PoolCapacity` 适配器接入 `CapacityModel` 钩子
+- `wein-kernel`：cuda 冒烟（§13-2 三线全过）——`kernels/` 子 crate 纯 Rust→PTX（nightly + abi_ptx/stdarch_nvptx feature，无 nvcc）+ dlopen(libcuda) 最小 Driver API 面（零 toolkit 依赖）+ 高层 Gpu/Module/Func/Stream/DevBuf
 - `wein-cli`：`wein serve --mock` 起 mock 服务
 - `wein-bench`：并发性能验收工具（TTFT/ITL/吞吐 + smoke 阈值门禁）
 
@@ -39,7 +40,7 @@ bench/battery.sh release
 1. **serve** ✅：MockEngine 钉死边界协议（24 验收用例）
 2. **engine core** ✅：wein-sched 调度器（8 同步验收）+ EngineCore 协议验收（3）+ serve 套件换引擎 parity 复跑（8）——同一协议，行为零漂移
 3. **memory** ✅：wein-memory（布局/BlockPool/radix/req_to_token/MemState，验收 m1-m10）+ `CapacityModel` 钩子接入（引擎适配器 + im1-im4 集成验收 + serve 套件 parity 复跑 p9）——抢占触发从聚合 token 模型换成 BlockPool 水位，调度策略零改动
-4. kernel：`trait Op` + cuda/（PTX）——W1 第 1 周先做 cuda crate 冒烟实验（02-architecture §13-2）；`Executor` 从 ScriptedExecutor 换成真实 exec 线程
+4. **kernel**（冒烟 ✅，trait Op/exec 接入待做）：cuda crate 冒烟实验完成——验收 k1-k8 全绿（PTX 产出物/指令降落/驱动探测/显存往返/vec_add 位对齐/**bf16 点积位对齐**/JIT 缓存跨进程复用/launch 4.69µs）；**风险登记**：路线锁 nightly + 两个未稳定 feature（abi_ptx #38788、stdarch_nvptx #111199），不达标时启用 cubin 旁路（架构不变）；后续：`trait Op` 注册表、varlen paged attention 等 M0 算子清单（§4）、`Executor` 从 ScriptedExecutor 换真实 exec 线程
 5. 逐层替换 mock，验收套件始终不变
 
 ## 规约

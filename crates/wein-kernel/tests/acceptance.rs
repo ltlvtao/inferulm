@@ -1,0 +1,283 @@
+//! kernel 层冒烟验收（02-architecture §13-2 的三条验收线 + 驱动路径本身）。
+//!
+//! 冒烟实验回答"cuda crate 路线（纯 Rust→PTX，无 nvcc）能不能走"：
+//! - k1/k2：PTX 产出物结构与 intrinsic 降落（**无 GPU 也能跑**——工具链线）
+//! - k3-k6：driver API 探测/显存/launch/数值逐位对齐（需 GPU，无卡则 SKIP）
+//! - k7：PTX JIT 缓存落盘可复用（§13-2 ①；子进程跨进程验证）
+//! - k8：launch 开销金丝雀（给基线制度的第一格 kernel 侧数字）
+//!
+//! 无 GPU 环境：k3-k8 打印 SKIP 后通过（设备行为没有硬件无从断言）；
+//! 本机（RTX 4090）全量跑。W2 真 attention kernel 出来后，k6 的位对齐
+//! 断言原样升格为 golden vector 框架的第一条。
+//!
+//! 逐位对齐的可达性依据：bf16→f32 精确（位左移）；fma.rn.f32 与 x86 FMA3
+//! 都是 IEEE 正确舍入的单次乘加——同操作序列必同位；RNE 公式两侧同一公式。
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Instant;
+
+use wein_kernel::cuda::{Gpu, Stream};
+use wein_kernel::kernel_args;
+
+fn ptx_path() -> PathBuf {
+    let p = std::env::var("WEIN_PTX").expect("build.rs 须注入 WEIN_PTX");
+    let p = PathBuf::from(p);
+    assert!(p.exists(), "PTX 产物缺失：{p:?}（build.rs 未产出？）");
+    p
+}
+
+fn ptx_text() -> String {
+    std::fs::read_to_string(ptx_path()).expect("读 PTX 文本")
+}
+
+/// 无卡环境：打印 SKIP 并让测试通过（硬件行为无硬件无从断言）
+fn gpu() -> Option<Gpu> {
+    match Gpu::probe() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("SKIP（无可用 CUDA 设备：{e}）");
+            None
+        }
+    }
+}
+
+// ───────────────────────── 工具链线（无 GPU） ─────────────────────────
+
+/// k1 · PTX 产出物：rustc（无 nvcc）吐出的 PTX 文本结构成立——
+/// 版本/目标头在，两个导出 kernel 各有一个 `.visible .entry`，名字未被修饰。
+/// 这一条钉死"纯 Rust→PTX"路线的最小事实。
+#[test]
+fn k1_ptx_artifact_structure() {
+    let ptx = ptx_text();
+    assert!(ptx.contains(".version "), "缺 PTX 版本头");
+    assert!(ptx.contains(".target "), "缺 target 头");
+    assert!(ptx.contains(".entry vec_add_f32("), "vec_add_f32 入口缺失/被改名");
+    assert!(ptx.contains(".entry bf16_dot("), "bf16_dot 入口缺失/被改名");
+    assert_eq!(
+        ptx.matches(".visible .entry").count(),
+        2,
+        "导出 kernel 数应为 2（多了说明编译单元混入了别的入口）"
+    );
+}
+
+/// k2 · intrinsic 降落（§13-2 ③）：线程索引 intrinsic 落到特殊寄存器
+/// （%tid.x / %ctaid.x），浮点算术落到 mul.rn.f32 / add.rn.f32（IEEE 正确
+/// 舍入、不收缩——逐位对齐的前提），且没有宿主调用 shim（no_std kernel 里
+/// 出现 call = 有东西没编译干净）。
+#[test]
+fn k2_intrinsics_lowered_to_ptx() {
+    let ptx = ptx_text();
+    assert!(ptx.contains("%tid.x"), "thread_idx 未降落特殊寄存器");
+    assert!(ptx.contains("%ctaid.x"), "block_idx 未降落特殊寄存器");
+    assert!(ptx.contains("mul.rn.f32"), "乘法未降落 mul.rn.f32");
+    assert!(ptx.contains("add.rn.f32"), "加法未降落 add.rn.f32");
+    let host_calls: Vec<&str> = ptx
+        .lines()
+        .filter(|l| l.trim_start().starts_with("call"))
+        .collect();
+    assert!(
+        host_calls.is_empty(),
+        "PTX 出现宿主调用：{host_calls:?}（no_std kernel 不应有 call）"
+    );
+}
+
+// ───────────────────────── 驱动线（需 GPU） ─────────────────────────
+
+/// k3 · driver 探测：dlopen(libcuda.so.1) → cuInit → 设备枚举/名字/算力，
+/// arch 字串与算力自洽（"sm_{maj}{min}"）。三层能力模型的身份层数据源。
+#[test]
+fn k3_driver_probe() {
+    let Some(gpu) = gpu() else { return };
+    assert!(gpu.device_count() >= 1);
+    assert!(gpu.name().contains("NVIDIA"), "设备名异常：{}", gpu.name());
+    let (maj, min) = gpu.compute_capability();
+    assert!((maj, min) >= (7, 0), "算力过低：{maj}.{min}");
+    assert_eq!(gpu.arch(), format!("sm_{maj}{min}"), "arch 字串须与算力自洽");
+}
+
+/// k4 · 显存往返：HtoD/DtoH 逐字节保持（第一次真·显存分配）。
+#[test]
+fn k4_device_memory_roundtrip() {
+    let Some(gpu) = gpu() else { return };
+    let host: Vec<f32> = vec![1.5, -2.25, 3.75, 0.0, f32::MAX, f32::MIN_POSITIVE];
+    let dev = gpu.alloc_from_slice(&host);
+    let back: Vec<f32> = dev.read_to_vec();
+    assert_eq!(back.len(), host.len());
+    for (a, b) in host.iter().zip(back.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "显存往返位级失真");
+    }
+    // 大块分配也成立（一次 cuMemAlloc 的规模感）
+    let big = gpu.alloc_bytes(64 << 20);
+    assert!(big.device_ptr() != 0);
+}
+
+/// k5 · 向量加（CUDA hello 的 Rust 版）：1M 元素、多 block 多线程，
+/// f32 加法 IEEE 确定 → 逐位对齐。
+#[test]
+fn k5_vec_add_bitwise() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let n: usize = 1 << 20;
+    let a: Vec<f32> = (0..n).map(|i| splitmix(i as u64) as f32).collect();
+    let b: Vec<f32> = (0..n).map(|i| splitmix(i as u64 ^ 0x9e37) as f32).collect();
+    let expect: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+    let da = gpu.alloc_from_slice(&a);
+    let db = gpu.alloc_from_slice(&b);
+    let dc = gpu.alloc_bytes(n * 4);
+
+    let module = gpu.load_module(&ptx_text());
+    let f = module.func("vec_add_f32");
+    let mut nn = n as u32;
+    let args = kernel_args![da, db, dc, nn];
+    gpu.launch(&f, (n as u32 + 255) / 256, 256, &args, &stream);
+    stream.sync();
+
+    let got: Vec<f32> = dc.read_to_vec();
+    for i in 0..n {
+        assert_eq!(got[i].to_bits(), expect[i].to_bits(), "vec_add[{i}] 位级失真");
+    }
+}
+
+/// k6 · bf16 点积逐位对齐（§13-2 ② 冒烟化身）：load bf16→f32、fma 链、
+/// RNE 收尾——attention QK 数值路径的最小完整形态。
+/// 512 线程 × 64 段长，GPU 与 CPU 参考实现输出位位相等。
+#[test]
+fn k6_bf16_dot_bitwise_alignment() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let seg: usize = 64;
+    let m: usize = 512; // 线程数（各算一段）
+    let n = seg * m;
+
+    // 确定性 bf16 输入（先造 f32 再舍入，两侧都只依赖舍入后的值）
+    let x: Vec<u16> = (0..n).map(|i| host_f32_to_bf16(splitmix(i as u64) as f32)).collect();
+    let y: Vec<u16> = (0..n).map(|i| host_f32_to_bf16(splitmix(i as u64 ^ 0x517c) as f32)).collect();
+
+    // CPU 参考实现（独立代码路径，不与 kernel 共享实现）
+    let expect: Vec<u16> = (0..m)
+        .map(|t| {
+            let mut acc = 0.0f32;
+            for j in 0..seg {
+                let a = host_bf16_to_f32(x[t * seg + j]);
+                let b = host_bf16_to_f32(y[t * seg + j]);
+                acc = a.mul_add(b, acc);
+            }
+            host_f32_to_bf16(acc)
+        })
+        .collect();
+
+    let dx = gpu.alloc_from_slice(&x);
+    let dy = gpu.alloc_from_slice(&y);
+    let dout = gpu.alloc_bytes(m * 2);
+
+    let module = gpu.load_module(&ptx_text());
+    let f = module.func("bf16_dot");
+    let (mut seg_a, mut m_a) = (seg as u32, m as u32);
+    let args = kernel_args![dx, dy, dout, seg_a, m_a];
+    gpu.launch(&f, (m as u32 + 255) / 256, 256, &args, &stream);
+    stream.sync();
+
+    let got: Vec<u16> = dout.read_to_vec();
+    assert_eq!(got.len(), m);
+    for t in 0..m {
+        assert_eq!(got[t], expect[t], "bf16_dot[{t}] 位不对齐（GPU {:#06x} vs 参考 {:#06x}）", got[t], expect[t]);
+    }
+}
+
+/// k7 · PTX JIT 缓存落盘可复用（§13-2 ①）：子进程加载同一 PTX 两次
+/// （同一 CUDA_CACHE_PATH），第一次后缓存目录非空（落盘），第二次成功且
+/// 不慢于第一次（复用）。免 JIT 的价值 = 冷启动延迟，量级打印进报告。
+#[test]
+fn k7_jit_cache_persists_across_processes() {
+    // 此测试自身不需要 GPU 在本进程探测成功——子进程才是被测对象；
+    // 但无卡机器子进程必失败，先探测门控
+    if gpu().is_none() {
+        return;
+    }
+    let cache_dir = std::env::temp_dir().join(format!("wein-jit-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let ptx = ptx_path();
+
+    let run = || {
+        let t0 = Instant::now();
+        let st = Command::new(env!("CARGO_BIN_EXE_jit-cache-probe"))
+            .env("CUDA_CACHE_PATH", &cache_dir)
+            .env("CUDA_CACHE_DISABLE", "0")
+            .env("WEIN_PTX", &ptx)
+            .status()
+            .expect("启动 jit-cache-probe 子进程");
+        (st.success(), t0.elapsed())
+    };
+
+    let (ok1, t1) = run();
+    assert!(ok1, "首次加载子进程失败");
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "JIT 缓存未落盘：{cache_dir:?} 为空（复用无从谈起）"
+    );
+
+    let (ok2, t2) = run();
+    assert!(ok2, "二次加载子进程失败");
+    eprintln!(
+        "JIT 缓存复用：冷 {t1:?} → 热 {t2:?}（缓存文件 {} 个）",
+        entries.len()
+    );
+    assert!(t2 <= t1, "热加载反而更慢：冷 {t1:?} 热 {t2:?}");
+}
+
+/// k8 · launch 开销金丝雀：1 万次连续小 kernel 提交 + 一次同步的均摊。
+/// 给基线制度第一格 kernel 侧数字；上限放得很宽（50µs），真值预期 2-8µs（WSL）。
+#[test]
+fn k8_launch_overhead_canary() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let module = gpu.load_module(&ptx_text());
+    let f = module.func("vec_add_f32");
+    let buf = gpu.alloc_bytes(4);
+    let mut n: u32 = 1;
+    let args = kernel_args![buf, buf, buf, n];
+
+    // 预热（首次含 JIT/模块初始化，不算数）
+    gpu.launch(&f, 1, 1, &args, &stream);
+    stream.sync();
+
+    let rounds = 10_000u32;
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        gpu.launch(&f, 1, 1, &args, &stream);
+    }
+    stream.sync();
+    let per = t0.elapsed().as_nanos() as f64 / rounds as f64 / 1000.0;
+    eprintln!("launch 开销：{per:.2} µs/次（{rounds} 次均摊，含一次末尾同步）");
+    assert!(per < 50.0, "launch 均摊 {per:.2}µs 超金丝雀上限 50µs");
+}
+
+// ───────────────────────── 测试侧工具 ─────────────────────────
+
+/// splitmix32——确定性 f32 源（不用 rand，冒烟测试要自含）
+fn splitmix(mut z: u64) -> f32 {
+    z = z.wrapping_add(0x9e3779b97f4a7c15);
+    let mut x = z ^ (z >> 30);
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    let u = (x >> 40) as u32; // 24 bit 尾数域
+    f32::from_bits((u & 0xffffff) | 0x40000000) - 3.0 // [-1, 1)
+}
+
+/// 参考实现侧的 bf16 转换（与 kernel 各自独立实现——对齐才有意义）
+fn host_bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+fn host_f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let lsb = (bits >> 16) & 1;
+    ((bits + 0x7fff + lsb) >> 16) as u16
+}

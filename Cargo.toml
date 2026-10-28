@@ -7,9 +7,15 @@ members = [
     "crates/wein-serve",
     "crates/wein-cli",
     "crates/wein-bench",
+    "crates/wein-kernel",
+]
+exclude = [
+    # kernels/ 由 wein-kernel/build.rs 以独立 cargo 调用构建（nvptx64 目标 + build-std），
+    # 不属于本 workspace（其 Cargo.toml 内空 [workspace] 表自绝）
+    "crates/wein-kernel/kernels",
 ]
 
-# W1 后续补 wein-platform / wein-kernel / wein-memory / wein-sched / wein-exec / wein-model（02-architecture §2）
+# W1 后续补 wein-platform / wein-exec / wein-model（02-architecture §2）
 
 [workspace.package]
 version = "0.1.0"
