@@ -6,6 +6,7 @@
 #   L1'  节拍泵参照      1ms/token mock（对照基线；真实引擎接入后退役为 L2）
 #   L2   engine core     真调度器（wein-sched）+ 脚本执行器，零步延迟 —— 调度层的"纯账"
 #   L2'  节拍泵(调度器)  1ms/步，与 L1' 对照：同节拍下 mock 与真调度器的端到端差
+#   L2m  内存层记账      L2 + BlockPool 水位/radix/DeferredRelease —— 内存层的"纯账"
 #
 # 用法：bench/battery.sh [release|debug]     （默认 release；报告落 bench-reports/battery-<时间戳>/）
 set -euo pipefail
@@ -45,6 +46,7 @@ run_suite zero-delay --engine mock --prefill-delay-ms 0 --token-delay-ms 0
 run_suite paced-1ms --engine mock --prefill-delay-ms 2 --token-delay-ms 1
 run_suite core-zero --engine core --token-delay-ms 0
 run_suite core-paced-1ms --engine core --token-delay-ms 1
+run_suite core-mem-zero --engine core --token-delay-ms 0 --memory
 
 python3 - "$OUT" "$STAMP" <<'PYEOF' > "$OUT/SUMMARY.md"
 import json, sys
@@ -64,6 +66,8 @@ r = load("core-zero-l1-stream.json")
 if r: rows.append(("L2 engine core 开销(零延迟执行器)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_mean={r.get('itl_mean_ms', 0):.3f}ms tps={r['aggregate_tps']:.0f}"))
 r = load("core-paced-1ms-l1-stream.json")
 if r: rows.append(("L2' 节拍泵(1ms/步, 真调度器)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms itl_mean={r.get('itl_mean_ms', 0):.2f}ms tps={r['aggregate_tps']:.0f}"))
+r = load("core-mem-zero-l1-stream.json")
+if r: rows.append(("L2m 内存层记账开销(core+BlockPool/radix, 零延迟)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_mean={r.get('itl_mean_ms', 0):.3f}ms tps={r['aggregate_tps']:.0f}"))
 print(f"# battery {stamp}\n")
 print("| 层 | 指标（中位数, c=100, n=500, max_tokens=32） |")
 print("|---|---|")

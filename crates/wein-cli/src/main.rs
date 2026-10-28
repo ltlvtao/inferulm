@@ -35,13 +35,21 @@ fn main() {
         let tok = MockTokenizer::from_texts(&texts);
         let pieces: Vec<u32> = (0..texts.len() as u32).collect();
         // core 引擎：稳态 decode 每步恰 1 token，步延迟即 token 节拍；
-        // prefill 在首几步内完成，无需单独延迟参数
+        // prefill 在首几步内完成，无需单独延迟参数。
+        // --memory：启用 BlockPool 水位 + radix 前缀缓存（L2m 归因电池；
+        // 块容量按 bench 负载给宽裕值——量的是记账开销，不制造抢占噪声）
         let engine: EngineHandle = match engine_kind.as_str() {
-            "core" => EngineCore::spawn(CoreConfig::scripted(
-                pieces,
-                Duration::from_millis(token_ms),
-            ))
-            .0,
+            "core" => {
+                let mut cfg = CoreConfig::scripted(pieces, Duration::from_millis(token_ms));
+                if args.iter().any(|a| a == "--memory") {
+                    cfg.memory = Some(wein_memory::state::MemConfig {
+                        block_size: 16,
+                        num_blocks: 8192,
+                        low_watermark: 0.1,
+                    });
+                }
+                EngineCore::spawn(cfg).0
+            }
             _ => MockEngine::spawn(MockScript {
                 prefill_delay: Duration::from_millis(prefill_ms),
                 per_token_delay: Duration::from_millis(token_ms),
@@ -54,7 +62,8 @@ fn main() {
         let addr = spawn_server(state, format!("0.0.0.0:{port}").parse().unwrap())
             .await
             .expect("bind failed");
-        println!("wein ({engine_kind}) listening on http://{addr}  model={model}");
+        let mem_tag = if args.iter().any(|a| a == "--memory") { "+memory" } else { "" };
+        println!("wein ({engine_kind}{mem_tag}) listening on http://{addr}  model={model}");
         tokio::signal::ctrl_c().await.ok();
     });
 }

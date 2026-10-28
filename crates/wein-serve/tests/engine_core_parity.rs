@@ -205,3 +205,59 @@ async fn p8_abort_storm_then_healthy_and_clean() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "Hello world");
 }
+
+/// p9 · 内存层启用（BlockPool 水位 + radix 前缀缓存）后协议零漂移：
+///      内容/UTF-8/usage 与 p1/p3 同源断言；前缀缓存真实命中（内存层不只是旁观）
+#[tokio::test]
+async fn p9_memory_enabled_core_protocol_parity() {
+    let mem_cfg = |pieces: Vec<u32>| CoreConfig {
+        pieces,
+        step_delay: Duration::from_millis(1),
+        memory: Some(wein_memory::state::MemConfig {
+            block_size: 2,
+            num_blocks: 4096,
+            low_watermark: 0.1,
+        }),
+        ..Default::default()
+    };
+
+    // 内容与 usage（对照 p1）
+    let ts = start_core(mem_cfg(vec![0, 1, 2]), default_tok()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&chat_body(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(body["usage"]["completion_tokens"], 3);
+
+    // UTF-8 多字节（对照 p3）
+    let tok = MockTokenizer::from_bytes(vec![
+        vec![0xe4, 0xbd],
+        vec![0xa0, 0xe5, 0xa5],
+        vec![0xbd],
+    ]);
+    let ts = start_core(mem_cfg(vec![0, 1, 2]), tok).await;
+    let frames = post_sse(&format!("{}/v1/chat/completions", ts.base), &chat_body(3)).await;
+    for f in &frames {
+        assert!(!f.contains('\u{fffd}'), "不允许出现替换符: {f}");
+    }
+    assert_eq!(content_of(&frames), "你好");
+
+    // 前缀缓存真实命中：同 prompt（2 token = 1 整块）第二问，cache_hit_tokens ≥ 2
+    let ts = start_core(mem_cfg(vec![0, 1, 2]), default_tok()).await;
+    for _ in 0..2 {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&chat_body(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    eventually(Duration::from_secs(3), || ts.stats.mem().cache_hit_tokens >= 2).await;
+}

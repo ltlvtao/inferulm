@@ -47,6 +47,7 @@ async fn e2_cancel_running_yields_aborted_and_frees_capacity() {
         sched: wein_sched::SchedConfig { max_running: 1, ..Default::default() },
         pieces: vec![0, 1],
         step_delay: Duration::from_millis(1),
+        memory: None,
     };
     let (engine, stats) = EngineCore::spawn(cfg);
 

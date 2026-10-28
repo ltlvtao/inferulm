@@ -15,4 +15,5 @@ async-stream = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+wein-memory = { path = "../wein-memory" }
 reqwest = { workspace = true }

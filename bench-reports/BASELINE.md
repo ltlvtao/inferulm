@@ -15,6 +15,7 @@
 | **L1' 节拍泵参照** | 有节拍生成下的端到端 | 1ms/token mock | ITL mean − 1ms = 每 token 可观察开销 | ✅ 在测（真实引擎接入后退役为 L2） |
 | **L2 engine core** | 调度决策 + 批组装开销 | 真调度器 + 脚本执行器（`--engine core --token-delay-ms 0`） | TTFT p50/p99、ITL mean | ✅ 在测（schedule_ns 细粒度插桩待 exec 层，现用 EngineStats.steps 计数） |
 | **L2' 节拍泵(调度器)** | 真调度器下的端到端 | 1ms/步 | ITL mean（与 L1' 之差 = 调度层叠加开销） | ✅ 在测 |
+| **L2m 内存层记账** | BlockPool 水位/radix/DeferredRelease 的热路径成本 | `--engine core --memory --token-delay-ms 0` | ITL mean（与 L2 之差 = 内存层叠加开销） | ✅ 在测 |
 | L3 exec/图 | 提交与回放开销 | 真执行层 | launch→replay 时延、图命中率 | ⏳ |
 | L4 kernel | 算子真算力 | 真算子 | 每 op 耗时（图内探针） | ⏳ |
 
@@ -35,6 +36,9 @@
 - **L0 是 loopback 数字**：同机回环，绝对值虚高；作层间比例与回归用，不作部署承诺。
 - **mock 的定时器抖动属于 mock**：L1'/L1 之差才是 serve 层的账；mock 内部 timer wheel
   的合并行为（ITL p99 ~17ms）不是 serve 层劣化。
+- **L2m 与 L2 的对照才是内存层的账**：内存层（radix 匹配/块分配/水位判定）
+  在每个 token 的热路径上；首测 ITL mean +13µs/token、tps 持平（−0.2%，噪声内）。
+  内存层块容量给宽裕值（8192×16）——量的是记账开销，不是抢占行为的账。
 - **L2 与 L1 的 tps 不可直接比**：mock 是每请求独立任务逐 token 唤醒；EngineCore 整批
   同步交付（32 步管 100 流），天然平滑——L2 tps 309k 对 L1 tps 81k 的优势是模型差，
   不是 serve 层回归。同节拍对照只看 L2' vs L1'。
@@ -59,7 +63,8 @@ qps >= 100000（人工核对 SUMMARY）
 
 ## 6. 基线演化表
 
-| 日期 | rev | profile | L0 QPS | L1 TTFT p50/p99 (ms) | L1 ITL mean (ms) | L1' ITL mean (ms) | L2 TTFT p50/p99 (ms) | L2 ITL mean (ms) | L2' ITL mean (ms) | 备注 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 2026-10-28 | 30c3b01 | release | 170,528 | 10.15 / 12.46 | 0.89 | 1.70 | — | — | — | 首基线；ITL 双峰发现（§3） |
-| 2026-10-28 | 6200950+core | release | 170,415 | 10.84 / 12.25 | — | — | 1.11 / 2.68 | 0.027 | 1.69 | engine core 首测（battery-20261028-144250）；L2'≈L1'：调度层叠加≈0；L2/L1 tps 模型差见 §3 |
+| 日期 | rev | profile | L0 QPS | L1 TTFT p50/p99 (ms) | L1 ITL mean (ms) | L1' ITL mean (ms) | L2 TTFT p50/p99 (ms) | L2 ITL mean (ms) | L2' ITL mean (ms) | L2m ITL mean (ms) | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-28 | 30c3b01 | release | 170,528 | 10.15 / 12.46 | 0.89 | 1.70 | — | — | — | — | 首基线；ITL 双峰发现（§3） |
+| 2026-10-28 | 6200950+core | release | 170,415 | 10.84 / 12.25 | — | — | 1.11 / 2.68 | 0.027 | 1.69 | — | engine core 首测（battery-20261028-144250）；L2'≈L1'：调度层叠加≈0；L2/L1 tps 模型差见 §3 |
+| 2026-10-28 | +memory | release | 168,289 | 10.56 / 12.21 | — | — | 1.18 / 4.98 | 0.022 | 1.67 | 0.035 | 内存层首测（battery-20261028-152856）；L2m−L2 = +13µs/token，tps 持平（312.6k vs 313.1k）；宽裕块容量——纯记账账 |

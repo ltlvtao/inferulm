@@ -7,16 +7,19 @@
 //! 三线程拓扑（02-architecture §5）中的 "engine core 线程"：当前为 tokio 任务，
 //! 协议是 channel，后续搬到专用线程不动接口。exec 线程（§5 第三线程）以
 //! `Executor` trait 预留——真实实现是 CUDA 图/NPU 图；M0 用 ScriptedExecutor。
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 
+use wein_memory::state::{MemConfig, MemState, MemStats};
 use wein_sched::{
-    FinishReason as SchedFinish, ReqId, ReqInput, SchedConfig, SchedEvent, Scheduler, StepPlan,
+    CapacityModel, FinishReason as SchedFinish, Removal, ReqId, ReqInput, SchedConfig, SchedEvent,
+    Scheduler, StepPlan,
 };
 
 use crate::handle::EngineHandle;
@@ -28,6 +31,8 @@ pub struct CoreConfig {
     pub pieces: Vec<u32>,
     /// 每步墙钟延迟（模拟 kernel 时间；0 = 尽快推进）
     pub step_delay: Duration,
+    /// KV 内存层（Some = BlockPool 水位驱动准入/抢占 + radix 前缀缓存；None = 聚合 token 模型）
+    pub memory: Option<MemConfig>,
 }
 
 impl Default for CoreConfig {
@@ -36,6 +41,7 @@ impl Default for CoreConfig {
             sched: SchedConfig::default(),
             pieces: vec![0, 1, 2, 3, 4, 5, 6, 7],
             step_delay: Duration::from_millis(1),
+            memory: None,
         }
     }
 }
@@ -47,6 +53,57 @@ impl CoreConfig {
     }
 }
 
+/// BlockPool 容量模型 ↔ 调度器钩子的适配器（依赖规则：wein-memory 不依赖
+/// wein-sched，适配发生在 engine 侧——orphan 规则下适配器类型属于本 crate）。
+///
+/// on_token 失败（块耗尽）与 on_admitted 失败（批空无条件准入但放不下）都进
+/// `forced`，引擎在步循环内 drain：先试 sched.preempt（recompute），批内仅剩
+/// 此请求时 preempt 拒绝 → abort（超大请求应在 API 层拒绝，这里是兜底）
+struct PoolCapacity {
+    mem: MemState,
+    forced: Vec<ReqId>,
+}
+
+impl CapacityModel for PoolCapacity {
+    fn can_admit(&mut self, ctx_len: usize) -> bool {
+        self.mem.can_admit(ctx_len)
+    }
+
+    fn on_admitted(&mut self, req: ReqId, prompt: &[u32], generated: u32) {
+        if !self.mem.admit(req, prompt, generated) {
+            self.forced.push(req);
+        }
+    }
+
+    fn on_sample(&mut self, _req: ReqId) {}
+
+    fn on_token(&mut self, req: ReqId, token_id: u32) {
+        if !self.mem.on_token(req, token_id) {
+            self.forced.push(req);
+        }
+    }
+
+    fn on_removed(&mut self, req: ReqId, how: Removal) {
+        match how {
+            Removal::Finished => self.mem.finish(req),
+            Removal::Preempted => self.mem.release(req, true), // keep_seq：重准入全上下文命中
+            Removal::Cancelled => self.mem.release(req, false),
+        }
+    }
+
+    fn over_pressure(&mut self) -> bool {
+        self.mem.over_pressure()
+    }
+
+    fn step_end(&mut self) {
+        self.mem.step_end();
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
+    }
+}
+
 /// 引擎侧可断言状态（对应 MockState 的角色；BASELINE §4 L2 插桩的载体）。
 #[derive(Default)]
 pub struct EngineStats {
@@ -55,6 +112,8 @@ pub struct EngineStats {
     finished: AtomicUsize,
     preempted: AtomicUsize,
     steps: AtomicU64,
+    /// 内存层快照（每步末刷新；未启用内存层时恒为默认值）
+    mem: Mutex<MemStats>,
 }
 
 impl EngineStats {
@@ -72,6 +131,9 @@ impl EngineStats {
     }
     pub fn step_count(&self) -> u64 {
         self.steps.load(Ordering::Relaxed)
+    }
+    pub fn mem(&self) -> MemStats {
+        self.mem.lock().expect("mem stats 锁中毒").clone()
     }
 }
 
@@ -131,7 +193,15 @@ impl EngineCore {
         mut cmd_rx: UnboundedReceiver<EngineCommand>,
         stats: Arc<EngineStats>,
     ) {
-        let mut sched = Scheduler::new(cfg.sched);
+        // 容量模型二选一：BlockPool 水位（memory）或聚合 token（默认）。
+        // 调度策略不变——准入反压与抢占触发全部经 CapacityModel 钩子
+        let mut sched = match cfg.memory {
+            Some(mem_cfg) => Scheduler::with_capacity(
+                cfg.sched,
+                PoolCapacity { mem: MemState::new(mem_cfg), forced: Vec::new() },
+            ),
+            None => Scheduler::new(cfg.sched),
+        };
         let mut exec = ScriptedExecutor::new(cfg.pieces);
         let mut senders: HashMap<RequestId, UnboundedSender<EngineEvent>> = HashMap::new();
 
@@ -141,7 +211,7 @@ impl EngineCore {
             Self::drain(&mut cmd_rx, &mut sched, &mut senders, &stats);
 
             // 推进直到空闲；空闲即停车等新命令（不忙转）。
-            // 步是原子的：本步 token 全部发出 → 完成事件 → 回收；
+            // 步是原子的：本步 token 全部发出（并记入内存层）→ 完成事件 → 回收；
             // 步间命令（取消/新提交）在下一步首 drain 时生效——
             // 因此取消后客户端至多再收到在飞那一步的 token（e2 验收钉死的边界）
             while !sched.is_idle() {
@@ -155,10 +225,37 @@ impl EngineCore {
                     if let Some(tx) = senders.get(&id) {
                         let _ = tx.send(EngineEvent::Token(tok));
                     }
+                    // 内存布局推进（token id 才在这里可知；TokenCapacity 实现为空操作）
+                    sched.capacity_mut().on_token(id, tok);
+                }
+                // 强制抢占：内存层报的失败者（块耗尽/批空放不下的超大请求）。
+                // preempt 被拒（批内仅剩此请求）→ abort 兜底
+                let forced: Vec<ReqId> = match sched.capacity_mut().as_any_mut() {
+                    Some(any) => any
+                        .downcast_mut::<PoolCapacity>()
+                        .map(|pc| std::mem::take(&mut pc.forced))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                for id in forced {
+                    if !sched.preempt(id) {
+                        Self::abort(&mut sched, &mut senders, &stats, id);
+                    }
+                }
+                // 内存层记账快照（每步末刷新；供断言与观测）
+                if let Some(any) = sched.capacity_mut().as_any_mut() {
+                    if let Some(pc) = any.downcast_mut::<PoolCapacity>() {
+                        *stats.mem.lock().expect("mem stats 锁中毒") = pc.mem.stats();
+                    }
                 }
                 Self::pump(&mut sched, &mut senders, &stats);
-                // DeferredRelease：步末回收执行器内已离批请求的状态
-                exec.retain(&plan.batch);
+                // DeferredRelease：步末回收执行器内部状态。保留集合 = 仍有
+                // 事件流者——含被抢占的等待者（它们会带着已生成 token 回来，
+                // 计数状态不得清；im1 抓到：按本步在批清理会把重算请求的
+                // 输出序打回起点）
+                let keep: Vec<ReqId> = senders.keys().copied().collect();
+                exec.retain(&keep);
+                sched.capacity_mut().step_end();
             }
         }
         // cmd_tx 全部 drop = 引擎关闭；senders 随之 drop，事件流自然关闭
@@ -195,16 +292,27 @@ impl EngineCore {
                 if let Some(tx) = senders.get(&id) {
                     let _ = tx.send(EngineEvent::Accepted);
                 }
-                sched.submit(ReqInput { id, prompt_len: prompt_token_ids.len(), max_tokens });
+                sched.submit(ReqInput { id, prompt_token_ids, max_tokens });
             }
-            EngineCommand::Cancel(id) => {
-                stats.cancelled.fetch_add(1, Ordering::Relaxed);
-                sched.cancel(id);
-                // best-effort 通知 Aborted（接收端可能已放弃，发送失败即忽略）
-                if let Some(tx) = senders.get(&id) {
-                    let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
-                }
-            }
+            EngineCommand::Cancel(id) => Self::abort(sched, senders, stats, id),
+        }
+    }
+
+    /// 取消/中止一个请求：出调度器 + best-effort 通知 Aborted。
+    /// 幂等：调度器已不认识它（先前已终结/移除）则什么都不做——
+    /// forced 列表可能对同一请求重复报告（admit 失败 + 无布局 token 增长失败）
+    fn abort(
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stats: &EngineStats,
+        id: RequestId,
+    ) {
+        if !sched.cancel(id) {
+            return;
+        }
+        stats.cancelled.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = senders.get(&id) {
+            let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
         }
     }
 

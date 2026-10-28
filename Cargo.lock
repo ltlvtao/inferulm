@@ -1471,6 +1471,7 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "wein-engine",
+ "wein-memory",
  "wein-serve",
 ]
 
@@ -1481,8 +1482,13 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "wein-memory",
  "wein-sched",
 ]
+
+[[package]]
+name = "wein-memory"
+version = "0.1.0"
 
 [[package]]
 name = "wein-sched"
@@ -1501,6 +1507,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wein-engine",
+ "wein-memory",
 ]
 
 [[package]]

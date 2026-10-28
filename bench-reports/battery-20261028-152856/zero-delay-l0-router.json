@@ -1,0 +1,19 @@
+{
+  "config": {
+    "concurrency": 100,
+    "num": 20000
+  },
+  "meta": {
+    "git_rev": "c175416",
+    "profile": "release",
+    "ts_unix": 1793172536
+  },
+  "mode": "flood GET /v1/models",
+  "result": {
+    "errors": 0,
+    "lat_p50_ms": 0.526015,
+    "lat_p99_ms": 1.606859,
+    "qps": 168288.6820686432,
+    "wall_s": 0.118843405
+  }
+}

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 wein-sched = { path = "../wein-sched" }
+wein-memory = { path = "../wein-memory" }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

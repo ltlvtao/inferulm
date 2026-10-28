@@ -1,0 +1,8 @@
+[package]
+name = "wein-memory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 零依赖：BlockPool/radix/r2t 是纯逻辑（设计规则：不依赖 wein-sched——同层禁止横向依赖，
+# CapacityModel 的适配由 wein-engine 承担）
