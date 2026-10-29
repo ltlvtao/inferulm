@@ -24,6 +24,10 @@
 //! 保持 eager）
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// 对拍钩子的 run_forward 调用计数（s1=预填批，s2..=解码步）
+static TRACE_STEP: AtomicU32 = AtomicU32::new(0);
 
 use wein_engine::Executor;
 use wein_kernel::cuda::{DevBuf, GraphExec, Stream};
@@ -750,25 +754,41 @@ impl Qwen35Executor {
         let (h, ii, voc) =
             (self.cfg.hidden_size as u32, self.cfg.inter_size as u32, self.cfg.vocab_size as u32);
 
+        // ── 对拍钩子（WEIN_TRACE_DIR 设定且无图档时激活；图捕获中禁 sync）──
+        let step = TRACE_STEP.fetch_add(1, Ordering::Relaxed) + 1;
+        let trace = self.graph.is_none() && std::env::var("WEIN_TRACE_DIR").is_ok();
+        if trace && step == 1 {
+            self.trace_meta();
+        }
+
         // ── embed ──
         tb.embed.run(inp.ids, &self.embed, &self.scr.x, h, t32, stream);
+        if trace {
+            self.trace_x(&format!("s{step}-embed"), t32);
+        }
 
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
         let mut lin_i = 0usize;
         let mut full_i = 0usize;
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             tb.rms_norm_zc.run(&self.scr.x, &layer.ln1, &self.scr.n1, t32, h, eps, stream);
             match &layer.attn {
                 AttnDev::Full(w) => {
                     let (qh_n, kvh, hd) = (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
                     let he = kvh * hd;
                     tb.gemm.run_wt(&self.scr.n1, &w.qg, &self.scr.qg, t32, 2 * qh_n * hd, h, stream);
+                    if trace {
+                        self.trace_buf(&format!("s{step}-L{li:02}-qg"), &self.scr.qg, t32 as usize * 2 * qh_n as usize * hd as usize);
+                    }
                     tb.embed.run(inp.iq, &self.scr.qg, &self.scr.qh, hd, t32 * qh_n, stream);
                     tb.embed.run(inp.ig, &self.scr.qg, &self.scr.gate, hd, t32 * qh_n, stream);
                     // 零中心 norm 在 head_dim 上（原地：行私有读写，安全）
                     tb.rms_norm_zc.run(&self.scr.qh, &w.qn, &self.scr.qh, t32 * qh_n, hd, eps, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.k, &self.scr.kh, t32, he, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.v, &self.scr.vh, t32, he, h, stream);
+                    if trace {
+                        self.trace_buf(&format!("s{step}-L{li:02}-vh"), &self.scr.vh, t32 as usize * he as usize);
+                    }
                     tb.rms_norm_zc.run(&self.scr.kh, &w.kn, &self.scr.kh, t32 * kvh, hd, eps, stream);
                     let rd = self.cfg.rot_dim();
                     tb.rope_pt.run(
@@ -791,7 +811,15 @@ impl Qwen35Executor {
                     tb.sigmul.run(
                         &self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream,
                     );
+                    if trace {
+                        self.trace_buf(&format!("s{step}-L{li:02}-attn"), &self.scr.attn, t32 as usize * qh_n as usize * hd as usize);
+                        self.trace_buf(&format!("s{step}-L{li:02}-gate"), &self.scr.gate, t32 as usize * qh_n as usize * hd as usize);
+                        self.trace_buf(&format!("s{step}-L{li:02}-agated"), &self.scr.agated, t32 as usize * qh_n as usize * hd as usize);
+                    }
                     tb.gemm.run_wt(&self.scr.agated, &w.o, &self.scr.o, t32, h, qh_n * hd, stream);
+                    if trace {
+                        self.trace_buf(&format!("s{step}-L{li:02}-o"), &self.scr.o, t32 as usize * h as usize);
+                    }
                     full_i += 1;
                 }
                 AttnDev::Linear(w) => {
@@ -809,7 +837,9 @@ impl Qwen35Executor {
                         inp.tpos, cd, self.cfg.conv_kernel, t32, stream,
                     );
                     tb.conv_state_roll.run(
-                        &self.scr.qkvc, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
+                        // 状态存**原始 qkv**（conv 前）——tap 与段内同源；
+                        // 存 qkvc（conv+silu 后）是解码递推偏差的根源
+                        &self.scr.qkv, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
                         self.cfg.conv_kernel, n_rows, stream,
                     );
                     tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
@@ -823,6 +853,12 @@ impl Qwen35Executor {
                         &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
                         inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, stream,
                     );
+                    if trace {
+                        // 定位解码递推偏差：conv 输出与 deltanet 输出（decode vs
+                        // 整段预填的同 token 对拍——分叉首组件即病灶）
+                        self.trace_buf(&format!("s{step}-L{li:02}-qkvc"), &self.scr.qkvc, t32 as usize * cd as usize);
+                        self.trace_buf(&format!("s{step}-L{li:02}-core"), &self.scr.core, t32 as usize * vald as usize);
+                    }
                     tb.rms_norm_gated.run(
                         &self.scr.core, &self.scr.z, &w.norm, &self.scr.normed, t32 * vh_n, vd,
                         eps, stream,
@@ -839,10 +875,82 @@ impl Qwen35Executor {
             tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t32 * ii, stream);
             tb.gemm.run_wt(&self.scr.m, &layer.wd, &self.scr.d, t32, h, ii, stream);
             tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.x, t32 * h, stream);
+            if trace {
+                self.trace_x(&format!("s{step}-layer-{li:02}"), t32);
+            }
         }
         // ── final norm + logits（tie：embed 兼作 lm_head 的 W[n,k]）──
         tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
         tb.gemm.run_wt(&self.scr.n2, &self.embed, &self.scr.logits, t32, voc, h, stream);
+        if trace {
+            self.trace_logits(step, t32);
+        }
+    }
+
+    /// 通用缓冲落盘（bf16 n 元素 → f32 LE）——full-attn 组件级对拍用
+    fn trace_buf(&self, tag: &str, buf: &DevBuf, n: usize) {
+        let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
+        if self.graph.is_some() {
+            return;
+        }
+        self.session.stream().sync();
+        let bits: Vec<u16> = buf.read_to_vec();
+        let vals: Vec<f32> = bits[..n].iter().map(|&b| reference::bf16_to_f32(b)).collect();
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{dir}/{tag}.f32"), bytes).expect("trace 写盘");
+    }
+
+    /// 逐层对拍落盘：残差流 scr.x（bf16）→ f32 LE，文件 `<dir>/<tag>.f32`
+    /// 行主序 [t, hidden]。仅 WEIN_TRACE_DIR 设定时有副作用（读回含 sync，
+    /// 图档下不得触发——调用侧已挡，此处再挡一层）
+    fn trace_x(&self, tag: &str, t: u32) {
+        let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
+        if self.graph.is_some() {
+            return;
+        }
+        self.session.stream().sync();
+        let h = self.cfg.hidden_size as usize;
+        let bits: Vec<u16> = self.scr.x.read_to_vec();
+        let vals: Vec<f32> =
+            bits[..t as usize * h].iter().map(|&b| reference::bf16_to_f32(b)).collect();
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{dir}/{tag}.f32"), bytes).expect("trace 写盘");
+    }
+
+    /// logits 落盘（[t, vocab] f32；对拍终局用）
+    fn trace_logits(&self, step: u32, t: u32) {
+        let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
+        if self.graph.is_some() {
+            return;
+        }
+        self.session.stream().sync();
+        let voc = self.cfg.vocab_size as usize;
+        let bits: Vec<u16> = self.scr.logits.read_to_vec();
+        let vals: Vec<f32> =
+            bits[..t as usize * voc].iter().map(|&b| reference::bf16_to_f32(b)).collect();
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{dir}/s{step}-logits.f32"), bytes).expect("trace 写盘");
+    }
+
+    /// 首步写 meta：hidden/vocab/eps + 层类型表（对拍侧定位层用）
+    fn trace_meta(&self) {
+        let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
+        let kinds: Vec<&str> = self
+            .layers
+            .iter()
+            .map(|l| match &l.attn {
+                AttnDev::Full(_) => "full",
+                AttnDev::Linear(_) => "linear",
+            })
+            .collect();
+        let meta = format!(
+            "{{\"hidden\":{},\"vocab\":{},\"eps\":{},\"layers\":[{}]}}\n",
+            self.cfg.hidden_size,
+            self.cfg.vocab_size,
+            self.cfg.rms_eps,
+            kinds.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(",")
+        );
+        std::fs::write(format!("{dir}/meta.json"), meta).expect("trace meta 写盘");
     }
 
     /// 步前向统一入口：pure_decode（每行独立请求的 1-token 步，采样行

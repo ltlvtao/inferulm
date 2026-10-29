@@ -4,6 +4,7 @@
 两端各自起服→跑→停（GPU 互斥串行）；报告 JSON 在 `../vs-vllm-<端>-*/`，对拍采样在 `../vs-vllm-correct/`。
 
 - **wein**：rev `746874a`，`--engine core --exec qwen`，eager 档 + `--graph` FULL_DECODE 档
+  （吞吐数据与 §2.1 的正确性发现在此 rev；修复后正确性复验见 §2.4，battery 带内见 BASELINE §6 `+fix` 行）
 - **vLLM**：0.32.0（torch 2.13.0+cu130），`--max-model-len 512 --gpu-memory-utilization 0.85`
   `VLLM_USE_FLASHINFER_SAMPLER=0`（贪心基准采样非测量轴，绕开 flashinfer JIT 的
   CCCL 13.4↔cu130 版本错配），起服排障链见 `bench/vs_vllm.sh` 注释
@@ -39,9 +40,11 @@
 - 4090 roofline 参照：vLLM 轻档 8.65GB/11.3ms ≈ 765GB/s（76% 峰值）——**这就是
   满负荷 target 的现实锚**，wein 当前 274GB/s（轻）。
 
-## 2. 正确性（贪心对拍，temperature=0，completions 原始 prompt 不经模板）
+## 2. 正确性（贪心对拍，temperature=0，completions 原始 prompt 不经模板）——发现与闭环
 
 分词**五组逐 id 一致**（含中文，`tokenize/` 落盘对账）——排除输入侧。
+
+### 2.1 发现（修复前，rev `746874a`）
 
 | # | prompt | 公共前缀 | 首分歧 | wein 走向 | vLLM 走向 |
 |---|---|---|---|---|---|
@@ -62,11 +65,66 @@
 - 内部证据链（q5 逐步 logits vs 独立 f64 镜像容差 81% + 贪心逐位一致）与外部矛盾 →
   **偏差在共享公式层**（镜像与 GPU 同一实现理解），内部对拍结构性看不见。
 
-**定位假设（待 W-next 验证）**：首 token 多数正确 + 第 2 token 起系统性走偏 →
-状态递推路径（gated deltanet 递推细节 / conv 状态滚动 / KV 追加）公式级偏差；
-#3 的 token 1 分歧说明预填路径也有份（或该 prompt 低边际敏感）。验证路径：
-logit 级 diff——wein 逐步 top-5 落盘 vs vLLM logprobs，逐层二分（先 full-attn
-8 层 vs 24 linear-attn 层归因）。
+### 2.2 定位（logit 级 diff，同日闭环）
+
+harness 三件套（已入库）：
+
+- **wein 侧落盘**：`WEIN_TRACE_DIR` executor 逐层残差流 + 组件 dump（f32 LE，
+  仅图未捕获时生效，不污染图档路径）+ `examples/qwen_trace.rs` 直接驱动；
+- **参照**：`bench/trace_reference.py`——HF transformers forced-decode 逐层落盘，
+  跟随 wein 的贪心链（同 token 序列，排除链漂移）；
+- **diff**：`bench/trace_diff.py` 逐步逐层 max|Δ|/mean|Δ|。
+
+二分链：embed 精确 → 前置线性层干净 → 首个 full-attn 层爆（max 4.16）→
+pos0 单点 softmax 恒等破而 v 读路径干净 ⇒ **V 读路径** → 输出对 16 个 kv 头余弦
+相似度 → **头映射**。
+
+判别实验（无须任何外部参照）：同一 token 走整段预填 vs 5 预填 + 1 解码步——
+预填 ≡ HF 而解码 ≠ 自身预填，纯 wein 内部即可把问题隔离到解码路径。
+
+### 2.3 双 bug（同类根因：内部测试共享公式盲区）
+
+1. **GQA 头映射**：`qh % kv_heads`（0,1,…,15,0,1,…）应为 `qh // group`
+   （HF repeat_kv 语义：kv 头 k 服务 q 头 [k·group,(k+1)·group)；本模型全注意力层
+   64 q 头 / 16 kv 头 / group 4）。**PTX kernel + CPU 参考 + f64 镜像三处同错**——
+   o12/golden 测试形状 (2,1) 两映射恒等故永远绿；升级 (8,2) 非平凡 group +
+   pos0 单点 softmax 恒等（独立真值，从 softmax 语义反推映射而非共享参考公式）钉死。
+2. **conv 状态存值约定**：`conv_state_roll` 喂了 conv+silu 后激活（qkvc），而 tap
+   读状态与段内同源要**原始 qkv**（HF/FLA causal_conv1d cache 同约定）。exec
+   调用点 + 镜像两处同错；预填单段永不触状态故全绿，解码一触即炸（qkvc
+   max|Δ|=26.6）。
+
+免疫钉：**段等价性质测试**（kernel `tests/segment_equiv.rs`，conv + deltanet）——
+任意切段 + 状态接力 ≡ 整段一次算，位对齐；"段内自洽、跨段露馅"类缺陷的
+永久测试类（解码就是 count=1 的切段特例）。
+
+### 2.4 修复后全绿（`vs-vllm-correct/` 全量重捕）
+
+| # | 前缀 token | 文本 | 长度（字符） |
+|---|---|---|---|
+| 1 | 48/48 | **字节全同** | 156 |
+| 2 | 48/48 | **字节全同** | 48 |
+| 3 | 48/48 | **字节全同** | 126 |
+| 4 | 48/48 | **字节全同** | 175 |
+| 5 | 48/48 | **字节全同** | 135 |
+
+48 token × 5 prompt：wein ≡ vLLM **逐字节全同**（HTTP completions 全链路：分词 →
+预填 → 48 步贪心解码 → detok）；chat 模板 prompt_tokens 11=11 复验一致。
+
+噪声地板刻度（`bench/ref_greedy48.py`，HF bf16 eager forced-decode）：
+
+- **HF ≡ vLLM：48/48 × 5 全同**——跨实现 bf16 贪心链的地板是 0 分歧，"bf16 噪声
+  翻贪心位"在本组 prompt 上不构成解释；
+- 修复前 wein vs HF：48/48/48/23/35——正是 §2.1 表中的分歧点；
+- 修复后 wein ≡ HF ≡ vLLM 三方全同；解码步偏差回落预填同带（logits mean|Δ|
+  ~0.026，无累积）。
+
+### 2.5 事故记录：陈旧二进制
+
+conv 修复后只重编了 `--example qwen_trace`，serve 用的 wein-cli 仍是旧二进制——
+服务器"复现"了已修复的偏差，引发一轮徒劳的 serve 路径排查（engine probe /
+serve 栈探针 / detok / bind_thread 全干净）。教训（已成本仓库纪律）：
+**任何 serve 路径测量前 `cargo build --release`（全 workspace）先行**。
 
 ## 3. chat 模板交叉验证（vLLM = W5 minijinja 的外部 oracle）
 

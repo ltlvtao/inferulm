@@ -403,7 +403,8 @@ pub unsafe extern "ptx-kernel" fn kv_scatter(
 }
 
 /// varlen paged attention（correctness-first 两遍法）：一线程一 (t,qh)，
-/// 因果只看 0..=pos；GQA：kv 头 = qh%kv_heads。pass1 记分取 max →
+/// 因果只看 0..=pos；GQA：kv 头 = qh // group（group=q_heads/kv_heads，
+/// HF repeat_kv 语义）。pass1 记分取 max →
 /// pass2 p_j=expf(s_j−m) 顺序累加分母 → 逐 e 加权 V（j 升序，与参考同序）。
 /// M0 正确性档：单线程扫全 KV，序列长上限 256（W2 flash 分块移除此限）
 #[no_mangle]
@@ -431,7 +432,7 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
         return;
     }
     let (t, qh) = (udiv(i, qh_n), urem(i, qh_n));
-    let kh = urem(qh, kv_heads as usize);
+    let kh = udiv(qh, udiv(qh_n, kv_heads as usize)); // GQA：kv 头 = qh // group
     let s = *seq_ids.add(t) as usize;
     let pos = *positions.add(t) as usize;
     if pos + 1 > MAX_LEN {

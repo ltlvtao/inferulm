@@ -204,7 +204,7 @@ pub fn kv_scatter(
 
 /// varlen paged attention 参考（correctness-first 两遍法，与 kernel 同序）：
 /// pass1 记分取 max；pass2 exp(score−m) 顺序累加分母与加权 V；
-/// GQA：kv 头 = qh % kv_heads；因果：token 只看 0..=pos
+/// GQA：kv 头 = qh // group（group = q_heads/kv_heads，HF repeat_kv 语义）；因果：token 只看 0..=pos
 pub fn paged_attn(
     q: &[u16],
     k_cache: &[u16],
@@ -224,7 +224,7 @@ pub fn paged_attn(
     for t in 0..positions.len() {
         let (s, pos) = (seq_ids[t] as usize, positions[t] as usize);
         for qh in 0..q_heads {
-            let kh = qh % kv_heads;
+            let kh = qh / (q_heads / kv_heads); // GQA：kv 头 = qh // group
             // pass1：score[j]（j 递增同序）与 max
             let mut sc = vec![0f32; pos + 1];
             let mut m = f32::NEG_INFINITY;

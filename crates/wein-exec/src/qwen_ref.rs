@@ -194,7 +194,7 @@ impl QwenMirror {
                     let q_scale = 1.0f32 / (hd as f32).sqrt();
                     let mut attn = vec![0u16; qh_n * hd];
                     for qh in 0..qh_n {
-                        let kh = qh % kvh;
+                        let kh = qh / (qh_n / kvh); // GQA：kv 头 = qh // group
                         let mut scores = vec![0f32; pos + 1];
                         let mut m = f32::NEG_INFINITY;
                         for j in 0..=pos {
@@ -238,11 +238,11 @@ impl QwenMirror {
                     let (keyd, vald) = (kh_n * kd, vh_n * vd);
                     let cd = 2 * keyd + vald;
                     let qkv = gemm_bf16(&n1, &w.qkv, 1, cd, h);
-                    // conv 单步 + 状态滚动（state 行 0：镜像单请求）
+                    // conv 单步 + 状态滚动（state 行 0：镜像单请求；状态存原始 qkv）
                     let convd =
                         kref::conv1d_dw(&qkv, &w.conv, &self.conv_state[li], &[0], &[0], cd, 4);
                     self.conv_state[li] =
-                        kref::conv_state_roll(&convd, &self.conv_state[li], &[0], &[1], &[0], cd, 4);
+                        kref::conv_state_roll(&qkv, &self.conv_state[li], &[0], &[1], &[0], cd, 4);
                     let q = convd[..keyd].to_vec();
                     let k = convd[keyd..2 * keyd].to_vec();
                     let v = convd[2 * keyd..].to_vec();

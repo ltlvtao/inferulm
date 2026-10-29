@@ -14,7 +14,7 @@
 //!        （自控 RNE，非默认 round），i8 + f32 scale 双输出位对齐
 //! - o11 · KV scatter write：页表寻址（block_table + pos 跨块）写入
 //!        paged KV；未触及槽位原样保留
-//! - o12 · varlen paged attention：GQA（qh%kv_heads）、pos 0 只看自身
+//! - o12 · varlen paged attention：GQA（qh//group）、pos 0 只看自身
 //!        （单点 softmax 恒等 v —— 独立真值校验）、33 长跨 3 块；
 //!        页槽寻址与 wein-memory plan_kv 的 token 记账同构
 //!        （[page][block_size][heads][head_dim]）
@@ -199,7 +199,9 @@ fn o12_paged_attn_golden_bitwise() {
     // 3 序列：s0 len 5（1 query，pos 4）；s1 len 33（2 query：pos 0 与 32）
     // —— pos 0 只看自身（softmax 单点 = 恒等）；33 长跨 3 块
     let (block_size, bpr) = (16usize, 3usize);
-    let (q_heads, kv_heads, head_dim) = (2usize, 1usize, 64usize);
+    // 非平凡 GQA（group=4）：qh//group 与 qh%kv_heads 在头 1,3,4,6 分叉——
+    // （2,1) 的 MQA 形状两映射恒等，钉不住头映射（vs vLLM 对拍的教训）
+    let (q_heads, kv_heads, head_dim) = (8usize, 2usize, 64usize);
     let q_scale: f32 = 0.125; // 1/sqrt(64) 恰为 2 的幂——输入侧不给舍入留余地
     let seq_ids: Vec<u32> = vec![0, 1, 1];
     let positions: Vec<u32> = vec![4, 0, 32];
@@ -224,14 +226,19 @@ fn o12_paged_attn_golden_bitwise() {
     stream.sync();
     assert_bits("paged_attn", &dout.read_to_vec(), &expect);
 
-    // 独立真值：pos 0 的 query，softmax 单点 → out 恒等于 v[slot0]（bf16 原样）
+    // 独立真值：pos 0 的 query，softmax 单点 → out 恒等于 v[slot0]（bf16 原样）。
+    // kv 头 = h // group（HF repeat_kv 语义：kv 头 k 服务 q 头 [k*group,(k+1)*group)）——
+    // 此断言由 softmax 恒等 + GQA 语义直接构造，不经过 reference 公式，
+    // 参考侧映射错（qh%kv_heads）时必红
     let s1_q0 = 1; // seq 1 第一个 query（token 下标 1）
+    let group = q_heads / kv_heads;
     for h in 0..q_heads {
+        let kh = h / group;
         for e in 0..head_dim {
             let slot = block_table[1 * bpr] * block_size as u32; // seq1 块 9，pos 0
-            let v = v_cache[(slot as usize * he) + e];
+            let v = v_cache[(slot as usize * he) + kh * head_dim + e];
             let got = expect[(s1_q0 * q_heads + h) * head_dim + e];
-            assert_eq!(got, v, "单点 softmax 应恒等 v[{e}]（GQA 各 q 头同 kv）");
+            assert_eq!(got, v, "单点 softmax 应恒等 v[kv 头 {kh}][{e}]（GQA = h//group）");
         }
     }
 }
@@ -520,7 +527,7 @@ struct AttnGolden {
 }
 impl AttnGolden {
     fn build() -> Self {
-        let (bpr, block_size, q_heads, kv_heads, head_dim) = (3usize, 16usize, 2usize, 1usize, 64usize);
+        let (bpr, block_size, q_heads, kv_heads, head_dim) = (3usize, 16usize, 8usize, 2usize, 64usize); // 非平凡 GQA（group=4）
         let block_table = vec![4, 0, 0, 9, 2, 6];
         let (seq_ids, positions): (Vec<u32>, Vec<u32>) = (vec![0, 1, 1], vec![4, 0, 32]);
         let tokens = seq_ids.len();
