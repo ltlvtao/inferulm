@@ -54,6 +54,11 @@ pub struct Driver {
     cu_memset_d8: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResult,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResult,
+    cu_event_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
+    cu_event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult,
+    cu_event_elapsed_time:
+        unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> CuResult,
+    cu_event_destroy: unsafe extern "C" fn(*mut c_void) -> CuResult,
     cu_memcpy_htod_async:
         unsafe extern "C" fn(u64, *const c_void, usize, *mut c_void) -> CuResult,
     cu_stream_begin_capture: unsafe extern "C" fn(*mut c_void, c_int) -> CuResult,
@@ -109,6 +114,10 @@ impl Driver {
                 cu_memset_d8: try_get(&lib, &["cuMemsetD8Async"])?,
                 cu_stream_create: try_get(&lib, &["cuStreamCreate"])?,
                 cu_stream_synchronize: try_get(&lib, &["cuStreamSynchronize"])?,
+                cu_event_create: try_get(&lib, &["cuEventCreate"])?,
+                cu_event_record: try_get(&lib, &["cuEventRecord"])?,
+                cu_event_elapsed_time: try_get(&lib, &["cuEventElapsedTime"])?,
+                cu_event_destroy: try_get(&lib, &["cuEventDestroy"])?,
                 cu_memcpy_htod_async: try_get(
                     &lib,
                     &["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"],
@@ -238,6 +247,28 @@ impl Driver {
     }
     pub(crate) fn stream_synchronize(&self, s: *mut c_void) -> Result<(), CuError> {
         self.check(unsafe { (self.cu_stream_synchronize)(s) }, "cuStreamSynchronize")
+    }
+    /// 计时事件（CU_EVENT_DEFAULT；同一事件可重复 record——池化复用）
+    pub(crate) fn event_create(&self) -> Result<*mut c_void, CuError> {
+        let mut e = std::ptr::null_mut();
+        self.check(unsafe { (self.cu_event_create)(&mut e, 0) }, "cuEventCreate")?;
+        Ok(e)
+    }
+    /// 流上记录（保序：排在前序 kernel 完成之后）
+    pub(crate) fn event_record(&self, e: *mut c_void, s: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_event_record)(e, s) }, "cuEventRecord")
+    }
+    /// 两事件间 GPU 时距 ms（start 须早于 end；均须已完成）
+    pub(crate) fn event_elapsed_time(
+        &self,
+        ms: &mut f32,
+        start: *mut c_void,
+        end: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_event_elapsed_time)(ms, start, end) }, "cuEventElapsedTime")
+    }
+    pub(crate) fn event_destroy(&self, e: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_event_destroy)(e) }, "cuEventDestroy")
     }
     /// 异步 H2D（流上排队——常驻输入缓冲的每步覆写上传）
     pub(crate) fn memcpy_htod_async(

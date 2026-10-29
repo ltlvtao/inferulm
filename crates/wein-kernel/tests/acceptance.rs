@@ -277,6 +277,45 @@ fn k8_launch_overhead_canary() {
     assert!(per < 50.0, "launch 均摊 {per:.2}µs 超金丝雀上限 50µs");
 }
 
+/// k9 · 事件计时链路：成对 cuEvent 流上记录 + ElapsedTime——步时分解
+/// 插桩（满负荷 L3q 每行账定位：GPU 时间按算子类切开）的根基。
+/// WSL 实测事件时间轴有 ~20µs 量化（同点两事件可差 0.02ms）——插桩
+/// 只按**粗段边界**打点（段是 ms 级），本测试同理：kernel 加大跨过
+/// 量化 floor，同点断言只钉"重复 record 可用 + 时距有界"。
+#[test]
+fn k9_event_timing() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let module = gpu.load_module(&ptx_text());
+    let f = module.func("vec_add_f32");
+    let n: u32 = 1 << 24;
+    let buf = gpu.alloc_bytes(4 * n as usize);
+    let args = kernel_args![buf, buf, buf, n];
+    gpu.launch(&f, 256, 256, &args, &stream);
+    stream.sync();
+
+    let (e0, e1) = (gpu.event(), gpu.event());
+    e0.record_on(&stream);
+    // 多拍 kernel 跨在两事件间（插桩的真实形态：段内一串 kernel）——
+    // vec_add 每线程一元素，4096×256 恰覆 1M；200 拍把时距抬过量化 floor
+    for _ in 0..200 {
+        gpu.launch(&f, 4096, 256, &args, &stream);
+    }
+    e1.record_on(&stream);
+    stream.sync();
+    let work_ms = e1.elapsed_ms(&e0);
+    eprintln!("事件计时：200 拍 1M vec_add = {work_ms:.3} ms");
+    assert!(work_ms >= 0.1, "kernel 时距 {work_ms:.3}ms 低于预期——计时链路不通");
+
+    // 同点两事件：可重复 record + 时距有界（≤ 量化上界 ~0.1ms）
+    let e2 = gpu.event();
+    e0.record_on(&stream);
+    e2.record_on(&stream);
+    stream.sync();
+    let zero = e2.elapsed_ms(&e0);
+    assert!(zero < 0.1, "同点事件时距 {zero:.3}ms 超量化上界");
+}
+
 // ───────────────────────── 测试侧工具 ─────────────────────────
 
 /// splitmix32——确定性 f32 源（不用 rand，冒烟测试要自含）

@@ -263,3 +263,39 @@ fn q10_row_recycling_zeroed_state() {
     // reset 全量零化路径（generate 内部）同样一致
     assert_eq!(ex.generate(&pb, 6), base, "reset 后完整生成须与基线逐 token 一致");
 }
+
+/// q13 · 步时分解插桩：WEIN_STEP_PROFILE 下 eager 步按算子类切段
+/// （gemm/gather/norm/eltw/conv/delta/attn/rope/kv/embed/logits/argmax）。
+/// 结构合同（非时延阈值）：报告存在、段集完备——漏一类 = 插桩盲区，
+/// 满负荷的账会错分；打点数远超步数（层循环内多段）且 GPU 段时距非负。
+#[test]
+fn q13_step_profile_sections() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    std::env::set_var("WEIN_STEP_PROFILE", "1");
+    let ex = exec(&dir);
+    std::env::remove_var("WEIN_STEP_PROFILE");
+    let Some(mut ex) = ex else { return };
+    let ids: Vec<u64> = (1..=4).collect();
+    let prompt = vec![5u32, 6, 7];
+    for &id in &ids {
+        ex.admitted(id, &prompt);
+    }
+    let plan = StepPlan {
+        prefill: ids.iter().map(|&i| (i, prompt.len())).collect(),
+        decode: ids.clone(),
+        batch: vec![],
+    };
+    assert_eq!(ex.step(&plan).len(), 4, "追平步各出一个 token");
+    for _ in 0..3 {
+        let out = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: vec![] });
+        assert_eq!(out.len(), 4, "纯 decode 每请求每步一个 token");
+    }
+    let Some(rep) = ex.step_profile_report() else {
+        panic!("WEIN_STEP_PROFILE 开启但无报告——插桩未激活");
+    };
+    for sect in ["embed", "gemm", "norm", "gather", "eltw", "logits", "argmax", "conv", "delta", "attn", "rope", "kv"] {
+        assert!(rep.contains(sect), "段表缺 {sect}——插桩盲区（{rep}）");
+    }
+    eprintln!("{rep}");
+}

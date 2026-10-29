@@ -22,15 +22,17 @@
 //! （ids/pos/seqs/rid/bt）常驻每步覆写；argmax 烤进图尾。sink 行（块表
 //! 末行 + 专属页 + 专属状态行）吸收桶尾 padding。`open` = NONE（q 系
 //! 保持 eager）
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// 对拍钩子的 run_forward 调用计数（s1=预填批，s2..=解码步）
 static TRACE_STEP: AtomicU32 = AtomicU32::new(0);
 
 use wein_engine::Executor;
-use wein_kernel::cuda::{DevBuf, GraphExec, Stream};
+use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
     AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetOp, EmbedOp, GemmOp, KvScatterOp,
     MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SigmulOp, SiluOp,
@@ -187,6 +189,181 @@ struct FwdIn<'a> {
 // 独占设备句柄，exec 单线程驱动（§5）——同 DeviceSession 论证
 unsafe impl Send for Qwen35Executor {}
 
+// ── 步时分解插桩（WEIN_STEP_PROFILE；满负荷账定位——BASELINE §4 的段级形态）──
+// 粗段边界打点：WSL 事件时间轴 ~20µs 量化（k9 实测同点两事件可差 0.02ms），
+// 逐 op 打点会把 phantom 时间灌进每段；按算子类切段（段 ms 级）足够定位
+// 大项。事件池 open 期建好反复 record（k9 合同）；同类相邻段合并（一层内
+// gemm 连发只落一次事件）。仅 eager 激活——图捕获区间禁额外事件。
+//
+// 打点协议：prof_mark(sect) 在 sect 段**首个 launch 之前**调用——落下的
+// 事件把上一段关在其末 kernel 之后（流保序），段时距 = 事件对时差。
+
+/// 事件池容量（单步边界数上界：~440 段/步 @ 32 层同类合并后——超则截断标注）
+const PROF_POOL: usize = 1024;
+
+struct StepProf {
+    ev: Vec<Event<'static>>,
+    /// 本步已录事件数（含 ev[0] 步首）
+    idx: usize,
+    /// 当前段名（正在跑的算子类；None = 步首未入段）
+    cur: Option<&'static str>,
+    /// (段名, 段尾事件 idx)——段首 = 上一段尾（首段 = ev[0]）
+    ends: Vec<(&'static str, usize)>,
+    totals: HashMap<&'static str, f64>,
+    hits: HashMap<&'static str, u64>,
+    steps: u64,
+    wall_ms: f64,
+    /// 11 次 alloc+H2D 的 host 账（每步）
+    upload_ms: f64,
+    /// run_forward 提交（launch 流）的 host 账
+    submit_ms: f64,
+    /// sync 后采样 D2H 读回的 host 账
+    readback_ms: f64,
+    /// 单事件记录的 GPU 时间轴成本（步尾校准突发的跨步均值的当前值）
+    cal_ms: f64,
+    /// 本步校准突发的 (首, 末) 事件 idx（finalize 时查时距）
+    cal_pair: Option<(usize, usize)>,
+    truncated: bool,
+}
+
+fn prof_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+impl StepProf {
+    fn new(gpu: &wein_kernel::cuda::Gpu) -> Self {
+        StepProf {
+            ev: (0..PROF_POOL).map(|_| pin!(gpu.event())).collect(),
+            idx: 0,
+            cur: None,
+            ends: Vec::new(),
+            totals: HashMap::new(),
+            hits: HashMap::new(),
+            steps: 0,
+            wall_ms: 0.0,
+            upload_ms: 0.0,
+            submit_ms: 0.0,
+            readback_ms: 0.0,
+            cal_ms: 0.0,
+            cal_pair: None,
+            truncated: false,
+        }
+    }
+
+    /// 步首：落 ev[0]（uploads 之后——H2D 同步拷贝不进 GPU 段账）
+    fn begin(&mut self, stream: &Stream) {
+        self.idx = 0;
+        self.ends.clear();
+        self.cur = None;
+        self.ev[0].record_on(stream);
+    }
+
+    /// 进入 sect 段（段首个 launch 前调用）
+    fn mark(&mut self, sect: &'static str, stream: &Stream) {
+        if self.cur == Some(sect) {
+            return; // 同类相邻段合并
+        }
+        if let Some(prev) = self.cur.replace(sect) {
+            if self.record(stream) {
+                self.ends.push((prev, self.idx));
+            }
+        }
+    }
+
+    /// 步尾：关掉最后一段（最后 launch 之后、sync 之前）
+    fn end(&mut self, stream: &Stream) {
+        if let Some(prev) = self.cur.take() {
+            if self.record(stream) {
+                self.ends.push((prev, self.idx));
+            }
+        }
+    }
+
+    fn record(&mut self, stream: &Stream) -> bool {
+        if self.idx + 1 >= PROF_POOL {
+            self.truncated = true;
+            return false;
+        }
+        self.idx += 1;
+        self.ev[self.idx].record_on(stream);
+        true
+    }
+
+    /// sync 后结算：段时距累计（sync 前调用 end 已把最后事件落定）。
+    /// 事件记录本身在 GPU 时间轴上有成本（WSL 实测 ~85µs/次，m=4 步
+    /// 440 边界 +37ms）——步尾同点校准突发量出单价，报告按段内边界数扣除
+    fn finalize(&mut self, wall: f64) {
+        let mut prev = 0usize;
+        for &(sect, e) in &self.ends {
+            *self.totals.entry(sect).or_insert(0.0) +=
+                self.ev[e].elapsed_ms(&self.ev[prev]) as f64;
+            *self.hits.entry(sect).or_insert(0) += 1;
+            prev = e;
+        }
+        self.steps += 1;
+        self.wall_ms += wall;
+        if let Some((a, b)) = self.cal_pair.take() {
+            let per = self.ev[b].elapsed_ms(&self.ev[a]) as f64 / (b - a) as f64;
+            self.cal_ms = (self.cal_ms * (self.steps - 1) as f64 + per) / self.steps as f64;
+        }
+    }
+
+    /// 步尾校准突发：连录 K 个无 kernel 事件——相邻时距 = 单记录成本。
+    /// 只落记录；时距查询在 finalize（sync 后——事件完成才可查）
+    fn calibrate(&mut self, stream: &Stream) {
+        const K: usize = 32;
+        if self.idx + K >= PROF_POOL {
+            return;
+        }
+        let a = self.idx + 1;
+        for _ in 0..K {
+            self.idx += 1;
+            self.ev[self.idx].record_on(stream);
+        }
+        self.cal_pair = Some((a, self.idx));
+    }
+
+    fn report(&self) -> String {
+        let steps = self.steps.max(1) as f64;
+        let mut rows: Vec<_> = self.totals.iter().collect();
+        rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 校正段账：raw − 边界数 × 单记录成本（事件落在段尾——段 i 的
+        // 边界 = hits[i]，含步首步尾摊销误差，量级 ≈ 单记录成本）
+        let adj: HashMap<&str, f64> = rows
+            .iter()
+            .map(|(&s, &ms)| {
+                let hits = self.hits.get(s).copied().unwrap_or(0) as f64 / steps;
+                (s, (ms / steps - hits * self.cal_ms).max(0.0))
+            })
+            .collect();
+        let adj_sum: f64 = adj.values().sum();
+        let gpu_sum: f64 = self.totals.values().sum();
+        let mut s = format!(
+            "# step profile（{} 步累计）\n\nwall {:.2} ms/步｜GPU 段和 raw {:.2} → 校正 {:.2}（事件记录 {:.0}µs/次 × {:.0} 打点/步）｜host：上传 {:.2} + 提交 {:.2}（与 GPU 重叠）+ 读回 {:.2}{}\n\n| 段 | 校正 ms/步 | 占比% | raw ms/步 | 打点/步 |\n|---|---|---|---|---|",
+            self.steps,
+            self.wall_ms / steps,
+            gpu_sum / steps,
+            adj_sum,
+            self.cal_ms * 1e3,
+            self.hits.values().sum::<u64>() as f64 / steps,
+            self.upload_ms / steps,
+            self.submit_ms / steps,
+            self.readback_ms / steps,
+            if self.truncated { "｜⚠ 事件池截断" } else { "" },
+        );
+        for (sect, ms) in rows {
+            let a = adj.get(sect).copied().unwrap_or(0.0);
+            let pct = if adj_sum > 0.0 { a / adj_sum * 100.0 } else { 0.0 };
+            let h = self.hits.get(sect).copied().unwrap_or(0) as f64 / steps;
+            s.push_str(&format!(
+                "\n| {sect} | {a:.2} | {pct:.1} | {:.2} | {h:.0} |",
+                *ms / steps
+            ));
+        }
+        s
+    }
+}
+
 pub struct Qwen35Executor {
     layers: Vec<LayerDev>,
     embed: DevBuf<'static>,
@@ -216,6 +393,9 @@ pub struct Qwen35Executor {
     q_scale: f32,
     /// FULL_DECODE 图档（None = NONE——eager 直发）
     graph: Option<QGraphMode>,
+    /// 步时分解插桩（WEIN_STEP_PROFILE；仅 eager——声明序先于 session，
+    /// 事件池借用 gpu 与 DevBuf 同一钉扎论证）
+    prof: RefCell<Option<StepProf>>,
     session: DeviceSession,
 }
 
@@ -345,6 +525,11 @@ impl Qwen35Executor {
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
         let q_scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+        let prof = if std::env::var("WEIN_STEP_PROFILE").is_ok() {
+            Some(StepProf::new(gpu))
+        } else {
+            None
+        };
 
         Ok(Qwen35Executor {
             layers,
@@ -369,6 +554,7 @@ impl Qwen35Executor {
             bpr: bpr_of(),
             q_scale,
             graph: None,
+            prof: RefCell::new(prof),
             session,
         })
     }
@@ -634,6 +820,60 @@ impl Qwen35Executor {
     /// 批前向 + 设备端采样。rows: (块表行, token, 位置)；samples: 采样行
     /// 全局下标。返回每采样行一个 token。批内同请求行须连续（断言钉——
     /// conv tap/deltanet 递推的段语义前提）
+    // ── 插桩辅助（未开启时 borrow 落空即返——热路径成本 ns 级）──
+
+    fn prof_mark(&self, sect: &'static str) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.mark(sect, self.session.stream());
+        }
+    }
+    fn prof_upload_done(&self, t: Instant) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.upload_ms += prof_ms(t.elapsed());
+            p.begin(self.session.stream());
+        }
+    }
+    fn prof_note_submit(&self, t: Instant) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.submit_ms += prof_ms(t.elapsed());
+        }
+    }
+    fn prof_end(&self) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.end(self.session.stream());
+            p.calibrate(self.session.stream());
+        }
+    }
+    fn prof_note_readback(&self, t: Instant) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.readback_ms += prof_ms(t.elapsed());
+        }
+    }
+    fn prof_finalize(&self, wall: Instant) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.finalize(prof_ms(wall.elapsed()));
+        }
+    }
+
+    /// 步时分解报告（markdown；插桩未开 → None）。q13 结构合同 + 满负荷
+    /// 账定位的读数源（examples/qwen_step_profile 驱动）
+    pub fn step_profile_report(&self) -> Option<String> {
+        self.prof.borrow().as_ref().map(|p| p.report())
+    }
+
+    /// 段表清零（校准单价保留）——example 按 m 分段读数的隔板
+    pub fn step_profile_reset(&self) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.totals.clear();
+            p.hits.clear();
+            p.steps = 0;
+            p.wall_ms = 0.0;
+            p.upload_ms = 0.0;
+            p.submit_ms = 0.0;
+            p.readback_ms = 0.0;
+        }
+    }
+
     fn forward_batch(&mut self, rows: &[(u32, u32, u32)], samples: &[u32]) -> Vec<u32> {
         // context 线程局部：engine 任务可在 worker 间迁移，进设备路径先绑
         self.session.gpu().bind_thread();
@@ -676,6 +916,8 @@ impl Qwen35Executor {
         }
 
         let (gpu, stream, tb) = (self.session.gpu(), self.session.stream(), self.session.table());
+        let prof_on = self.prof.borrow().is_some();
+        let tw = Instant::now();
         let ids: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let pos: Vec<u32> = rows.iter().map(|r| r.2).collect();
         let seqs: Vec<u32> = rows.iter().map(|r| r.0).collect();
@@ -691,6 +933,7 @@ impl Qwen35Executor {
         let ids_lq: Vec<u32> = (0..t).map(|tt| (tt * 4) as u32).collect();
         let ids_lk: Vec<u32> = (0..t).map(|tt| (tt * 4 + 1) as u32).collect();
         let ids_lv: Vec<u32> = (0..t).map(|tt| (tt * 2 + 1) as u32).collect();
+        let tu = Instant::now();
         let (d_ids, d_pos, d_seqs, d_bt) = (
             gpu.alloc_from_slice(&ids),
             gpu.alloc_from_slice(&pos),
@@ -726,22 +969,40 @@ impl Qwen35Executor {
             ilk: &d_ilk,
             ilv: &d_ilv,
         };
+        if prof_on {
+            self.prof_upload_done(tu);
+        }
+        let tsub = Instant::now();
         self.run_forward(t as u32, n_rows, &inp);
+        if prof_on {
+            self.prof_note_submit(tsub);
+        }
 
         // ── 采样（设备端 argmax；只回读采样行的 u32）──
         if samples.is_empty() {
+            self.prof_end();
             stream.sync();
+            if prof_on {
+                self.prof_finalize(tw);
+            }
             return Vec::new();
         }
         let s = samples.len() as u32;
         assert!((s as usize) <= t, "采样行数超批");
+        self.prof_mark("argmax");
         let d_rows = gpu.alloc_from_slice(samples);
         tb.argmax_rows.run(
             &self.scr.logits, &d_rows, &self.scr.am_scratch, &self.scr.am_out,
             self.cfg.vocab_size as u32, s, stream,
         );
+        self.prof_end();
         stream.sync();
+        let tr = Instant::now();
         let out: Vec<u32> = self.scr.am_out.read_to_vec();
+        if prof_on {
+            self.prof_note_readback(tr);
+            self.prof_finalize(tw);
+        }
         out[..s as usize].to_vec()
     }
 
@@ -762,6 +1023,7 @@ impl Qwen35Executor {
         }
 
         // ── embed ──
+        self.prof_mark("embed");
         tb.embed.run(inp.ids, &self.embed, &self.scr.x, h, t32, stream);
         if trace {
             self.trace_x(&format!("s{step}-embed"), t32);
@@ -771,25 +1033,32 @@ impl Qwen35Executor {
         let mut lin_i = 0usize;
         let mut full_i = 0usize;
         for (li, layer) in self.layers.iter().enumerate() {
+            self.prof_mark("norm");
             tb.rms_norm_zc.run(&self.scr.x, &layer.ln1, &self.scr.n1, t32, h, eps, stream);
             match &layer.attn {
                 AttnDev::Full(w) => {
                     let (qh_n, kvh, hd) = (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
                     let he = kvh * hd;
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.qg, &self.scr.qg, t32, 2 * qh_n * hd, h, stream);
                     if trace {
                         self.trace_buf(&format!("s{step}-L{li:02}-qg"), &self.scr.qg, t32 as usize * 2 * qh_n as usize * hd as usize);
                     }
+                    self.prof_mark("gather");
                     tb.embed.run(inp.iq, &self.scr.qg, &self.scr.qh, hd, t32 * qh_n, stream);
                     tb.embed.run(inp.ig, &self.scr.qg, &self.scr.gate, hd, t32 * qh_n, stream);
                     // 零中心 norm 在 head_dim 上（原地：行私有读写，安全）
+                    self.prof_mark("norm");
                     tb.rms_norm_zc.run(&self.scr.qh, &w.qn, &self.scr.qh, t32 * qh_n, hd, eps, stream);
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.k, &self.scr.kh, t32, he, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.v, &self.scr.vh, t32, he, h, stream);
                     if trace {
                         self.trace_buf(&format!("s{step}-L{li:02}-vh"), &self.scr.vh, t32 as usize * he as usize);
                     }
+                    self.prof_mark("norm");
                     tb.rms_norm_zc.run(&self.scr.kh, &w.kn, &self.scr.kh, t32 * kvh, hd, eps, stream);
+                    self.prof_mark("rope");
                     let rd = self.cfg.rot_dim();
                     tb.rope_pt.run(
                         &self.scr.qh, &self.cos, &self.sin, inp.pos, &self.scr.qh, rd, hd, qh_n,
@@ -799,15 +1068,18 @@ impl Qwen35Executor {
                         &self.scr.kh, &self.cos, &self.sin, inp.pos, &self.scr.kh, rd, hd, kvh,
                         t32, stream,
                     );
+                    self.prof_mark("kv");
                     tb.kv_scatter.run(
                         &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[full_i],
                         &self.v_pool[full_i], self.bpr as u32, BLOCK, he, t32, stream,
                     );
+                    self.prof_mark("attn");
                     tb.paged_attn.run(
                         &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt, inp.seqs,
                         inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh,
                         hd, t32, stream,
                     );
+                    self.prof_mark("eltw");
                     tb.sigmul.run(
                         &self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream,
                     );
@@ -816,6 +1088,7 @@ impl Qwen35Executor {
                         self.trace_buf(&format!("s{step}-L{li:02}-gate"), &self.scr.gate, t32 as usize * qh_n as usize * hd as usize);
                         self.trace_buf(&format!("s{step}-L{li:02}-agated"), &self.scr.agated, t32 as usize * qh_n as usize * hd as usize);
                     }
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.agated, &w.o, &self.scr.o, t32, h, qh_n * hd, stream);
                     if trace {
                         self.trace_buf(&format!("s{step}-L{li:02}-o"), &self.scr.o, t32 as usize * h as usize);
@@ -831,7 +1104,9 @@ impl Qwen35Executor {
                     );
                     let (keyd, vald) = (kh_n * kd, vh_n * vd);
                     let cd = 2 * keyd + vald;
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.qkv, &self.scr.qkv, t32, cd, h, stream);
+                    self.prof_mark("conv");
                     tb.conv1d_dw.run(
                         &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc, inp.trow,
                         inp.tpos, cd, self.cfg.conv_kernel, t32, stream,
@@ -842,12 +1117,15 @@ impl Qwen35Executor {
                         &self.scr.qkv, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
                         self.cfg.conv_kernel, n_rows, stream,
                     );
+                    self.prof_mark("gather");
                     tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
                     tb.embed.run(inp.ilk, &self.scr.qkvc, &self.scr.ks, keyd, t32, stream);
                     tb.embed.run(inp.ilv, &self.scr.qkvc, &self.scr.vs, vald, t32, stream);
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.z, &self.scr.z, t32, vald, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.b, &self.scr.bb, t32, 32, h, stream);
+                    self.prof_mark("delta");
                     tb.deltanet.run(
                         &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
                         &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
@@ -859,28 +1137,38 @@ impl Qwen35Executor {
                         self.trace_buf(&format!("s{step}-L{li:02}-qkvc"), &self.scr.qkvc, t32 as usize * cd as usize);
                         self.trace_buf(&format!("s{step}-L{li:02}-core"), &self.scr.core, t32 as usize * vald as usize);
                     }
+                    self.prof_mark("norm");
                     tb.rms_norm_gated.run(
                         &self.scr.core, &self.scr.z, &w.norm, &self.scr.normed, t32 * vh_n, vd,
                         eps, stream,
                     );
+                    self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.normed, &w.out, &self.scr.o, t32, h, vald, stream);
                     lin_i += 1;
                 }
             }
+            self.prof_mark("eltw");
             tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, t32 * h, stream);
+            self.prof_mark("norm");
             tb.rms_norm_zc.run(&self.scr.h2, &layer.ln2, &self.scr.n2, t32, h, eps, stream);
+            self.prof_mark("gemm");
             tb.gemm.run_wt(&self.scr.n2, &layer.wg, &self.scr.g, t32, ii, h, stream);
             tb.gemm.run_wt(&self.scr.n2, &layer.wu, &self.scr.u, t32, ii, h, stream);
+            self.prof_mark("eltw");
             tb.silu.run(&self.scr.g, &self.scr.act, t32 * ii, stream);
             tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t32 * ii, stream);
+            self.prof_mark("gemm");
             tb.gemm.run_wt(&self.scr.m, &layer.wd, &self.scr.d, t32, h, ii, stream);
+            self.prof_mark("eltw");
             tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.x, t32 * h, stream);
             if trace {
                 self.trace_x(&format!("s{step}-layer-{li:02}"), t32);
             }
         }
         // ── final norm + logits（tie：embed 兼作 lm_head 的 W[n,k]）──
+        self.prof_mark("norm");
         tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
+        self.prof_mark("logits");
         tb.gemm.run_wt(&self.scr.n2, &self.embed, &self.scr.logits, t32, voc, h, stream);
         if trace {
             self.trace_logits(step, t32);

@@ -87,6 +87,12 @@ impl Gpu {
         Stream { drv: &self.drv, handle: self.drv.stream_create().expect("cuStreamCreate") }
     }
 
+    /// 计时事件（CUevent）：流上成对 record + elapsed_ms——步时分解
+    /// 插桩的根基。同一事件可重复 record（插桩的事件池复用此合同）
+    pub fn event(&self) -> Event<'_> {
+        Event { drv: &self.drv, handle: self.drv.event_create().expect("cuEventCreate") }
+    }
+
     /// 加载 PTX 文本（driver JIT；缓存落盘由 k7 验证）。
     /// 镜像必须 NUL 结尾（驱动合同）——Rust &str 不带，这里补上
     pub fn load_module(&self, ptx_text: &str) -> Module<'_> {
@@ -143,6 +149,34 @@ pub struct Func {
 pub struct Stream<'a> {
     drv: &'a Driver,
     handle: *mut c_void,
+}
+
+/// 计时事件（CUevent）——GPU 时间轴上的标记点。record_on 排进流，
+/// elapsed_ms 量两点间 GPU 时距（须已完成）。插桩用事件池反复 record。
+pub struct Event<'a> {
+    drv: &'a Driver,
+    handle: *mut c_void,
+}
+
+impl Event<'_> {
+    /// 流上记录（保序：排在前序 kernel 完成之后）
+    pub fn record_on(&self, stream: &Stream) {
+        self.drv.event_record(self.handle, stream.handle).expect("cuEventRecord");
+    }
+    /// 自 `since` 到本事件的 GPU 时距（ms；须两者均已完成）
+    pub fn elapsed_ms(&self, since: &Event) -> f32 {
+        let mut ms = 0f32;
+        self.drv
+            .event_elapsed_time(&mut ms, since.handle, self.handle)
+            .expect("cuEventElapsedTime");
+        ms
+    }
+}
+
+impl Drop for Event<'_> {
+    fn drop(&mut self) {
+        self.drv.event_destroy(self.handle).expect("cuEventDestroy");
+    }
 }
 
 impl Stream<'_> {
