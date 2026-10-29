@@ -276,6 +276,64 @@ fn o20_deltanet_golden_bitwise() {
     }
 }
 
+/// o22 · deltanet 时延金丝雀：满负荷 decode 形状（m=100 行 × 32 v 头 ×
+/// kd=vd=128，每行 1 token）单 launch 事件计时。状态池 200MB/层是该 kernel
+/// 的带宽账（BASELINE §7：6 趟访存 → 3 趟 + v4 合并后地板 ~0.6ms）。
+/// 门禁 1.5ms 是 2× 地板余量——防"每线程串行扫 S 行"形态回归
+#[test]
+fn o22_deltanet_latency_canary() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    let (n_rows, k_heads, v_heads, k_dim, v_dim) = (100usize, 16usize, 32usize, 128usize, 128usize);
+    let tokens = n_rows; // decode：每行 1 token
+    let q = vec_bf16(0x6a12, tokens * k_heads * k_dim, 1.0);
+    let k = vec_bf16(0x6b34, tokens * k_heads * k_dim, 1.0);
+    let v = vec_bf16(0x6c56, tokens * v_heads * v_dim, 1.0);
+    let a = vec_bf16(0x6d78, tokens * v_heads, 1.0);
+    let b = vec_bf16(0x6e9a, tokens * v_heads, 1.0);
+    let a_log: Vec<f32> = (0..v_heads).map(|h| 0.3 + 0.2 * h as f32).collect();
+    let dt_bias = vec_bf16(0x6fbc, v_heads, 0.5);
+    let state_len = n_rows * v_heads * v_dim * k_dim;
+    let state = vec![0f32; state_len]; // 时延与数据值无关
+    let row_start: Vec<u32> = (0..n_rows as u32).collect();
+    let row_count = vec![1u32; n_rows];
+    let row_id: Vec<u32> = (0..n_rows as u32).collect();
+
+    let (dq, dk, dv, da, db) = (
+        gpu.alloc_from_slice(&q),
+        gpu.alloc_from_slice(&k),
+        gpu.alloc_from_slice(&v),
+        gpu.alloc_from_slice(&a),
+        gpu.alloc_from_slice(&b),
+    );
+    let (da_log, ddtb) = (gpu.alloc_from_slice(&a_log), gpu.alloc_from_slice(&dt_bias));
+    let dstate = gpu.alloc_from_slice(&state);
+    let dout = gpu.alloc_bytes(tokens * v_heads * v_dim * 2);
+    let (drs, drc, dri) = (
+        gpu.alloc_from_slice(&row_start),
+        gpu.alloc_from_slice(&row_count),
+        gpu.alloc_from_slice(&row_id),
+    );
+    for _ in 0..3 {
+        // 热身（JIT/缓存就位）；状态每拍原地演化——形状与访存量不变
+        t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
+    }
+    stream.sync();
+    let (e0, e1) = (gpu.event(), gpu.event());
+    e0.record_on(&stream);
+    for _ in 0..20 {
+        t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
+    }
+    e1.record_on(&stream);
+    stream.sync();
+    let per_launch = e1.elapsed_ms(&e0) / 20.0;
+    eprintln!("o22 deltanet m=100×32×128²：{per_launch:.3} ms/launch（20 拍均值）");
+    assert!(per_launch < 1.5, "deltanet {per_launch:.3}ms 超 1.5ms 门禁——状态访存形态回归（串行扫 S 行）");
+}
+
 /// o21 · 行 argmax：全序归约确定——真值构造（等值取小下标、全负行、
 /// 首/末位置极值），非随机
 #[test]

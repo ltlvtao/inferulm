@@ -17,6 +17,9 @@
 // sqrt/mul_add 等浮点方法在新 nightly 被移入 core_float_math（#137578）；
 // 正确舍入原语直接走 intrinsics——语义等同 sqrt.rn.f32（冒烟风险登记项）
 #![feature(core_intrinsics)]
+// f32x4 作 16B 向量容器（load/store 发射 ld/st.global.v4.f32；车道只做
+// 恒定索引抽取——算术仍在标量域，位对齐合同不动）
+#![feature(portable_simd)]
 
 use core::arch::nvptx::{_block_dim_x, _block_idx_x, _syncthreads, _thread_idx_x};
 
@@ -652,10 +655,28 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
 /// gated deltanet（recurrent correctness-first）：一块 = (请求行, v 头)，
 /// 一线程一 v 维（线程私有 state 行 S[v][0..k_dim]，全局内存 L1 驻留）。
 /// 每 token：q/k 逐头 l2norm（f32，eps=1e-6）→ q 再除 √k_dim →
+/// 16B 对齐 f32×4：host 侧缓冲全经 cuMemAlloc（≥256B 对齐），kd%4==0 时
+/// 状态行内偏移按 16B 对齐——f32x4 是 LLVM 向量类型，整加载/存储由
+/// nvptx 后端发射 ld/st.global.v4.f32（错位向量访问是硬件错误，该路径
+/// 仅由对齐条件守卫）。车道恒定索引抽取——算子仍在标量域（同序同位）
+#[inline(always)]
+unsafe fn ld4(p: *const f32) -> core::simd::f32x4 {
+    unsafe { *(p as *const core::simd::f32x4) }
+}
+#[inline(always)]
+unsafe fn st4(p: *mut f32, x: core::simd::f32x4) {
+    unsafe { *(p as *mut core::simd::f32x4) = x };
+}
+
 /// S·=exp(g)；kv_mem=ΣS·k_n；delta=(v−kv_mem)·β；S+=k_n⊗delta；
 /// out=ΣS·q_ns——与 torch_recurrent_gated_delta_rule 逐步同序，
 /// 累加 j 升序；core out 收 bf16（norm/gate 在 rms_norm_gated 另做）。
 /// 门控标量：β=sigmoid(b)，g=−exp(A_log)·softplus(a+dt_bias)
+///
+/// 访存形态：每 token 对状态行 3 趟（kvm 读、更新读、写；v4 向量）——
+/// 原始 4 趟 6 次访问的 decay 写/读往返改为更新趟同式重算 S1=S0·decay
+/// （同表达式位不变），kvm/o 累加与逐元素运算序逐操作数保持（位对齐
+/// 合同不动：o16/o20/o19 与 wein≡vLLM oracle 原样有效）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn deltanet(
     q: *const u16,        // [tokens, k_heads, k_dim]
@@ -717,33 +738,53 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         }
         let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
         let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
-        // S *= decay
-        let mut j = 0usize;
-        while j < kd {
-            *srow.add(j) = *srow.add(j) * decay;
-            j += 1;
-        }
-        // kv_mem = Σ_j S[v][j]·k_n[j]（j 升序）
+        // kvm 趟（读 S0）：S1=S0·decay 只在寄存器（更新趟同式重算，位不变），
+        // 累加 j 升序同参考
         let mut kvm = 0.0f32;
-        let mut j = 0usize;
-        while j < kd {
-            kvm = *srow.add(j) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
-            j += 1;
+        if kd % 4 == 0 {
+            let mut j = 0usize;
+            while j < kd {
+                let s = *ld4(srow.add(j)).as_array();
+                kvm = (s[0] * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+                kvm = (s[1] * decay) * (bf16_to_f32(*k.add(qb + j + 1)) * invk) + kvm;
+                kvm = (s[2] * decay) * (bf16_to_f32(*k.add(qb + j + 2)) * invk) + kvm;
+                kvm = (s[3] * decay) * (bf16_to_f32(*k.add(qb + j + 3)) * invk) + kvm;
+                j += 4;
+            }
+        } else {
+            let mut j = 0usize;
+            while j < kd {
+                kvm = (*srow.add(j) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+                j += 1;
+            }
         }
         let vin = bf16_to_f32(*v.add((g * vh + h) * vd + vv));
         let delta = (vin - kvm) * beta;
-        // S[v][j] += k_n[j]·delta
-        let mut j = 0usize;
-        while j < kd {
-            *srow.add(j) = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + *srow.add(j);
-            j += 1;
-        }
-        // out[v] = Σ_j S[v][j]·(q_n[j]/√kd)——更新后读（同参考序）
+        // 更新+输出趟（读 S0 写 S2）：S1 同式重算、S2 落地、o 就地 j 升序累加
         let mut o = 0.0f32;
-        let mut j = 0usize;
-        while j < kd {
-            o = *srow.add(j) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
-            j += 1;
+        if kd % 4 == 0 {
+            let mut j = 0usize;
+            while j < kd {
+                let s = *ld4(srow.add(j)).as_array();
+                let s2_0 = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + (s[0] * decay);
+                let s2_1 = (bf16_to_f32(*k.add(qb + j + 1)) * invk) * delta + (s[1] * decay);
+                let s2_2 = (bf16_to_f32(*k.add(qb + j + 2)) * invk) * delta + (s[2] * decay);
+                let s2_3 = (bf16_to_f32(*k.add(qb + j + 3)) * invk) * delta + (s[3] * decay);
+                st4(srow.add(j), core::simd::f32x4::from_array([s2_0, s2_1, s2_2, s2_3]));
+                o = s2_0 * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+                o = s2_1 * ((bf16_to_f32(*q.add(qb + j + 1)) * invq) / kd_sqrt) + o;
+                o = s2_2 * ((bf16_to_f32(*q.add(qb + j + 2)) * invq) / kd_sqrt) + o;
+                o = s2_3 * ((bf16_to_f32(*q.add(qb + j + 3)) * invq) / kd_sqrt) + o;
+                j += 4;
+            }
+        } else {
+            let mut j = 0usize;
+            while j < kd {
+                let s2 = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + (*srow.add(j) * decay);
+                *srow.add(j) = s2;
+                o = s2 * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+                j += 1;
+            }
         }
         *core_out.add((g * vh + h) * vd + vv) = f32_to_bf16(o);
         i += 1;

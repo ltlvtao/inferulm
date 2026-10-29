@@ -2,3 +2,4 @@
 Cargo.lock.orig
 *.log
 vendor/
+crates/wein-kernel/kernels/target/
