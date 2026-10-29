@@ -17,15 +17,37 @@ fn arg(args: &[String], k: &str, d: &str) -> String {
         .unwrap_or_else(|| d.to_string())
 }
 
-/// HfTokenizer → serve Tokenizer 桥（组装在 cli 层——serve 不依赖 model，§2 单向）。
-/// 组合合同由 q11（wein-serve tests）钉住，此处与之间构
-struct HfServing(wein_model::HfTokenizer);
+/// HfTokenizer + ChatTemplate → serve Tokenizer 桥（组装在 cli 层——
+/// serve 不依赖 model，§2 单向）。组合合同由 q11/q12（wein-serve tests）
+/// 钉住，此处与之间构
+struct HfServing {
+    tok: wein_model::HfTokenizer,
+    tpl: Option<wein_model::ChatTemplate>,
+}
 impl Tokenizer for HfServing {
     fn encode(&self, text: &str) -> Vec<u32> {
-        self.0.encode(text)
+        self.tok.encode(text)
     }
     fn piece_bytes(&self, id: u32) -> Cow<'_, [u8]> {
-        Cow::Owned(self.0.decode(&[id]).into_bytes())
+        Cow::Owned(self.tok.decode(&[id]).into_bytes())
+    }
+    fn render_chat_template(
+        &self,
+        messages: &[wein_serve::ChatMessage],
+    ) -> Option<Result<String, String>> {
+        // 模板在场即真身；模型目录无模板 → None（serve 回退占位）
+        self.tpl.as_ref().map(|t| {
+            t.render(
+                &messages
+                    .iter()
+                    .map(|m| wein_model::ChatMsg { role: m.role.clone(), content: m.content.clone() })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())
+        })
+    }
+    fn eos_id(&self) -> Option<u32> {
+        Some(self.tok.eos_id())
     }
 }
 
@@ -79,12 +101,20 @@ fn main() {
                 eprintln!("tokenizer 打开失败：{e}");
                 std::process::exit(1)
             });
+            // chat 模板（W5）：在场即接（--graph 与否无关）
+            let tpl = match wein_model::ChatTemplate::open(&dir) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("chat 模板不在场（chat 端点回退占位包装）：{e}");
+                    None
+                }
+            };
             let engine = EngineCore::spawn_with(
                 CoreConfig::scripted(vec![], Duration::ZERO),
                 Box::new(ex),
             )
             .0;
-            (engine, Arc::new(HfServing(hf)))
+            (engine, Arc::new(HfServing { tok: hf, tpl }))
         } else {
             let engine: EngineHandle = match engine_kind.as_str() {
                 "core" => {

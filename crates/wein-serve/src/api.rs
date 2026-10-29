@@ -135,7 +135,11 @@ fn validate_common(
         .map_err(|m| openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", m))?;
     // M0 默认 16：未设上限的请求不至于无限流（真实引擎接入后改为模型上下文上限）
     let max_tokens = max_tokens.unwrap_or(16);
-    Ok(ValidatedGen { stops, max_tokens, sampling: SamplingParams { temperature, top_p } })
+    Ok(ValidatedGen {
+        stops,
+        max_tokens,
+        sampling: SamplingParams { temperature, top_p, stop_token_ids: Vec::new() },
+    })
 }
 
 // ---------- handlers ----------
@@ -171,12 +175,27 @@ async fn chat_completions(State(st): State<Arc<ServeState>>, Json(req): Json<Cha
     if req.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "'messages' must not be empty");
     }
-    // 占位 chat 模板（真实模板 W5 接入）：保证确定性与可测性
-    let prompt: String = req.messages.iter().map(|m| format!("{}: {}\n", m.role, m.content)).collect();
-    let prompt_ids = st.tokenizer.encode(&prompt);
+    // chat 模板（W5 真身）：tokenizer 有模板即渲染（模型侧 raise → 400）；
+    // 无模板（mock/未接）回退占位包装——既有验收即 parity
+    let prompt_ids = match st.tokenizer.render_chat_template(&req.messages) {
+        Some(Ok(text)) => st.tokenizer.encode(&text),
+        Some(Err(msg)) => {
+            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+        }
+        None => {
+            let prompt: String =
+                req.messages.iter().map(|m| format!("{}: {}\n", m.role, m.content)).collect();
+            st.tokenizer.encode(&prompt)
+        }
+    };
     let prompt_tokens = prompt_ids.len();
 
-    let (id, events) = st.engine.submit(prompt_ids, v.max_tokens, v.sampling);
+    // eos 停止（vLLM 默认）：命中即 Finished(Stop) 且不外吐
+    let mut sampling = v.sampling;
+    if let Some(eos) = st.tokenizer.eos_id() {
+        sampling.stop_token_ids.push(eos);
+    }
+    let (id, events) = st.engine.submit(prompt_ids, v.max_tokens, sampling);
     let resp_id = format!("chatcmpl-{id}");
     let created = now();
     let model = st.model_id.clone();
@@ -244,7 +263,12 @@ async fn completions(State(st): State<Arc<ServeState>>, Json(req): Json<Completi
     let prompt_ids = st.tokenizer.encode(&prompt_text);
     let prompt_tokens = prompt_ids.len();
 
-    let (id, events) = st.engine.submit(prompt_ids, v.max_tokens, v.sampling);
+    // eos 停止与 chat 端点同一默认（vLLM：原始续写也停于 eos）
+    let mut sampling = v.sampling;
+    if let Some(eos) = st.tokenizer.eos_id() {
+        sampling.stop_token_ids.push(eos);
+    }
+    let (id, events) = st.engine.submit(prompt_ids, v.max_tokens, sampling);
     let resp_id = format!("cmpl-{id}");
     let created = now();
     let model = st.model_id.clone();

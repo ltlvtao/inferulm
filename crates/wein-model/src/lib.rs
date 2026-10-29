@@ -9,10 +9,12 @@
 //! 设备上载是 wein-exec 的事。
 
 mod config;
+mod template;
 mod tokenizer;
 mod weights;
 
 pub use config::{LayerType, Qwen35Config};
+pub use template::{ChatMsg, ChatTemplate};
 pub use tokenizer::HfTokenizer;
 pub use weights::{Dtype, TensorRef, WeightStore};
 

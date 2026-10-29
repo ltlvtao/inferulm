@@ -76,6 +76,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +exec | release | 168,890 | 10.20 / 12.31 | — | — | 1.15 / 3.08 | 0.041 | 1.72 | 0.043 | exec 真身首测（battery-20261028-215639）：**L3 TTFT p50 6.76ms / p99 14.27ms / ITL mean 0.80ms / tps 47.1k**（toy 真 GPU 步，其余层噪声带内）；行回收缺陷修复后三重复全健康 |
 | 2026-10-29 | +qwen | release | 165,559 | 10.78 / 12.10 | — | — | 1.05 / 4.59 | 0.036 | 1.65 | 0.058 | 真模型竖切首测（battery-20261029-002042，I1）：**L3q TTFT p50 72.35ms / ITL p50 30.91ms / tps 115.7 / errors 0**（Qwen3.5-4B 真权重，轻载 c=4/n=8/12tok——满负荷 profile 撞 exec 批界不适用）；ITL≈q9 单步账（33.7ms 中位），TTFT=追平+首步；conv 状态行间接缺陷（span 序号≠状态行号）q8 双胞胎实验定位，o19 升级钉住 |
 | 2026-10-29 | +graph | release | 169,691 | — | — | — | 1.13 / 2.18 | 0.027 | 1.64 | 0.037 | W2 图档首测（battery-20261029-013037，`--graph` FULL_DECODE 桶{1..32}回放）：**L3q+ ITL p50 28.79ms vs L3q 31.28ms（−8.0%）、tps 122.1 vs 115.4（+5.8%）、TTFT p50 72.29 vs 75.64ms、errors 0**；单步对照 qg3 图先测防热身漂移（§7）；混合步/prefill 仍 eager（sink 行吸收桶 padding）；其余层噪声带内 |
+| 2026-10-29 | +chat | release | 162,763 | — | — | — | 1.10 / 5.47 | 0.025 | 1.68 | 0.050 | W5 chat 模板（battery-20261029-091642）：**语义变更——bench 流量走 chat 端点吃到真模板**，prompt 4→11 token（占位 `user: bench\n` → `<\|im_start\|>…<think>\n`，实测 token 数）：L3q TTFT 72→112ms 是追平多算 7 token 的账（**非性能回归**；隔离复跑复现 + token 数对账归因），ITL 32.91ms / tps 100.2；同轮同语义 L3q+ 图档 ITL 31.94ms（**−3.0%**，方向与 §6 上行一致）；stop_token_ids 热路径零开销（total_tokens 两轮同 96——无提前 eos）；其余层噪声带内 |
 
 ## 7. kernel 侧微基准（设备端首测，随 exec/kernel 里程碑追加）
 

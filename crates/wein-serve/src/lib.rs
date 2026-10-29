@@ -7,6 +7,7 @@ mod detok;
 mod openai;
 
 pub use detok::{IncrementalDetok, MockTokenizer, Tokenizer};
+pub use openai::ChatMessage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

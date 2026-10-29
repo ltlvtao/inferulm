@@ -8,11 +8,14 @@ pub type RequestId = u64;
 pub struct SamplingParams {
     pub temperature: f64,
     pub top_p: f64,
+    /// 停止词表（chat eos 等，W5）：采样命中即 Finished(Stop)，该 token 不外吐
+    /// （vLLM stop_token_ids 语义）。检查发生在 engine core 的 token 发射处
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl Default for SamplingParams {
     fn default() -> Self {
-        Self { temperature: 1.0, top_p: 1.0 }
+        Self { temperature: 1.0, top_p: 1.0, stop_token_ids: Vec::new() }
     }
 }
 

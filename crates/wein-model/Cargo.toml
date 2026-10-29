@@ -12,3 +12,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 memmap2 = "0.9"
 tokenizers = { version = "0.21", default-features = false, features = ["onig", "esaxx_fast"] }
+minijinja = { version = "3.0.4", features = ["serde"] }

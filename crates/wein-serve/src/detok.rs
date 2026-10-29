@@ -9,6 +9,17 @@ pub trait Tokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Vec<u32>;
     /// 单个 token 的原始字节（byte-level，可能是不完整 UTF-8——正是本模块要处理的核心问题）
     fn piece_bytes(&self, id: u32) -> Cow<'_, [u8]>;
+    /// chat 模板钩子（W5）：`/v1/chat/completions` 的 messages → prompt 文本。
+    /// None = 无模板（mock/未接模型——回退占位包装，既有行为）；
+    /// Some(Err(msg)) = 模板拒绝（模型侧 raise_exception 语义 → HTTP 400）
+    fn render_chat_template(&self, _messages: &[crate::openai::ChatMessage]) -> Option<Result<String, String>> {
+        None
+    }
+    /// eos token id（W5）：作为引擎 stop_token_ids——采样命中即停且不外吐。
+    /// None = 无（行为与 W5 前全同）
+    fn eos_id(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// 测试用 tokenizer：id → 任意字节片段。

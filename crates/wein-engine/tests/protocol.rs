@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use wein_engine::{CoreConfig, EngineCore, EngineEvent, EventStream, FinishReason};
+use wein_engine::{CoreConfig, EngineCore, EngineEvent, EventStream, FinishReason, SamplingParams};
 
 async fn next(stream: &mut EventStream) -> EngineEvent {
     tokio::time::timeout(Duration::from_secs(5), stream.recv())
@@ -90,4 +90,36 @@ async fn e3_max_tokens_zero_finishes_immediately() {
     assert!(matches!(next(&mut s).await, EngineEvent::Accepted));
     assert!(matches!(next(&mut s).await, EngineEvent::Finished(FinishReason::Length)));
     assert!(t0.elapsed() < Duration::from_millis(100), "max=0 不得等待任何一步执行");
+}
+
+/// e4 · stop_token_ids（W5）：采样命中停止词表（chat eos）→ 该 token 不外吐、
+///      Finished(Stop) 恰一次后关流；记账走 finished 而非 cancelled；
+///      空表请求行为与旧全同（Length 路径零漂移）
+#[tokio::test]
+async fn e4_stop_token_ids_finishes_stop_without_emitting() {
+    let (engine, stats) = EngineCore::spawn(CoreConfig::scripted(
+        vec![5, 6, 7, 9, 8],
+        Duration::from_millis(1),
+    ));
+    let mut sp = SamplingParams::default();
+    sp.stop_token_ids = vec![9, 8];
+    let (_id, mut s) = engine.submit(vec![1], 10, sp);
+
+    assert!(matches!(next(&mut s).await, EngineEvent::Accepted));
+    assert!(matches!(next(&mut s).await, EngineEvent::Token(5)));
+    assert!(matches!(next(&mut s).await, EngineEvent::Token(6)));
+    assert!(matches!(next(&mut s).await, EngineEvent::Token(7)));
+    // 9 命中停止表：不外吐，直接终结
+    assert!(matches!(next(&mut s).await, EngineEvent::Finished(FinishReason::Stop)));
+    assert!(s.recv().await.is_none(), "Finished 之后必须关流");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(stats.finished_count(), 1, "eos 停止是 finished 不是 cancelled");
+    assert_eq!(stats.cancelled_count(), 0);
+
+    // 空 stop 表零漂变：Length 路径原样
+    let (_, mut s2) = engine.submit(vec![1], 2, Default::default());
+    assert!(matches!(next(&mut s2).await, EngineEvent::Accepted));
+    assert!(matches!(next(&mut s2).await, EngineEvent::Token(5)));
+    assert!(matches!(next(&mut s2).await, EngineEvent::Token(6)));
+    assert!(matches!(next(&mut s2).await, EngineEvent::Finished(FinishReason::Length)));
 }
