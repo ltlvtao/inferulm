@@ -24,7 +24,11 @@ PROMPTS=(
 )
 
 capture () { # $1=side $2=base_url
-  local side=$1 url=$2 model=${WEIN_MODEL_DIR:-$HOME/.cache/wein/Qwen3.5-4B}
+  local side=$1 url=$2
+  # model 名匹配当侧 served-model-name：wein=原目录（VL 统体，只取文本骨干），
+  # vllm=文本骨干副本（Qwen3.5-4B-text，同一组文本张量）
+  local model=${WEIN_MODEL_DIR:-$HOME/.cache/wein/Qwen3.5-4B}
+  [ "$side" = vllm ] && model=${WEIN_VLLM_MODEL:-$HOME/.cache/wein/Qwen3.5-4B-text}
   mkdir -p "$OUT/$side"
   local i=0
   for p in "${PROMPTS[@]}"; do
