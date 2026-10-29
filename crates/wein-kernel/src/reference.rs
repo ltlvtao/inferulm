@@ -342,17 +342,39 @@ pub fn softplus(x: f32) -> f32 {
     }
 }
 
+/// 行平方和块归约镜像（与 kernels::block_sum_strided 同式同序）：
+/// block 宽 bdim = min(hidden,256).next_power_of_two()（host 同式），
+/// "线程" t 跨步占有 {t, t+bdim, ...} 部分和（i 升序，`acc = v·v + acc`）
+/// → 线程 0 顺序合并 u 升序 `total = s[u] + total`。GPU 块归约的确定性
+/// 序在标量域逐步复现——kernel↔参考位对齐保持（序 ≠ 单线程顺序累加，
+/// 但两侧一致）
+fn rms_block_sum(x: &[u16], base: usize, hidden: usize) -> f32 {
+    let bdim = hidden.min(256).next_power_of_two();
+    let mut s = vec![0f32; bdim];
+    for t in 0..bdim {
+        let mut acc = 0.0f32;
+        let mut i = t;
+        while i < hidden {
+            let v = bf16_to_f32(x[base + i]);
+            acc = v * v + acc;
+            i += bdim;
+        }
+        s[t] = acc;
+    }
+    let mut total = 0.0f32;
+    for u in 0..bdim {
+        total = s[u] + total;
+    }
+    total
+}
+
 /// 零中心 RMSNorm（Qwen3_5RMSNorm 同语义）：out = x·rsqrt(mean(x²)+eps)·(1+w)，
-/// f32 域单次收 bf16——与 kernel 逐步同序
+/// f32 域单次收 bf16——与 kernel 逐步同序（块归约序同 rms_block_sum）
 pub fn rms_norm_zc(x: &[u16], w: &[u16], rows: usize, hidden: usize, eps: f32) -> Vec<u16> {
     let mut out = vec![0u16; rows * hidden];
     for r in 0..rows {
         let base = r * hidden;
-        let mut acc = 0.0f32;
-        for i in 0..hidden {
-            let v = bf16_to_f32(x[base + i]);
-            acc = v * v + acc;
-        }
+        let acc = rms_block_sum(x, base, hidden);
         let inv = 1.0f32 / ((acc / hidden as f32 + eps).sqrt());
         for i in 0..hidden {
             let o = bf16_to_f32(x[base + i]) * inv * (1.0 + bf16_to_f32(w[i]));
@@ -553,16 +575,13 @@ pub fn deltanet(
 }
 
 /// 带门 RMSNorm（Qwen3_5RMSNormGated 同语义）：xb=bf16(x·inv)（唯一中间
-/// round），xw=w_f32·f32(xb) 不收，末级 xw·silu(z) 单次收 bf16
+/// round），xw=w_f32·f32(xb) 不收，末级 xw·silu(z) 单次收 bf16——
+/// 块归约序同 rms_block_sum（与 kernel 同式同序）
 pub fn rms_norm_gated(x: &[u16], z: &[u16], w: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<u16> {
     let mut out = vec![0u16; rows * hidden];
     for r in 0..rows {
         let base = r * hidden;
-        let mut acc = 0.0f32;
-        for i in 0..hidden {
-            let v = bf16_to_f32(x[base + i]);
-            acc = v * v + acc;
-        }
+        let acc = rms_block_sum(x, base, hidden);
         let inv = 1.0f32 / ((acc / hidden as f32 + eps).sqrt());
         for i in 0..hidden {
             let xb = f32_to_bf16(bf16_to_f32(x[base + i]) * inv);

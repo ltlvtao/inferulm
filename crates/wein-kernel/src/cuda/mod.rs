@@ -253,6 +253,11 @@ pub struct DevBuf<'a> {
 }
 
 impl DevBuf<'_> {
+    /// 字节容量
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// launch 参数位：指向**存着设备地址的 host 内存**（AsKernelArg 消费）
     fn arg_slot(&self) -> *const core::ffi::c_void {
         &self.ptr as *const u64 as *const core::ffi::c_void

@@ -106,13 +106,21 @@ impl OpTable<'_> {
         let add = AddCuda { gpu, f: m.func("add") };
         let mul = MulCuda { gpu, f: m.func("mul") };
         // I1 竖切八入口（同模块；deltanet 自带块几何——注册时零假设）
-        let rms_norm_zc = RmsNormZcCuda { gpu, f: m.func("rms_norm_zc") };
+        let rms_norm_zc = RmsNormZcCuda {
+            gpu,
+            f: m.func("rms_norm_zc"),
+            scratch: gpu.alloc_bytes(REDUCE_ROWS_CAP * 256 * 4),
+        };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
         let conv_state_roll = ConvStateRollCuda { gpu, f: m.func("conv_state_roll") };
         let deltanet = DeltanetCuda { gpu, f: m.func("deltanet") };
-        let rms_norm_gated = RmsNormGatedCuda { gpu, f: m.func("rms_norm_gated") };
+        let rms_norm_gated = RmsNormGatedCuda {
+            gpu,
+            f: m.func("rms_norm_gated"),
+            scratch: gpu.alloc_bytes(REDUCE_ROWS_CAP * 256 * 4),
+        };
         let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
         // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
         let gemm = GemmLt { lt: Box::new(
@@ -205,15 +213,29 @@ pub trait RmsNormZcOp {
     fn name(&self) -> &'static str;
 }
 
+/// 块归约 scratch 行容量：满批 q-norm 128×16=2048 行，×4 余量
+const REDUCE_ROWS_CAP: usize = 8192;
+
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// 块归约 scratch：[REDUCE_ROWS_CAP, 256] f32，block 按 blockIdx 私有槽
+    /// （resolve 一次预分配——capture 期不触 alloc_guard，运行时零分配）
+    scratch: DevBuf<'a>,
 }
 
 impl RmsNormZcOp for RmsNormZcCuda<'_> {
     fn run(&self, x: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
-        let args = crate::kernel_args![*x, *w, *out, hidden, eps, rows];
-        self.gpu.launch(&self.f, rows.div_ceil(256), 256, &args, stream);
+        let args = crate::kernel_args![*x, *w, *out, hidden, eps, rows, self.scratch];
+        // block-per-row：块宽 = min(hidden,256) 上取 2 幂（kernel 的
+        // scratch 块归约按 blockDim 同构——reference.rs 镜像同式）
+        let b = hidden.min(256).next_power_of_two();
+        assert!(
+            rows as usize * b as usize * 4 <= self.scratch.bytes(),
+            "rms_norm_zc rows={rows} 超 scratch 容量 {} 槽",
+            self.scratch.bytes() / 4
+        );
+        self.gpu.launch(&self.f, rows, b, &args, stream);
     }
     fn name(&self) -> &'static str {
         "rms_norm_zc/cuda"
@@ -464,12 +486,20 @@ pub trait RmsNormGatedOp {
 pub struct RmsNormGatedCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// 块归约 scratch（同 RmsNormZcCuda）
+    scratch: DevBuf<'a>,
 }
 
 impl RmsNormGatedOp for RmsNormGatedCuda<'_> {
     fn run(&self, x: &DevBuf, z: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
-        let args = crate::kernel_args![*x, *z, *w, *out, hidden, eps, rows];
-        self.gpu.launch(&self.f, rows.div_ceil(256), 256, &args, stream);
+        let args = crate::kernel_args![*x, *z, *w, *out, hidden, eps, rows, self.scratch];
+        let b = hidden.min(256).next_power_of_two(); // block-per-row（同 rms_norm_zc）
+        assert!(
+            rows as usize * b as usize * 4 <= self.scratch.bytes(),
+            "rms_norm_gated rows={rows} 超 scratch 容量 {} 槽",
+            self.scratch.bytes() / 4
+        );
+        self.gpu.launch(&self.f, rows, b, &args, stream);
     }
     fn name(&self) -> &'static str {
         "rms_norm_gated/cuda"

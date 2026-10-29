@@ -491,9 +491,53 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
 // 零中心 norm / partial rope / 门控乘 / 深度因果卷积 / gated deltanet /
 // 带门 RMSNorm / 设备端 argmax——数值对齐纪律与上文同守。
 
+/// 行平方和的跨线程归约：scratch 是 kernel 参数（op 预分配，每 block 按
+/// blockIdx 私有槽 row*bdim）——stdarch nvptx 三条跨线程通道全断：
+/// 无 shfl intrinsic、asm! 未实现（无寄存器类）、`#[link_section=".shared"]`
+/// 被 rustc 后端忽略（static 落 .global 模块级，并发 block 互踩）。
+/// 线程 t 跨步占有元素 {t, t+bdim, ...}（连续线程连续地址——合并访存），
+/// 部分和 i 升序；`_syncthreads`（CUDA 语义 = 块内含 global 的可见性
+/// 屏障）后线程 0 顺序合并 u 升序 `total = s[u] + total`——reference.rs
+/// 按同式同序标量镜像（位对齐合同保持）
+#[inline(always)]
+unsafe fn block_sum_strided(
+    x: *const u16,
+    scratch: *mut f32,
+    row: usize,
+    base: usize,
+    h: usize,
+    t: usize,
+    bdim: usize,
+) -> f32 {
+    unsafe {
+        let slot = scratch.add(row * bdim);
+        let mut acc = 0.0f32;
+        let mut i = t;
+        while i < h {
+            let v = bf16_to_f32(*x.add(base + i));
+            acc = v * v + acc;
+            i += bdim;
+        }
+        *slot.add(t) = acc;
+        _syncthreads();
+        if t == 0 {
+            let mut total = 0.0f32;
+            let mut u = 0usize;
+            while u < bdim {
+                total = *slot.add(u) + total;
+                u += 1;
+            }
+            *slot = total;
+        }
+        _syncthreads();
+        *slot
+    }
+}
+
 /// 零中心 RMSNorm（Qwen3.5 形态）：out = x·rsqrt(mean(x²)+eps)·(1+w)。
 /// 与 transformers Qwen3_5RMSNorm 同语义：norm 在 f32、(1+w) 在 f32、
-/// 单次收 bf16。行内顺序累加同 rms_norm
+/// 单次收 bf16。block-per-row（跨步合并 + scratch 块归约——row-per-thread
+/// 串行扫整行在 rows=m 时全 GPU 只 m 个线程在跑，喂不饱 DRAM 延迟）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn rms_norm_zc(
     x: *const u16,
@@ -502,25 +546,23 @@ pub unsafe extern "ptx-kernel" fn rms_norm_zc(
     hidden: u32,
     eps: f32,
     rows: u32,
+    scratch: *mut f32,
 ) {
-    let r = tid();
-    if r < rows {
-        let h = hidden as usize;
-        let base = (r as usize) * h;
-        let mut acc = 0.0f32;
-        let mut i = 0usize;
-        while i < h {
-            let v = bf16_to_f32(*x.add(base + i));
-            acc = v * v + acc;
-            i += 1;
-        }
-        let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
-        let mut i = 0usize;
-        while i < h {
-            let o = bf16_to_f32(*x.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
-            *out.add(base + i) = f32_to_bf16(o);
-            i += 1;
-        }
+    let row = _block_idx_x() as usize;
+    if row >= rows as usize {
+        return;
+    }
+    let t = _thread_idx_x() as usize;
+    let bdim = _block_dim_x() as usize;
+    let h = hidden as usize;
+    let base = row * h;
+    let total = unsafe { block_sum_strided(x, scratch, row, base, h, t, bdim) };
+    let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
+    let mut i = t;
+    while i < h {
+        let o = bf16_to_f32(*x.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
+        *out.add(base + i) = f32_to_bf16(o);
+        i += bdim;
     }
 }
 
@@ -793,7 +835,8 @@ pub unsafe extern "ptx-kernel" fn deltanet(
 
 /// 带门 RMSNorm（deltanet 输出，Qwen3_5RMSNormGated 语义）：
 /// h=f32(x)；xn=h·rsqrt(mean(h²)+eps)；xb=bf16(xn)（唯一中间 round）；
-/// xw=w_f32·f32(xb)（f32 不收）；out=bf16(xw·silu(f32(z)))——末级单 round
+/// xw=w_f32·f32(xb)（f32 不收）；out=bf16(xw·silu(f32(z)))——末级单 round。
+/// block-per-row（同 rms_norm_zc：跨步合并 + scratch 块归约）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn rms_norm_gated(
     x: *const u16,     // [rows, hidden]（core out bf16）
@@ -803,27 +846,25 @@ pub unsafe extern "ptx-kernel" fn rms_norm_gated(
     hidden: u32,
     eps: f32,
     rows: u32,
+    scratch: *mut f32,
 ) {
-    let r = tid();
-    if r < rows {
-        let h = hidden as usize;
-        let base = (r as usize) * h;
-        let mut acc = 0.0f32;
-        let mut i = 0usize;
-        while i < h {
-            let v = bf16_to_f32(*x.add(base + i));
-            acc = v * v + acc;
-            i += 1;
-        }
-        let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
-        let mut i = 0usize;
-        while i < h {
-            let xb = f32_to_bf16(bf16_to_f32(*x.add(base + i)) * inv);
-            let xw = *w.add(i) * bf16_to_f32(xb);
-            let zv = bf16_to_f32(*z.add(base + i));
-            *out.add(base + i) = f32_to_bf16(xw * (zv * (1.0f32 / (1.0f32 + expf(-zv)))));
-            i += 1;
-        }
+    let row = _block_idx_x() as usize;
+    if row >= rows as usize {
+        return;
+    }
+    let t = _thread_idx_x() as usize;
+    let bdim = _block_dim_x() as usize;
+    let h = hidden as usize;
+    let base = row * h;
+    let total = unsafe { block_sum_strided(x, scratch, row, base, h, t, bdim) };
+    let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
+    let mut i = t;
+    while i < h {
+        let xb = f32_to_bf16(bf16_to_f32(*x.add(base + i)) * inv);
+        let xw = *w.add(i) * bf16_to_f32(xb);
+        let zv = bf16_to_f32(*z.add(base + i));
+        *out.add(base + i) = f32_to_bf16(xw * (zv * (1.0f32 / (1.0f32 + expf(-zv)))));
+        i += bdim;
     }
 }
 

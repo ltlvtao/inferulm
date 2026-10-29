@@ -37,6 +37,15 @@ fn gpu() -> Option<Gpu> {
     }
 }
 
+/// GPU 串行锁（graphs.rs 同款）：cargo test 并行线程的 kernel 会互相
+/// 闯入事件计时窗——µs 级门禁（o23 的 60µs）对并发负载敏感，全文件持锁
+fn guard() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 fn profile() -> HardwareProfile {
     HardwareProfile::with_device(Device::Cuda).with_arch("sm_89")
 }
@@ -64,6 +73,7 @@ fn vec_f32(seed_hi: u64, n: usize, scale: f32) -> Vec<f32> {
 /// o15 · 注册表长全：+8 槽位、名字可审（档位标识入日志）
 #[test]
 fn o15_op_table_all_i1_slots() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let t = table(&gpu);
     assert_eq!(t.rms_norm_zc.name(), "rms_norm_zc/cuda");
@@ -80,6 +90,7 @@ fn o15_op_table_all_i1_slots() {
 /// 带门（deltanet 输出路径；w 是 F32 checkpoint 原生权重）
 #[test]
 fn o16_norms_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -116,6 +127,7 @@ fn o16_norms_golden_bitwise() {
 /// out 缓冲先填哨兵——pass-through 维若被 kernel 写坏立刻现形
 #[test]
 fn o17_rope_pt_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -164,6 +176,7 @@ fn o17_rope_pt_golden_bitwise() {
 /// o18 · sigmul 位对齐：out = x·sigmoid(g)；n 含非 block 整数倍
 #[test]
 fn o18_sigmul_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -184,6 +197,7 @@ fn o18_sigmul_golden_bitwise() {
 /// 分账，若 kernel 拿 span 序号当行号写，行 2 留零、行 0 被串写，本条现形
 #[test]
 fn o19_conv_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -234,6 +248,7 @@ fn o19_conv_golden_bitwise() {
 /// v/k 头 2:1（repeat_interleave 映射）、最终状态回读对拍
 #[test]
 fn o20_deltanet_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -282,6 +297,7 @@ fn o20_deltanet_golden_bitwise() {
 /// 门禁 1.5ms 是 2× 地板余量——防"每线程串行扫 S 行"形态回归
 #[test]
 fn o22_deltanet_latency_canary() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -334,10 +350,54 @@ fn o22_deltanet_latency_canary() {
     assert!(per_launch < 1.5, "deltanet {per_launch:.3}ms 超 1.5ms 门禁——状态访存形态回归（串行扫 S 行）");
 }
 
+/// o23 · rms 系时延金丝雀：满负荷 decode 两真实形状——主 norm
+/// （rows=100 × hidden=2560）与 q/k norm（rows=1600 × hidden=128）。
+/// 病灶：row-per-thread 串行扫整行（rows=100 时全 GPU 仅 100 线程在跑，
+/// 3-4 warp 喂不饱 DRAM 延迟——372µs/拍）。门禁 60µs 逼出 block-per-row
+/// 共享内存归约（地板 ~6µs + launch 4.7µs）
+#[test]
+fn o23_rms_norm_latency_canary() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    for &(rows, hidden) in &[(100usize, 2560usize), (1600usize, 128usize)] {
+        let x = vec_bf16(0x7e11, rows * hidden, 1.0);
+        let w = vec_bf16(0x7f22, hidden, 1.0);
+        let z = vec_bf16(0x7033, rows * hidden, 1.0);
+        let wf: Vec<f32> = (0..hidden).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let (dx, dw, dz, dwf) = (
+            gpu.alloc_from_slice(&x),
+            gpu.alloc_from_slice(&w),
+            gpu.alloc_from_slice(&z),
+            gpu.alloc_from_slice(&wf),
+        );
+        let dout = gpu.alloc_bytes(rows * hidden * 2);
+        for _ in 0..3 {
+            t.rms_norm_zc.run(&dx, &dw, &dout, rows as u32, hidden as u32, 1e-6, &stream);
+            t.rms_norm_gated.run(&dx, &dz, &dwf, &dout, rows as u32, hidden as u32, 1e-6, &stream);
+        }
+        stream.sync();
+        let (e0, e1) = (gpu.event(), gpu.event());
+        e0.record_on(&stream);
+        for _ in 0..50 {
+            t.rms_norm_zc.run(&dx, &dw, &dout, rows as u32, hidden as u32, 1e-6, &stream);
+            t.rms_norm_gated.run(&dx, &dz, &dwf, &dout, rows as u32, hidden as u32, 1e-6, &stream);
+        }
+        e1.record_on(&stream);
+        stream.sync();
+        let per_launch = e1.elapsed_ms(&e0) / 100.0; // 两 kernel × 50 拍均摊
+        eprintln!("o23 rms rows={rows} hidden={hidden}：{:.1} µs/launch（均摊）", per_launch * 1000.0);
+        assert!(per_launch * 1000.0 < 60.0,
+            "rms({rows}×{hidden}) {per_launch:.1}µs 超 60µs 门禁——row-per-thread 串行扫行形态回归");
+    }
+}
+
 /// o21 · 行 argmax：全序归约确定——真值构造（等值取小下标、全负行、
 /// 首/末位置极值），非随机
 #[test]
 fn o21_argmax_rows_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -376,6 +436,7 @@ fn o21_argmax_rows_golden_bitwise() {
 /// （2⁻⁷ 相对 / 2⁻¹¹ 绝对）+ 单位阵真值锚（W=I 时恒等乘积位精确）
 #[test]
 fn g7_gemm_wt_tolerance() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
