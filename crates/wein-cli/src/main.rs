@@ -81,7 +81,19 @@ fn main() {
         // --graph：FULL_DECODE 图档（W2 §7）——纯 decode 步走桶图回放
         let use_qwen = engine_kind == "core" && exec_kind == "qwen";
         let use_graph = args.iter().any(|a| a == "--graph");
-        let graph_buckets: Vec<u32> = vec![1, 2, 4, 8, 16, 32];
+        // qwen 桶集盖满行容量（满负荷 c=100+ 纯 decode 步不回落 eager）；
+        // toy 沿用 {1..32}（L3 档 c=100 图档不进 battery，测试自定桶集）。
+        // WEIN_GRAPH_BUCKETS=1,2,4,… 可覆盖（批扩展曲线/battery 变体）
+        let graph_buckets: Vec<u32> = match std::env::var("WEIN_GRAPH_BUCKETS") {
+            Ok(s) => s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+            Err(_) => {
+                if use_qwen {
+                    vec![1, 2, 4, 8, 16, 32, 64, 100, 128]
+                } else {
+                    vec![1, 2, 4, 8, 16, 32]
+                }
+            }
+        };
         let (engine, tok): (EngineHandle, Arc<dyn Tokenizer>) = if use_qwen {
             let dir = PathBuf::from(&model);
             let ex = if use_graph {

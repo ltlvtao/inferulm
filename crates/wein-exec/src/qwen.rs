@@ -1038,6 +1038,10 @@ fn conv_row_bytes(cfg: &Qwen35Config) -> usize {
 }
 
 impl Executor for Qwen35Executor {
+    fn row_capacity(&self) -> usize {
+        self.row_capacity as usize
+    }
+
     fn admitted(&mut self, id: ReqId, prompt: &[u32]) {
         assert!(
             prompt.iter().all(|&t| t < self.cfg.vocab_size),

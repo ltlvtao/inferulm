@@ -654,6 +654,10 @@ impl ToyExecutor {
 }
 
 impl Executor for ToyExecutor {
+    fn row_capacity(&self) -> usize {
+        self.row_capacity as usize
+    }
+
     fn admitted(&mut self, id: ReqId, prompt: &[u32]) {
         assert!(
             prompt.iter().all(|&t| t < self.cfg.vocab),

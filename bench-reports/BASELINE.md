@@ -78,6 +78,7 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-29 | +graph | release | 169,691 | — | — | — | 1.13 / 2.18 | 0.027 | 1.64 | 0.037 | W2 图档首测（battery-20261029-013037，`--graph` FULL_DECODE 桶{1..32}回放）：**L3q+ ITL p50 28.79ms vs L3q 31.28ms（−8.0%）、tps 122.1 vs 115.4（+5.8%）、TTFT p50 72.29 vs 75.64ms、errors 0**；单步对照 qg3 图先测防热身漂移（§7）；混合步/prefill 仍 eager（sink 行吸收桶 padding）；其余层噪声带内 |
 | 2026-10-29 | +chat | release | 162,763 | — | — | — | 1.10 / 5.47 | 0.025 | 1.68 | 0.050 | W5 chat 模板（battery-20261029-091642）：**语义变更——bench 流量走 chat 端点吃到真模板**，prompt 4→11 token（占位 `user: bench\n` → `<\|im_start\|>…<think>\n`，实测 token 数）：L3q TTFT 72→112ms 是追平多算 7 token 的账（**非性能回归**；隔离复跑复现 + token 数对账归因），ITL 32.91ms / tps 100.2；同轮同语义 L3q+ 图档 ITL 31.94ms（**−3.0%**，方向与 §6 上行一致）；stop_token_ids 热路径零开销（total_tokens 两轮同 96——无提前 eos）；其余层噪声带内 |
 | 2026-10-29 | +fix | release | 163,838 | — | — | — | 1.21 / 4.12 | 0.032 | 1.66 | 0.046 | 递推偏差双修复复跑（battery-20261029-112815）：GQA 头映射 `qh%kvh`→`qh//group`（PTX kernel/CPU 参考/f64 镜像三处）+ conv 状态存值 `qkvc`→原始 `qkv`（exec 调用点/镜像两处）——**纯正确性修复零性能账**：L3q TTFT 117.79 / ITL 33.48 / tps 99.2、L3q+ ITL 31.24 / tps 104.2，与 W5 语义基线（091642）带内；外部对拍 wein≡vLLM 48 token × 5 prompt 全同（`bench-reports/vs-vllm-correct/`）；L0 六轮 143k–169k，SUMMARY 引用的首套冷启 142.9k 偏低（wall 0.12s 小样本），表中取六轮中位 |
+| 2026-10-29 | +full | release | 174,069 | — | — | — | 1.17 / 3.75 | 0.035 | 1.69 | 0.085 | **满负荷 L3q 首测**（battery-20261029-121058，c=100/n=500/mt=32 与 L0-L3 同 profile）：L3q 满负荷 TTFT 804.08 / ITL 141.61 / tps 574.1，L3q+ 图档满负荷 795.98 / **138.99 / 581.4**（桶 {1,2,4,8,16,32,64,100,128}）。配套 engine 准入重构（e5）：`Executor::row_capacity` 钳 max_running + 建行挪到调度准入（先回收后建行）——超容排队不炸批界，**副产 busy 档换手提速：L3 tps 49.5k→91.4k（+84%）、L2' 28.2k→45.7k（+62%）**，每请求指标逐位不变（ITL/TTFT/token 数同）、单波对照（n=c=100 新旧无差）⇒ 全部来自换手时延（Finished 交付提前一个步内位置）；轻载 L3q/L3q+ 带内；L2/L2m 289-313k 带内展宽（零延迟纯 CPU 档对机器态敏感）；批扩展曲线与图桶 padding 教训见 §7 |
 
 ## 7. kernel 侧微基准（设备端首测，随 exec/kernel 里程碑追加）
 
@@ -90,6 +91,8 @@ qps >= 100000（人工核对 SUMMARY）
 | 2026-10-28 | +exec | 同上 | exec 步时延 canary（批 4 纯 decode） | **中位 611 µs/步** | 一步 = 5 上传（alloc+H2D）+ 16 launch + GEMM×7 + sync + logits 回读；x7 金丝雀；对照 launch 4.69µs——exec 层优化账（W2：常驻上传缓冲/图捕获/切片回读） |
 | 2026-10-29 | +graph | 同上 | 图档步时延 canary（toy，批 50 步中位） | eager 680 µs → 图 528 µs（**1.29×**） | w3 金丝雀；toy 步 launch 债占比高（16 kernel/步），图收益 = 全 launch + 5 次分配/上传转常驻覆写 |
 | 2026-10-29 | +graph | 同上 | 图档步时延 canary（Qwen3.5-4B，单请求 decode 20 步中位） | eager 26.9 ms → 图 25.1 ms（**−6.7%**） | qg3 金丝雀，图先测（热身漂移偏向后测的 eager）；大模型步 GEMM 主导（8.4GB 权重读/token），图收益 = 32 层 launch 债（~160 kernel/步）+ 14 次分配/同步上传；端到端 L3q+ ITL −8.0%（§6） |
+| 2026-10-29 | +full | 同上 | 批扩展曲线（`qwen-sweep-20261029-121226`，n=c 同步起步纯 decode 稳态） | eager ITL 36.99 → 62.05 → 80.96 → 108.09 → 142.76 → 169.34 ms（c=4→128） | m×32 而步时仅 ×4.6（批摊销有效）；**m=100 带宽账 8.4GB/142.76ms ≈ 59GB/s**，vLLM 同卡 692GB/s——每步 ×12 的账不在显存带宽（权重只值 ~12ms），在每行 host 侧工作与 kernel 形状（cuBLASLt 按 m 选 algo、逐行上传/argmax），满负荷优化的路线图数据；tps 峰值 605（c=128 eager） |
+| 2026-10-29 | +full | 同上 | 图档收益 vs 批（同曲线） | −4.4% / **−7.1% / −7.5%** / −2.7% / −2.3% / −0.1%（c=4→128） | 收益峰在批 16-32（launch 债占比最高处），大 m 收窄（W2 结论的满负荷延伸）；**桶 padding 教训**：桶 128 对 m=100 多算 28 行 → ITL +16%（反劣于 eager），桶粒度须贴工作点（默认桶集 {1,2,4,8,16,32,64,100,128}，`WEIN_GRAPH_BUCKETS` 可覆盖）；c=128 图档 tps 538.6 < eager 605.2——sink 让位 1 行 = 少 1 并发槽 |
 
 launch 4.69µs 是 L3（exec 层）落地时的对照基线：纯 Rust→PTX 路线在 WSL 上的
 单 kernel 提交成本在此，exec 步的图捕获/回放收益按此尺度衡量。

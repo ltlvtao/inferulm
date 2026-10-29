@@ -149,6 +149,13 @@ pub trait Executor: Send {
     /// 抢占通知：调度器会以 recompute 语义重放（forwarded 清零）——
     /// 执行器须把自己的前向游标一并归零，否则重放位置错位（x6 验收钉死）
     fn preempted(&mut self, _id: ReqId) {}
+    /// 行容量（并发请求上限）：执行器每请求占一行（块表/递推/conv 状态池），
+    /// 超额准入会在执行器内部 assert 崩掉引擎任务。engine 把它钳进
+    /// max_running——超容请求在调度器排队等行释放（e5 钉死）。默认无界
+    /// （脚本件无行概念）
+    fn row_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 /// 确定性执行器：每请求独立循环取 pieces（与 MockEngine 相同的可预测输出，
@@ -211,7 +218,11 @@ impl EngineCore {
         mut exec: Box<dyn Executor>,
     ) {
         // 容量模型二选一：BlockPool 水位（memory）或聚合 token（默认）。
-        // 调度策略不变——准入反压与抢占触发全部经 CapacityModel 钩子
+        // 调度策略不变——准入反压与抢占触发全部经 CapacityModel 钩子。
+        // 执行器行容量钳进 max_running：超额准入会在 exec 内部 assert 崩掉
+        // 引擎任务（I1 满负荷批界）——超容请求排队等行（e5）
+        let mut cfg = cfg;
+        cfg.sched.max_running = cfg.sched.max_running.min(exec.row_capacity());
         let mut sched = match cfg.memory {
             Some(mem_cfg) => Scheduler::with_capacity(
                 cfg.sched,
@@ -222,19 +233,26 @@ impl EngineCore {
         let mut senders: HashMap<RequestId, UnboundedSender<EngineEvent>> = HashMap::new();
         // 停止词表（chat eos 等）：随请求提交进 来，请求离场即清（W5）
         let mut stops: HashMap<RequestId, Vec<u32>> = HashMap::new();
+        // prompt 暂存：exec 建行发生在调度**准入**时（SchedEvent::Admitted），
+        // 不是提交时——超容请求在 waiting 排队不占执行器行（e5）。首次准入
+        // 即消费；抢占重准入不再触发（exec 保留行/状态走 recompute）
+        let mut prompts: HashMap<RequestId, Vec<u32>> = HashMap::new();
 
         while let Some(cmd) = cmd_rx.recv().await {
-            Self::handle(&mut sched, &mut senders, &mut stops, &stats, &mut exec, cmd);
+            Self::handle(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec, cmd);
             // 批量吸收同刻到达的命令再统一推进：一次调度决策管一批提交
-            Self::drain(&mut cmd_rx, &mut sched, &mut senders, &mut stops, &stats, &mut exec);
+            Self::drain(&mut cmd_rx, &mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
 
             // 推进直到空闲；空闲即停车等新命令（不忙转）。
             // 步是原子的：本步 token 全部发出（并记入内存层）→ 完成事件 → 回收；
             // 步间命令（取消/新提交）在下一步首 drain 时生效——
             // 因此取消后客户端至多再收到在飞那一步的 token（e2 验收钉死的边界）
             while !sched.is_idle() {
-                Self::drain(&mut cmd_rx, &mut sched, &mut senders, &mut stops, &stats, &mut exec);
+                Self::drain(&mut cmd_rx, &mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 let plan = sched.step();
+                // 事件先于 exec.step：本步新准入者先建行（exec.admitted）
+                // 再进前向——否则 step 查不到行会静默空转
+                Self::pump(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 stats.steps.fetch_add(1, Ordering::Relaxed);
                 if !cfg.step_delay.is_zero() {
                     sleep(cfg.step_delay).await;
@@ -272,7 +290,7 @@ impl EngineCore {
                 };
                 for id in forced {
                     if !sched.preempt(id) {
-                        Self::abort(&mut sched, &mut senders, &mut stops, &stats, id);
+                        Self::abort(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, id);
                     }
                 }
                 // 内存层记账快照（每步末刷新；供断言与观测）
@@ -281,7 +299,7 @@ impl EngineCore {
                         *stats.mem.lock().expect("mem stats 锁中毒") = pc.mem.stats();
                     }
                 }
-                Self::pump(&mut sched, &mut senders, &mut stops, &stats, &mut exec);
+                Self::pump(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 // DeferredRelease：步末回收执行器内部状态。保留集合 = 仍有
                 // 事件流者——含被抢占的等待者（它们会带着已生成 token 回来，
                 // 计数状态不得清；im1 抓到：按本步在批清理会把重算请求的
@@ -302,19 +320,21 @@ impl EngineCore {
         sched: &mut Scheduler,
         senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
         stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
         stats: &EngineStats,
         exec: &mut Box<dyn Executor>,
     ) {
         while let Ok(cmd) = cmd_rx.try_recv() {
-            Self::handle(sched, senders, stops, stats, exec, cmd);
+            Self::handle(sched, senders, stops, prompts, stats, exec, cmd);
         }
-        Self::pump(sched, senders, stops, stats, exec);
+        Self::pump(sched, senders, stops, prompts, stats, exec);
     }
 
     fn handle(
         sched: &mut Scheduler,
         senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
         stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
         stats: &EngineStats,
         exec: &mut Box<dyn Executor>,
         cmd: EngineCommand,
@@ -332,12 +352,12 @@ impl EngineCore {
                 if let Some(tx) = senders.get(&id) {
                     let _ = tx.send(EngineEvent::Accepted);
                 }
-                // prompt 首次可见：执行器建立序列/KV 记账（空 prompt 的 BOS
-                // 语义由执行器决定——调度器只看长度 0）
-                exec.admitted(id, &prompt_token_ids);
-                sched.submit(ReqInput { id, prompt_token_ids, max_tokens });
+                // prompt 暂存：建行推迟到调度准入（pump 的 Admitted 臂）——
+                // 空 prompt 的 BOS 语义由执行器在 admitted 决定
+                sched.submit(ReqInput { id, prompt_token_ids: prompt_token_ids.clone(), max_tokens });
+                prompts.insert(id, prompt_token_ids);
             }
-            EngineCommand::Cancel(id) => Self::abort(sched, senders, stops, stats, id),
+            EngineCommand::Cancel(id) => Self::abort(sched, senders, stops, prompts, stats, id),
         }
     }
 
@@ -348,10 +368,12 @@ impl EngineCore {
         sched: &mut Scheduler,
         senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
         stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
         stats: &EngineStats,
         id: RequestId,
     ) {
         stops.remove(&id);
+        prompts.remove(&id);
         if !sched.cancel(id) {
             return;
         }
@@ -367,12 +389,19 @@ impl EngineCore {
         sched: &mut Scheduler,
         senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
         stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
         stats: &EngineStats,
         exec: &mut Box<dyn Executor>,
     ) {
+        let mut admitted_ids: Vec<ReqId> = Vec::new();
         for ev in sched.poll_events() {
             match ev {
-                SchedEvent::Admitted(_) => {}
+                // 建行时机：调度准入处。但**先回收后建行**——同轮回放的
+                // Finished/Aborted 已从 senders 除名，滞留一步的完成行
+                // （DeferredRelease）先归还行池再为准入者分配，峰值行数
+                // 不越过 row_capacity（e5）。首见消费暂存 prompt；抢占
+                // 重准入查不到 → 不重复建行（exec 保留状态走 recompute）
+                SchedEvent::Admitted(id) => admitted_ids.push(id),
                 SchedEvent::Preempted(id) => {
                     stats.preempted.fetch_add(1, Ordering::Relaxed);
                     // 重算语义的另一半：调度器清自己的 forwarded，执行器
@@ -382,6 +411,7 @@ impl EngineCore {
                 SchedEvent::Cancelled(id) => {
                     senders.remove(&id);
                     stops.remove(&id);
+                    prompts.remove(&id);
                 }
                 SchedEvent::Finished { id, reason } => {
                     stats.finished.fetch_add(1, Ordering::Relaxed);
@@ -389,6 +419,15 @@ impl EngineCore {
                     if let Some(tx) = senders.remove(&id) {
                         let _ = tx.send(EngineEvent::Finished(map_reason(reason)));
                     }
+                }
+            }
+        }
+        if !admitted_ids.is_empty() {
+            let keep: Vec<ReqId> = senders.keys().copied().collect();
+            exec.retain(&keep);
+            for id in admitted_ids {
+                if let Some(p) = prompts.remove(&id) {
+                    exec.admitted(id, &p);
                 }
             }
         }

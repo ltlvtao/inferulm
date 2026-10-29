@@ -49,10 +49,11 @@ run_suite () { # $1=tag；$2.. 传给 wein-cli 的延迟参数（模型 id = 就
   trap - EXIT
 }
 
-# 真模型竖切（L3q / L3q+图档）：轻载 sanity 账（c=4/n=8/12 tok）——exec 即
-# 节拍器，TTFT 含真权重追平、ITL 是 ~34ms/步的账。满负荷 profile（c=100/
-# n=500）会撞 exec 的 MAX_ROWS/T_MAX 批界，不适用于本层。模型不在场则跳过
-# （与 q 系列同门）。$1=tag，$2..=wein-cli 附加旗标（图档传 --graph）
+# 真模型竖切（L3q 轻载 sanity + 满负荷容量账 / 同档 +图）：轻载（c=4/n=8/
+# 12 tok）是回归敏感的 sanity——exec 即节拍器，TTFT 含真权重追平、ITL 是
+# ~34ms/步的账；满负荷（c=100/n=500/32 tok，与 L0-L3 同 profile）是容量账
+# ——行容量已接入准入（e5：超容排队不炸批界），图桶盖到行容量。模型不在场
+# 则跳过（与 q 系列同门）。$1=tag，$2..=wein-cli 附加旗标（图档传 --graph）
 run_qwen_suite () {
   local tag=$1; shift
   local dir=${WEIN_MODEL_DIR:-$HOME/.cache/wein/Qwen3.5-4B}
@@ -69,6 +70,11 @@ run_qwen_suite () {
   echo "-- $tag · L3q streaming (轻载 c=4 n=8 max_tokens=12) --"
   "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --model "$dir" --concurrency 4 --num 8 \
       --max-tokens 12 --repeat 1 --warmup --json "$OUT/$tag-l1-stream.json" \
+      | grep -E '"(ttft_p50_ms|ttft_p99_ms|itl_p50_ms|itl_p99_ms|aggregate_tps|errors)"'
+
+  echo "-- $tag · L3q full (满负荷 c=100 n=500 max_tokens=32) --"
+  "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --model "$dir" --concurrency 100 --num 500 \
+      --max-tokens 32 --repeat 1 --warmup --json "$OUT/$tag-l1-full.json" \
       | grep -E '"(ttft_p50_ms|ttft_p99_ms|itl_p50_ms|itl_p99_ms|aggregate_tps|errors)"'
 
   kill "$pid" 2>/dev/null || true
@@ -109,10 +115,14 @@ r = load("core-exec-zero-l1-stream.json")
 if r: rows.append(("L3 exec 层开销(core+真执行器 toy, 真 GPU 步)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_mean={r.get('itl_mean_ms', 0):.2f}ms tps={r['aggregate_tps']:.0f}"))
 r = load("core-qwen-l1-stream.json")
 if r: rows.append(("L3q 真模型竖切(Qwen3.5-4B 真权重, 轻载 c=4)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_p50={r['itl_p50_ms']:.2f}ms tps={r['aggregate_tps']:.1f}"))
+r = load("core-qwen-l1-full.json")
+if r: rows.append(("L3q 满负荷(同 L0-L3 profile c=100)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_p50={r['itl_p50_ms']:.2f}ms tps={r['aggregate_tps']:.1f}"))
 r = load("core-qwen-graph-l1-stream.json")
 if r: rows.append(("L3q+ 图档(FULL_DECODE 桶图回放, 轻载 c=4)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_p50={r['itl_p50_ms']:.2f}ms tps={r['aggregate_tps']:.1f}"))
+r = load("core-qwen-graph-l1-full.json")
+if r: rows.append(("L3q+ 图档满负荷(桶{1,2,4,8,16,32,64,100,128}, c=100)", f"ttft_p50={r['ttft_p50_ms']:.2f}ms ttft_p99={r['ttft_p99_ms']:.2f}ms itl_p50={r['itl_p50_ms']:.2f}ms tps={r['aggregate_tps']:.1f}"))
 print(f"# battery {stamp}\n")
-print("| 层 | 指标（中位数; L0-L3: c=100, n=500, max_tokens=32; L3q: c=4, n=8, max_tokens=12） |")
+print("| 层 | 指标（中位数; L0-L3/满负荷: c=100, n=500, max_tokens=32; 轻载 L3q: c=4, n=8, max_tokens=12） |")
 print("|---|---|")
 for name, m in rows: print(f"| {name} | {m} |")
 PYEOF
