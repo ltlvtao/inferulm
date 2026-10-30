@@ -68,6 +68,15 @@ pub fn expf(x: f32) -> f32 {
     const A0: f32 = 1.0;
     let t = x * LOG2E;
     let kf = t.floor();
+    // 域钳（与 kernels::expf 镜像同式）：指数域直加只在 kf ∈ [-126,127]
+    // 成立，域外回绕出垃圾且 CPU/GPU 的垃圾不一致（NaN payload 异源）——
+    // kf < -126 落 0.0、kf > 127 落 +inf（vLLM/torch 同口径）
+    if kf < -126.0 {
+        return 0.0;
+    }
+    if kf > 127.0 {
+        return f32::INFINITY;
+    }
     let f = t - kf; // [0,1)，Sterbenz 精确
     let mut p = A7;
     p = p * f + A6;
@@ -491,8 +500,10 @@ pub fn conv_state_roll(
 }
 
 /// gated deltanet 递推参考（与 kernel 同步序）：每 (row, v_head) 持
-/// S[v][0..k_dim] f32；token 循环内 decay→kvm→delta→S 更新→输出，
-/// 全部 j 升序顺序累加；l2norm 后 q 再除 √k_dim（除法非倒数乘）
+/// S[v][0..k_dim] f32；token 循环内 decay→kvm→delta→S 更新→输出；
+/// l2norm 后 q 再除 √k_dim（除法非倒数乘）。kvm/o 累加序：kd=vd=128
+/// 走 E2 两级折叠（切片 4 项 + 跨切片 32 项——镜像 kernel 的 warp 归约
+/// 树），其余 j 严格升序顺序累加
 #[allow(clippy::too_many_arguments)]
 pub fn deltanet(
     q: &[u16],        // [tokens, k_heads, k_dim]
@@ -533,6 +544,9 @@ pub fn deltanet(
                 .iter()
                 .map(|&b| bf16_to_f32(b))
                 .collect();
+            // E2 镜像（kd=vd=128）：kernel 的 kvm/o 是切片+两级折叠的
+            // warp 归约树——同树镜像保位对齐；其余形状 j 严格升序
+            let e2 = k_dim == 128 && v_dim == 128;
             for i in 0..cnt {
                 let g = st + i;
                 let decay = expf(0.0 - big_a * softplus(bf16_to_f32(a[g * v_heads + h]) + dtb));
@@ -554,9 +568,21 @@ pub fn deltanet(
                     for j in 0..k_dim {
                         srow[j] *= decay;
                     }
+                    // E2 归约树镜像：切片内 j 升序 4 项（lane 部分和）→
+                    // 跨切片 u 升序 32 项（块内折叠）——kernel 同树同序
                     let mut kvm = 0.0f32;
-                    for j in 0..k_dim {
-                        kvm = srow[j] * (bf16_to_f32(k[qb + j]) * invk) + kvm;
+                    if e2 {
+                        for sl in 0..32 {
+                            let mut p = 0.0f32;
+                            for i in 0..4 {
+                                p = srow[sl * 4 + i] * (bf16_to_f32(k[qb + sl * 4 + i]) * invk) + p;
+                            }
+                            kvm = p + kvm;
+                        }
+                    } else {
+                        for j in 0..k_dim {
+                            kvm = srow[j] * (bf16_to_f32(k[qb + j]) * invk) + kvm;
+                        }
                     }
                     let vin = bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
                     let delta = (vin - kvm) * beta;
@@ -568,8 +594,18 @@ pub fn deltanet(
                         ));
                     }
                     let mut o = 0.0f32;
-                    for j in 0..k_dim {
-                        o = srow[j] * ((bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                    if e2 {
+                        for sl in 0..32 {
+                            let mut p = 0.0f32;
+                            for i in 0..4 {
+                                p = srow[sl * 4 + i] * ((bf16_to_f32(q[qb + sl * 4 + i]) * invq) / kd_sqrt) + p;
+                            }
+                            o = p + o;
+                        }
+                    } else {
+                        for j in 0..k_dim {
+                            o = srow[j] * ((bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                        }
                     }
                     out[(g * v_heads + h) * v_dim + vv] = f32_to_bf16(o);
                 }

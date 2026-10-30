@@ -130,7 +130,11 @@ impl OpTable<'_> {
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
         let conv_state_roll = ConvStateRollCuda { gpu, f: m.func("conv_state_roll") };
-        let deltanet = DeltanetCuda { gpu, f: m.func("deltanet") };
+        let deltanet = DeltanetCuda {
+            gpu,
+            f: m.func("deltanet"),
+            scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * 1024 * 4),
+        };
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
             f: m.func("rms_norm_gated"),
@@ -230,6 +234,9 @@ pub trait RmsNormZcOp {
 
 /// 块归约 scratch 行容量：满批 q-norm 128×16=2048 行，×4 余量
 const REDUCE_ROWS_CAP: usize = 8192;
+
+/// E2 warp 归约块容量：满批 rows(128)×v_heads(32)，每块 kvm/o 两区 1024 f32
+const DELTA_BLOCK_CAP: usize = 4096;
 
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
@@ -424,8 +431,9 @@ impl ConvStateRollOp for ConvStateRollCuda<'_> {
     }
 }
 
-/// gated deltanet 递推：grid = rows×v_heads、block = v_dim（线程持 S[v][0..k_dim]）。
-/// 状态池属 executor（[rows, v_heads, v_dim, k_dim] f32，行号经 row_id 间接）
+/// gated deltanet 递推：grid = rows×v_heads；block = v_dim（kd=vd=128 时
+/// 128 线程走 E2 warp 重映射）。状态池属 executor（[rows, v_heads, v_dim,
+/// k_dim] bf16，行号经 row_id 间接）
 pub trait DeltanetOp {
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -456,6 +464,9 @@ pub trait DeltanetOp {
 pub struct DeltanetCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// E2 warp 归约 scratch：[DELTA_BLOCK_CAP, 1024] f32（kvm/o 两区），
+    /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
+    scratch: DevBuf<'a>,
 }
 
 impl DeltanetOp for DeltanetCuda<'_> {
@@ -482,10 +493,20 @@ impl DeltanetOp for DeltanetCuda<'_> {
         l2_eps: f32,
         stream: &Stream,
     ) {
-        // 块几何自带：一 block = (行, v 头)，block 宽 = v_dim
+        // 块几何自带：kd=vd=128 走 E2（一块=(行, v 头)×128 线程=4 warp，
+        // warp 顺序吃 v 行、lane 持 j 切片 u64——warp 指令 256B 全合并；
+        // kvm/o 归约走 scratch 两级折叠）；其余一块 = (行, v 头)、
+        // block 宽 = v_dim（kernel 侧同条件分支）
+        let e2 = k_dim == 128 && v_dim == 128;
         let args = crate::kernel_args![*q, *k, *v, *a, *b, *a_log, *dt_bias, *state, *core_out,
-            *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps];
-        self.gpu.launch(&self.f, n_rows * v_heads, v_dim, &args, stream);
+            *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps,
+            self.scratch];
+        if e2 {
+            assert!(n_rows as usize * v_heads as usize <= DELTA_BLOCK_CAP,
+                "deltanet 块数 {} 超 scratch 容量 {DELTA_BLOCK_CAP}", n_rows * v_heads);
+        }
+        let (grid, bdim) = (n_rows * v_heads, if e2 { 128 } else { v_dim });
+        self.gpu.launch(&self.f, grid, bdim, &args, stream);
     }
     fn name(&self) -> &'static str {
         "deltanet/cuda"

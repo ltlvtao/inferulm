@@ -254,6 +254,7 @@ fn o20_deltanet_golden_bitwise() {
     // kd=8 走通用 u64 车道路径；kd=128 走行驻留快路径（local depot/寄存器）
     o20_case(2, 4, 8, 8);
     o20_case(2, 4, 128, 8);
+    o20_case(4, 8, 128, 128); // E2 路径：kd=vd=128（块=(行,v 头)×4 warp，kvm/o 两级折叠）
 }
 
 fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
@@ -320,8 +321,8 @@ fn o25_deltanet_bf16_state_drift_budget() {
     let eps = 1e-6f32;
     let kd_sqrt = (k_dim as f32).sqrt();
 
-    // f32 存态真值：与 reference::deltanet 逐句同构，仅缺"落池收 bf16"
-    // 那一跳（s 保持 f32 不收）——即本刀前的递推语义
+    // f32 存态真值：与 reference::deltanet 逐句同构（含 E2 两级折叠归约
+    // 树），仅缺"落池收 bf16"那一跳（s 保持 f32 不收）——即本刀前的递推语义
     let mut s: Vec<f32> = vec![0.0; v_heads * v_dim * k_dim];
     let mut out_f32 = vec![0u16; tokens * v_heads * v_dim];
     for h in 0..v_heads {
@@ -350,8 +351,12 @@ fn o25_deltanet_bf16_state_drift_budget() {
                     srow[j] *= decay;
                 }
                 let mut kvm = 0.0f32;
-                for j in 0..k_dim {
-                    kvm = srow[j] * (reference::bf16_to_f32(k[qb + j]) * invk) + kvm;
+                for sl in 0..k_dim / 4 {
+                    let mut p = 0.0f32;
+                    for i in 0..4 {
+                        p = srow[sl * 4 + i] * (reference::bf16_to_f32(k[qb + sl * 4 + i]) * invk) + p;
+                    }
+                    kvm = p + kvm;
                 }
                 let vin = reference::bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
                 let delta = (vin - kvm) * beta;
@@ -359,8 +364,12 @@ fn o25_deltanet_bf16_state_drift_budget() {
                     srow[j] = (reference::bf16_to_f32(k[qb + j]) * invk) * delta + srow[j];
                 }
                 let mut o = 0.0f32;
-                for j in 0..k_dim {
-                    o = srow[j] * ((reference::bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                for sl in 0..k_dim / 4 {
+                    let mut p = 0.0f32;
+                    for i in 0..4 {
+                        p = srow[sl * 4 + i] * ((reference::bf16_to_f32(q[qb + sl * 4 + i]) * invq) / kd_sqrt) + p;
+                    }
+                    o = p + o;
                 }
                 out_f32[(g * v_heads + h) * v_dim + vv] = reference::f32_to_bf16(o);
             }
@@ -385,7 +394,7 @@ fn o25_deltanet_bf16_state_drift_budget() {
             max_y = max_y.max(y.abs() as f64);
         }
         ((sse / sy).sqrt(), max_d / max_y)
-    };
+    }
     let (rel2_o, maxn_o) = norm_err(
         out_bf.iter().zip(out_f32.iter())
             .map(|(&b, &f)| (reference::bf16_to_f32(b), reference::bf16_to_f32(f))),
@@ -409,9 +418,10 @@ fn o25_deltanet_bf16_state_drift_budget() {
 }
 
 /// o22 · deltanet 时延金丝雀：满负荷 decode 形状（m=100 行 × 32 v 头 ×
-/// kd=vd=128，每行 1 token）单 launch 事件计时。状态池 bf16 + kd=128 行驻
-/// 寄存器后 105MB/层（2 趟 210MB，地板 ~0.26ms，实测 0.47——占用率相抵
-/// 的现实值）。门禁 0.8ms——防"每线程串行扫 S 行"形态回归
+/// kd=vd=128，每行 1 token）单 launch 事件计时。E2 形状（一块=(行,v 头)
+/// ×4 warp、lane 持 j 切片 u64——warp 指令 256B 全合并）后预期 ~0.26-0.31ms
+/// （状态流 205MB @ ~700-850GB/s）；门禁 0.36ms——防散射形态回归（带宽
+/// 探针实证：u64 跨步散射真 DRAM 仅 ~280-500GB/s，全合并 ~880）
 #[test]
 fn o22_deltanet_latency_canary() {
     let _g = guard();
@@ -464,7 +474,7 @@ fn o22_deltanet_latency_canary() {
     stream.sync();
     let per_launch = e1.elapsed_ms(&e0) / 20.0;
     eprintln!("o22 deltanet m=100×32×128²：{per_launch:.3} ms/launch（20 拍均值）");
-    assert!(per_launch < 0.8, "deltanet {per_launch:.3}ms 超 0.8ms 门禁——状态访存形态回归（串行扫 S 行）");
+    assert!(per_launch < 0.36, "deltanet {per_launch:.3}ms 超 0.36ms 门禁——状态访存形态回归（u64 散射跨步）");
 }
 
 /// o23 · rms 系时延金丝雀：满负荷 decode 两真实形状——主 norm
