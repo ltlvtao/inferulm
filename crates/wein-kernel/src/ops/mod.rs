@@ -101,7 +101,11 @@ impl OpTable<'_> {
         let silu = SiluCuda { gpu, f: m.func("silu") };
         let w8a8_quant = QuantCuda { gpu, f: m.func("w8a8_quant") };
         let kv_scatter = KvScatterCuda { gpu, f: m.func("kv_scatter") };
-        let paged_attn = PagedAttnCuda { gpu, f: m.func("paged_attn") };
+        let paged_attn = PagedAttnCuda {
+            gpu,
+            f: m.func("paged_attn"),
+            scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * 258 * 4),
+        };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
         let mul = MulCuda { gpu, f: m.func("mul") };
@@ -725,9 +729,9 @@ impl KvScatterOp for KvScatterCuda<'_> {
     }
 }
 
-/// varlen paged attention（correctness-first：单线程两遍扫 KV，W2 再 flash 分块）。
-/// 每 (token, q_head) 一线程：pos 位置的 query 因果只看 0..=pos；
-/// GQA：kv 头 = qh % kv_heads
+/// varlen paged attention：一 block 一 (token, q_head)（block=head_dim
+/// 线程四相位协作，逐元素累加序与 reference 全同——o12 位对齐零漂移）。
+/// pos 位置的 query 因果只看 0..=pos；GQA：kv 头 = qh // group
 pub trait PagedAttnOp {
     /// q: [tokens, q_heads, head_dim] bf16；k/v_cache: paged 池；out 同 q。
     /// q_scale 为输入（host 算 1/sqrt(head_dim)）——kernel 不做 sqrt
@@ -756,7 +760,13 @@ pub trait PagedAttnOp {
 pub struct PagedAttnCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// 块归约 scratch：[ATTN_BLOCK_CAP, 258] f32（分值/p + 分母槽），
+    /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
+    scratch: DevBuf<'a>,
 }
+
+/// attn 块数容量上限：T_MAX(512) × q_heads(32)——超容显式 assert
+const ATTN_BLOCK_CAP: usize = 16384;
 
 impl PagedAttnOp for PagedAttnCuda<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -779,9 +789,12 @@ impl PagedAttnOp for PagedAttnCuda<'_> {
         stream: &Stream,
     ) {
         let n = tokens * q_heads;
+        assert!(n as usize <= ATTN_BLOCK_CAP,
+            "paged_attn 块数 {n} 超 scratch 容量 {ATTN_BLOCK_CAP}");
         let args = crate::kernel_args![*q, *k_cache, *v_cache, *block_table, *seq_ids, *positions,
-            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens];
-        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, self.scratch];
+        // 一 block 一 (t,qh)、block=head_dim 线程（四相位块协作——kernel 同构）
+        self.gpu.launch(&self.f, n, head_dim, &args, stream);
     }
     fn name(&self) -> &'static str {
         "paged_attn/cuda"

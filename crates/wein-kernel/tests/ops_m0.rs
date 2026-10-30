@@ -42,6 +42,15 @@ fn gpu() -> Option<Gpu> {
     }
 }
 
+/// GPU 串行锁（ops_i1/graphs 同款）：cargo test 并行线程的 kernel 会互相
+/// 闯入事件计时窗——时延金丝雀（o24）对并发负载敏感，全文件持锁
+fn guard() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 fn profile() -> HardwareProfile {
     HardwareProfile::with_device(Device::Cuda).with_arch("sm_89")
 }
@@ -61,6 +70,7 @@ fn assert_bits(label: &str, got: &[u16], expect: &[u16]) {
 /// o7 · 注册表长全：六槽位齐、名字可审（档位标识入日志）
 #[test]
 fn o7_op_table_all_m0_slots() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let t = table(&gpu);
     assert_eq!(t.rms_norm.name(), "rms_norm/cuda-blocked");
@@ -78,6 +88,7 @@ fn o7_op_table_all_m0_slots() {
 /// o8 · rope 位对齐：half-split（Llama/Qwen），位置含空隙（表寻址真值）
 #[test]
 fn o8_rope_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -104,6 +115,7 @@ fn o8_rope_golden_bitwise() {
 /// o9 · silu 位对齐：自控 exp2 路径；n 含非 block 整数倍
 #[test]
 fn o9_silu_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -120,6 +132,7 @@ fn o9_silu_golden_bitwise() {
 /// o10 · W8A8 动态量化位对齐：i8 + f32 scale 双输出；RNE 半偶自控实现
 #[test]
 fn o10_w8a8_quant_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -159,6 +172,7 @@ fn o10_w8a8_quant_golden_bitwise() {
 /// o11 · KV scatter 位对齐：页表寻址（pos 跨块边界 15/16/17），未触及槽位保留
 #[test]
 fn o11_kv_scatter_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -193,6 +207,7 @@ fn o11_kv_scatter_golden_bitwise() {
 /// o12 · varlen paged attention 位对齐：GQA、单点 softmax 恒等、跨块
 #[test]
 fn o12_paged_attn_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -246,6 +261,7 @@ fn o12_paged_attn_golden_bitwise() {
 /// o13 · golden 文件框架扩展：每算子一文件，缺失生成/回读对拍/漂移须重生成
 #[test]
 fn o13_golden_files_roundtrip_m0() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -375,6 +391,7 @@ fn o13_golden_files_roundtrip_m0() {
 /// mul（silu×up）——全逐元素无归约，位对齐模式（自控 kernel 侧）
 #[test]
 fn o14_embed_add_mul_golden_bitwise() {
+    let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
@@ -542,3 +559,62 @@ impl AttnGolden {
 }
 
 const NOTE: &str = "cuda/asc 共享 golden（02-architecture §4）；out 由 wein-kernel::reference 生成";
+
+/// o24 · paged_attn 时延金丝雀：满负荷 decode 形状（tokens=100 × qh 32 /
+/// kv 16 / hd 128——Qwen3.5-4B full-attn 层的工作形状；pos=23 对位
+/// qwen_step_profile m=100 attn 段工作点，pos=63 深序列）。门禁按
+/// 带宽地板（pos23：19.7MB≈25µs / pos63：52.4MB≈65µs）× 余量——
+/// 防"一线程一 (t,qh) 串行两遍扫 + 每 e 重走页表"形态回归
+#[test]
+fn o24_paged_attn_latency_canary() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    let (q_heads, kv_heads, head_dim, block_size, tokens) =
+        (32usize, 16usize, 128usize, 16usize, 100usize);
+    let he = kv_heads * head_dim;
+    let q_scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let qn = tokens * q_heads * head_dim;
+    let q = vec_bf16(0x7a11, qn, 2.0);
+    let dq = gpu.alloc_from_slice(&q);
+    let dout = gpu.alloc_bytes(qn * 2);
+    for &pos in &[23usize, 63usize] {
+        let bpr = (pos + 1).div_ceil(block_size);
+        let npages = tokens * bpr;
+        let slots = npages * block_size;
+        // 每行独立序列（s=t），页 id 顺排——页表间接寻址真实
+        let block_table: Vec<u32> = (0..npages as u32).collect();
+        let seq_ids: Vec<u32> = (0..tokens as u32).collect();
+        let positions: Vec<u32> = vec![pos as u32; tokens];
+        let slot_elems = slots * he;
+        let k_cache = vec_bf16(0x7b33, slot_elems, 1.0);
+        let v_cache = vec_bf16(0x7c55, slot_elems, 1.0);
+        let dkc = gpu.alloc_from_slice(&k_cache);
+        let dvc = gpu.alloc_from_slice(&v_cache);
+        let dbt = gpu.alloc_from_slice(&block_table);
+        let dsi = gpu.alloc_from_slice(&seq_ids);
+        let dpo = gpu.alloc_from_slice(&positions);
+        for _ in 0..3 {
+            t.paged_attn.run(&dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale,
+                bpr as u32, block_size as u32, q_heads as u32, kv_heads as u32,
+                head_dim as u32, tokens as u32, &stream);
+        }
+        stream.sync();
+        let (e0, e1) = (gpu.event(), gpu.event());
+        e0.record_on(&stream);
+        for _ in 0..20 {
+            t.paged_attn.run(&dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale,
+                bpr as u32, block_size as u32, q_heads as u32, kv_heads as u32,
+                head_dim as u32, tokens as u32, &stream);
+        }
+        e1.record_on(&stream);
+        stream.sync();
+        let per = e1.elapsed_ms(&e0) / 20.0;
+        eprintln!("o24 paged_attn tokens={tokens} pos={pos}：{per:.3} ms/launch（20 拍均值）");
+        let gate = if pos == 23 { 0.30 } else { 0.60 };
+        assert!(per < gate,
+            "paged_attn({tokens}×pos{pos}) {per:.3}ms 超 {gate}ms 门禁——单线程两遍扫形态回归");
+        drop((dkc, dvc, dbt, dsi, dpo));
+    }
+}

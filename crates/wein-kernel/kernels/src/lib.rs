@@ -405,11 +405,21 @@ pub unsafe extern "ptx-kernel" fn kv_scatter(
     *v_dst.add(slot * he + e) = *src_v.add(t * he + e);
 }
 
-/// varlen paged attention（correctness-first 两遍法）：一线程一 (t,qh)，
-/// 因果只看 0..=pos；GQA：kv 头 = qh // group（group=q_heads/kv_heads，
-/// HF repeat_kv 语义）。pass1 记分取 max →
-/// pass2 p_j=expf(s_j−m) 顺序累加分母 → 逐 e 加权 V（j 升序，与参考同序）。
-/// M0 正确性档：单线程扫全 KV，序列长上限 256（W2 flash 分块移除此限）
+/// varlen paged attention：一 block 一 (t,qh)（block=head_dim 线程）。
+/// 旧形态"一线程一 (t,qh)"在 m=100 decode 时全 GPU 仅 3200 线程、
+/// 每线程 256-f32 本地数组 + 每 e 重走页表——1.08ms/launch vs 25µs
+/// 带宽地板。四相位块协作，**逐元素累加序与 reference.rs 全同**
+/// （dot：j 属主单线程 d 升序；denom：线程 0 串行 j 升序
+/// `p_j + denom`；加权 V：每 e 独立 j 升序）——位对齐零漂移：
+/// · A 记分：线程 τ 跨步认领 j∈{τ,τ+bdim,…}，整条点积单线程
+///   d 升序（u64 载 4×bf16——hd%4 守卫 + 标量回退），sc 落 scratch
+/// · B 归一：各线程冗余扫 max（纯比较值同）→ j 属主原地 p=expf(sc−m)
+/// · C 分母：线程 0 串行 j 升序（操作数序逐字同参考）
+/// · D 加权 V：线程 τ=e 认领输出维，warp 内连续 e 合并访存，j 升序
+/// scratch 是 kernel 参数（op 预分配 [块,258] f32——stdarch nvptx
+/// 跨线程通道三断，argmax_rows/rms 同款 blockIdx 私有槽 + syncthreads）。
+/// 因果只看 0..=pos；GQA：kv 头 = qh // group（HF repeat_kv 语义）。
+/// M0 容量档：序列长上限 256（pos+1 > MAX_LEN 整块不写——exec 层责任）
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn paged_attn(
     q: *const u16,
@@ -426,15 +436,16 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
     kv_heads: u32,
     head_dim: u32,
     tokens: u32,
+    scratch: *mut f32,
 ) {
     const MAX_LEN: usize = 256;
     let hd = head_dim as usize;
     let qh_n = q_heads as usize;
-    let i = tid() as usize;
-    if i >= tokens as usize * qh_n {
+    let blk = _block_idx_x() as usize; // block = (t, qh)
+    if blk >= tokens as usize * qh_n {
         return;
     }
-    let (t, qh) = (udiv(i, qh_n), urem(i, qh_n));
+    let (t, qh) = (udiv(blk, qh_n), urem(blk, qh_n));
     let kh = udiv(qh, udiv(qh_n, kv_heads as usize)); // GQA：kv 头 = qh // group
     let s = *seq_ids.add(t) as usize;
     let pos = *positions.add(t) as usize;
@@ -443,48 +454,87 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
     }
     let (bpr, bs) = (bpr as usize, block_size as usize);
     let he = kv_heads as usize * hd;
-    let qbase = i * hd;
+    let qbase = blk * hd; // (t·qh_n + qh)·hd
+    let e = _thread_idx_x() as usize;
+    let bdim = _block_dim_x() as usize;
+    let sc = scratch.add(blk * (MAX_LEN + 2)); // 块私有槽：[0,pos]=分值/p，[256]=分母
 
-    // sc 经裸指针访问（数组下标检查在 PTX 里成 panic 桩 call——
-    // pos+1 ≤ MAX_LEN 已由上方 return 保证）
-    let mut sc = [0.0f32; MAX_LEN];
-    let scp = sc.as_mut_ptr();
-    let mut m = f32::NEG_INFINITY;
-    let mut j = 0usize;
+    // A 记分：j 属主整条点积（d 升序）→ sc[j]
+    let vec4 = hd % 4 == 0;
+    let mut j = e;
     while j <= pos {
         let kbase = slot_of(block_table, s, j, bpr, bs) * he + kh * hd;
         let mut dot = 0.0f32;
-        let mut d = 0usize;
-        while d < hd {
-            let a = bf16_to_f32(*q.add(qbase + d));
-            let b = bf16_to_f32(*k_cache.add(kbase + d));
-            dot = a * b + dot;
-            d += 1;
+        if vec4 {
+            let mut d = 0usize;
+            while d < hd {
+                let qs = bf16x4(*(q.add(qbase + d) as *const u64));
+                let ks = bf16x4(*(k_cache.add(kbase + d) as *const u64));
+                let mut l = 0usize;
+                while l < 4 {
+                    dot = bf16_to_f32(qs[l]) * bf16_to_f32(ks[l]) + dot;
+                    l += 1;
+                }
+                d += 4;
+            }
+        } else {
+            let mut d = 0usize;
+            while d < hd {
+                let a = bf16_to_f32(*q.add(qbase + d));
+                let b = bf16_to_f32(*k_cache.add(kbase + d));
+                dot = a * b + dot;
+                d += 1;
+            }
         }
-        *scp.add(j) = dot * q_scale;
-        let scj = *scp.add(j);
+        *sc.add(j) = dot * q_scale;
+        j += bdim;
+    }
+    _syncthreads();
+    // B 各线程冗余扫 max（纯比较——值与序无关位同）→ j 属主原地写 p
+    let mut m = f32::NEG_INFINITY;
+    let mut jj = 0usize;
+    while jj <= pos {
+        let scj = *sc.add(jj);
         m = if scj > m { scj } else { m };
-        j += 1;
+        jj += 1;
     }
-    let mut denom = 0.0f32;
-    let mut j = 0usize;
+    let mut j = e;
     while j <= pos {
-        *scp.add(j) = expf(*scp.add(j) - m);
-        denom = *scp.add(j) + denom;
-        j += 1;
+        *sc.add(j) = expf(*sc.add(j) - m);
+        j += bdim;
     }
-    let mut e = 0usize;
-    while e < hd {
+    _syncthreads();
+    // C 分母：线程 0 串行 j 升序——`p_j + denom` 操作数序逐字同参考
+    if e == 0 {
+        let mut denom = 0.0f32;
+        let mut jj = 0usize;
+        while jj <= pos {
+            denom = *sc.add(jj) + denom;
+            jj += 1;
+        }
+        *sc.add(MAX_LEN) = denom;
+    }
+    _syncthreads();
+    let denom = *sc.add(MAX_LEN);
+    // D 加权 V：线程 e 认领输出维（+bdim 步进覆盖 hd>bdim），j 升序
+    let mut ee = e;
+    while ee < hd {
         let mut acc = 0.0f32;
         let mut j = 0usize;
         while j <= pos {
             let vbase = slot_of(block_table, s, j, bpr, bs) * he + kh * hd;
-            acc = *scp.add(j) * bf16_to_f32(*v_cache.add(vbase + e)) + acc;
+            acc = *sc.add(j) * bf16_to_f32(*v_cache.add(vbase + ee)) + acc;
             j += 1;
         }
-        *out.add(qbase + e) = f32_to_bf16(acc / denom);
-        e += 1;
+        *out.add(qbase + ee) = f32_to_bf16(acc / denom);
+        ee += bdim;
     }
+}
+
+/// u64 拆 4×bf16（小端车道序——与标量 d 升序逐元素对应）
+#[inline(always)]
+unsafe fn bf16x4(v: u64) -> [u16; 4] {
+    [(v & 0xffff) as u16, ((v >> 16) & 0xffff) as u16, ((v >> 32) & 0xffff) as u16, (v >> 48) as u16]
 }
 
 // ───────────────────── I1 竖切算子（Qwen3.5 文本骨干） ─────────────────────
