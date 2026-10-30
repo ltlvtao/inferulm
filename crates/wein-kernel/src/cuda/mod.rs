@@ -11,7 +11,7 @@ use std::ffi::c_void;
 
 use driver::Driver;
 
-pub use cublaslt::BlasLt;
+pub use cublaslt::{BlasLt, GemmTuneRecord};
 
 // ── 捕获区间守卫（§4 图捕获安全规则：ZoS forbid_cuda_sync 的 Rust 化）──
 // 捕获中的隐式同步（sync / 回读 / 同步 H2D / 分配）会污染或炸掉图——

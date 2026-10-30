@@ -400,8 +400,25 @@ pub struct Qwen35Executor {
 }
 
 impl Qwen35Executor {
+    /// gemm autotune 的 m 集（= 图桶默认集；图档开启时被实际桶集替换）：
+    /// ramp/drain 的瞬态 m 不调优只钉 heuristic（零调优债），稳态 decode
+    /// 形状全在桶集内（battery 实测无门控的债：满负荷 tps 2827→1678）。
+    /// `WEIN_TUNE_M=1,2,…` 可覆盖（空串 = 全 heuristic 钉，A/B 用）
+    const TUNE_M: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 100, 128];
+
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let session = DeviceSession::open()?;
+        let tune = match std::env::var("WEIN_TUNE_M") {
+            Ok(s) => s
+                .split(',')
+                .filter_map(|t| t.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>(),
+            _ => Self::TUNE_M.to_vec(),
+        };
+        Self::open_with_tune(dir, &tune)
+    }
+
+    fn open_with_tune(dir: &Path, tune_m: &[u32]) -> Result<Self, String> {
+        let session = DeviceSession::open_tuned(tune_m)?;
         let gpu = session.gpu();
         let cfg = Qwen35Config::load(dir).map_err(|e| format!("config：{e}"))?;
         cfg.validate().map_err(|e| format!("config：{e}"))?;
@@ -572,7 +589,7 @@ impl Qwen35Executor {
         if buckets[0] < 1 || *buckets.last().unwrap() as usize > T_MAX {
             return Err(format!("桶集越界（须 ≥1 且最大 ≤ {T_MAX}）：{buckets:?}"));
         }
-        let mut ex = Self::open(dir)?;
+        let mut ex = Self::open_with_tune(dir, &buckets)?;
         ex.row_capacity = MAX_ROWS as u32 - 1; // sink 让位——须在首个 admit 前定死
         ex.build_graphs(buckets)?;
         Ok(ex)

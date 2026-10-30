@@ -14,7 +14,15 @@
 //! - g5 · gemm 槽位入表：name 可审 + 无设备画像仍 Err（o2 语义延续）
 //! - g6 · 吞吐 canary（2048³ bf16）：TFLOPS 下限门禁——防退化到
 //!        非 tensor core 路径（canary 不是基准：单跑下限，见噪声纪律）
+//! - g8 · 每形状 algo 钉（autotune，受控路径）：调用方声明稳态 m 集
+//!        （`open_tuned`），集内形状 heuristic 前 4 候选逐个实测（1 预热 +
+//!        事件对 3 计时）、滞回择优后缓存 + 进程级钉表共享；集外瞬态形状
+//!        （服务 ramp/drain 的 m 扫描）只钉 heuristic 免调优债——无门控
+//!        实测债：满负荷 tps 2827→1678、ttft ×4。滞回/钉表保跨会话选型
+//!        一致（qg2 零漂移合同的 gemm 侧前提）
 use wein_kernel::cuda::{BlasLt, Gpu};
+// g8 走 open_tuned（调优 m 集 = [100]）——autotune 是受控路径：调用方
+// 声明稳态 m 集，瞬态形状（服务 ramp/drain 扫描）只钉 heuristic 免调优债
 use wein_kernel::ops::{GemmOp, OpTable};
 use wein_kernel::reference;
 use wein_platform::{Device, HardwareProfile};
@@ -179,4 +187,70 @@ fn g6_gemm_throughput_canary() {
     let tflops = 2.0 * (m * n * k) as f64 * reps as f64 / secs / 1e12;
     eprintln!("gemm 2048³ bf16: {tflops:.1} TFLOPS（{reps} 次均值 {secs:.3}s）");
     assert!(tflops >= 10.0, "吞吐 {tflops:.1} TFLOPS 低于下限 10——疑似未走 tensor core 路径");
+}
+
+/// g8 · 每形状 algo 钉（autotune）：首 call 用**真实缓冲**逐候选实测择优
+/// （事件对在调用者流上——前序工作排队在外，段计量纯），胜者连同
+/// desc/layouts 缓存，其后纯 launch。验收四钉：
+/// ① 每形状恰调优一次（第二套缓冲命中缓存）；
+/// ② 择优不劣于 heuristic 首选（同测同缓冲的配对比较，非绝对门）；
+/// ③ 胜者结果仍在容差合同内（g2 准则——候选换人不换合同）；
+/// ④ 钉住的选型跨地址位确定（同 algo 同输入 → 位位相同，g4 的跨缓冲集版）
+#[test]
+fn g8_gemm_algo_pinned_autotune() {
+    let Some(gpu) = gpu() else { return };
+    let (stream, lt) = (gpu.stream(), BlasLt::open_tuned(&gpu, &[100]).expect("open"));
+    // m=100 满负荷 decode 的线性层投影稳态形状（n×k 与 exec 权重表同）
+    let shapes: [(u32, u32, u32); 6] = [
+        (100, 8192, 2560), // 线性层 qkv
+        (100, 4096, 2560), // z
+        (100, 32, 2560),   // a/b
+        (100, 2560, 4096), // out
+        (100, 9728, 2560), // MLP wg/wu
+        (100, 2560, 9728), // MLP wd
+    ];
+    for &(m, n, k) in &shapes {
+        let (a, w) = (mk_mat(0x21, m as usize, k as usize), mk_mat(0x43, n as usize, k as usize));
+        let expect = reference::gemm_wt(&a, &w, m as usize, n as usize, k as usize);
+        // 两套并存缓冲（地址必不同）各跑一次：首跑调优、次跑命中缓存
+        let mk_set = || {
+            (
+                gpu.alloc_from_slice(&a),
+                gpu.alloc_from_slice(&w),
+                gpu.alloc_bytes(m as usize * n as usize * 2),
+            )
+        };
+        let (s0, s1) = (mk_set(), mk_set());
+        let run = |set: &(_, _, _)| -> Vec<u16> {
+            lt.gemm_wt(&set.0, &set.1, &set.2, m, n, k, &stream);
+            stream.sync();
+            set.2.read_to_vec()
+        };
+        let (out0, out1) = (run(&s0), run(&s1));
+        assert_close(&format!("gemm_wt {m}x{n}x{k}（tuned）"), &out0, &expect);
+        assert_eq!(out0, out1, "钉住的 algo 跨地址须位确定");
+    }
+    // 调优审计面：每形状恰一条记录 + 择优不劣于首选（配对比较）
+    let report = lt.tune_report();
+    for &(m, n, k) in &shapes {
+        let recs: Vec<_> = report
+            .iter()
+            .filter(|r| r.m == m && r.n == n && r.k == k && r.wt)
+            .collect();
+        assert_eq!(recs.len(), 1, "形状 {m}x{n}x{k} 须恰调优一次（实得 {} 条）", recs.len());
+        let r = recs[0];
+        assert!(r.candidates >= 1, "至少一个可用候选");
+        assert!(r.best_ms.is_finite(), "胜者须有实测（capturing 回退才允许 0）");
+        assert!(
+            r.best_ms <= r.first_ms * 1.02 + 1e-6,
+            "择优 {:.4}ms 劣于首选 {:.4}ms（{m}x{n}x{k}）",
+            r.best_ms,
+            r.first_ms
+        );
+        let gain = (r.first_ms - r.best_ms) / r.first_ms * 100.0;
+        eprintln!(
+            "g8 tune {m}x{n}x{k}: 候选 {} 钉 #{chosen}（实测最优 #{argmin}）{best:.3}ms vs 首选 {first:.3}ms（{gain:+.1}%）",
+            r.candidates, chosen = r.chosen, argmin = r.argmin, best = r.best_ms, first = r.first_ms
+        );
+    }
 }

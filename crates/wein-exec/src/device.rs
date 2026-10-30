@@ -30,11 +30,16 @@ pub struct DeviceSession {
 
 impl DeviceSession {
     /// 探测→画像→resolve→流。任何一环失败都是启动期错误（Degrade 链
-    /// 原样透出，不带病运行）
+    /// 原样透出，不带病运行）。gemm 全 heuristic 钉（瞬态形状路径）
     pub fn open() -> Result<Self, String> {
+        Self::open_tuned(&[])
+    }
+
+    /// 同 `open`，另指定 gemm autotune 的 m 集（稳态 decode 桶集）
+    pub fn open_tuned(tune_m: &[u32]) -> Result<Self, String> {
         let gpu = Box::new(Gpu::probe().map_err(|e| format!("GPU 探测失败：{e}"))?);
         let profile = HardwareProfile::with_device(Device::Cuda).with_arch(gpu.arch());
-        let table = OpTable::resolve(&gpu, &profile).map_err(|ds| {
+        let table = OpTable::resolve_tuned(&gpu, &profile, tune_m).map_err(|ds| {
             let reasons: Vec<String> = ds.iter().map(|d| d.to_string()).collect();
             format!("算子表解析失败（{} 项降级）：{}", reasons.len(), reasons.join("; "))
         })?;

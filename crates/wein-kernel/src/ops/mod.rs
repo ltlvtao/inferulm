@@ -61,10 +61,21 @@ pub struct OpTable<'a> {
 
 impl OpTable<'_> {
     /// 按 HardwareProfile 解析。设备族不匹配 → Degrade 列表（启动期裁决）。
-    /// PTX 模块不显式卸载——算子表即进程生命周期，CUfunction 句柄常驻
+    /// PTX 模块不显式卸载——算子表即进程生命周期，CUfunction 句柄常驻。
+    /// gemm 全 heuristic 钉（瞬态形状路径；稳态形状调 `resolve_tuned`）
     pub fn resolve<'a>(
         gpu: &'a Gpu,
         profile: &HardwareProfile,
+    ) -> Result<OpTable<'a>, Vec<Degrade>> {
+        Self::resolve_tuned(gpu, profile, &[])
+    }
+
+    /// 同 `resolve`，另指定 gemm autotune 的 m 集（exec 稳态 decode 桶集
+    /// 走此口；见 `BlasLt::open_tuned`）
+    pub fn resolve_tuned<'a>(
+        gpu: &'a Gpu,
+        profile: &HardwareProfile,
+        tune_m: &[u32],
     ) -> Result<OpTable<'a>, Vec<Degrade>> {
         if profile.device != Device::Cuda {
             return Err(vec![Degrade {
@@ -128,7 +139,7 @@ impl OpTable<'_> {
         let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
         // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
         let gemm = GemmLt { lt: Box::new(
-            crate::cuda::BlasLt::open(gpu).map_err(|e| vec![Degrade {
+            crate::cuda::BlasLt::open_tuned(gpu, tune_m).map_err(|e| vec![Degrade {
                 key: "kernel.gemm",
                 reason: format!("libcublasLt 打不开：{e}"),
                 impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
