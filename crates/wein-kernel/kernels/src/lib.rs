@@ -17,9 +17,8 @@
 // sqrt/mul_add 等浮点方法在新 nightly 被移入 core_float_math（#137578）；
 // 正确舍入原语直接走 intrinsics——语义等同 sqrt.rn.f32（冒烟风险登记项）
 #![feature(core_intrinsics)]
-// f32x4 作 16B 向量容器（load/store 发射 ld/st.global.v4.f32；车道只做
-// 恒定索引抽取——算术仍在标量域，位对齐合同不动）
-#![feature(portable_simd)]
+// 状态池 bf16 后 4×bf16 走 u64 整载/整存（ld/st.global.b64——paged_attn
+// 同习语；portable_simd 的 f32x4 容器已随 f32 池退役）
 
 use core::arch::nvptx::{_block_dim_x, _block_idx_x, _syncthreads, _thread_idx_x};
 
@@ -747,17 +746,19 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
 /// gated deltanet（recurrent correctness-first）：一块 = (请求行, v 头)，
 /// 一线程一 v 维（线程私有 state 行 S[v][0..k_dim]，全局内存 L1 驻留）。
 /// 每 token：q/k 逐头 l2norm（f32，eps=1e-6）→ q 再除 √k_dim →
-/// 16B 对齐 f32×4：host 侧缓冲全经 cuMemAlloc（≥256B 对齐），kd%4==0 时
-/// 状态行内偏移按 16B 对齐——f32x4 是 LLVM 向量类型，整加载/存储由
-/// nvptx 后端发射 ld/st.global.v4.f32（错位向量访问是硬件错误，该路径
-/// 仅由对齐条件守卫）。车道恒定索引抽取——算子仍在标量域（同序同位）
+/// 存取走 u64 整载/整存（4×bf16，ld/st.global.b64——同 paged_attn 习语），
+/// 抽取/打包全在 u32 双车道域——deltanet 状态池 bf16 的存侧；
+/// kd%4==0 时行内偏移按 8B 对齐（cuMemAlloc ≥256B 底座）；kd=128 时
+/// 整行 S0 驻 32×u64 寄存器（见 token 循环内注释）
+///
+/// f32→bf16 舍入但**值留在 u32 高半**（位同 f32_to_bf16——低 16 位恒零）：
+/// 展宽回 f32 是 from_bits 零成本，打包省一次移位。deltanet bf16 池的
+/// 抽取/打包全在 u32 域（u64 域逐车道 shift/and 是 ALU 大头）
 #[inline(always)]
-unsafe fn ld4(p: *const f32) -> core::simd::f32x4 {
-    unsafe { *(p as *const core::simd::f32x4) }
-}
-#[inline(always)]
-unsafe fn st4(p: *mut f32, x: core::simd::f32x4) {
-    unsafe { *(p as *mut core::simd::f32x4) = x };
+fn f32_to_bf16_hi(x: f32) -> u32 {
+    let bits = x.to_bits();
+    let lsb = (bits >> 16) & 1;
+    (bits + 0x7fff + lsb) & 0xffff_0000
 }
 
 /// S·=exp(g)；kv_mem=ΣS·k_n；delta=(v−kv_mem)·β；S+=k_n⊗delta；
@@ -765,10 +766,13 @@ unsafe fn st4(p: *mut f32, x: core::simd::f32x4) {
 /// 累加 j 升序；core out 收 bf16（norm/gate 在 rms_norm_gated 另做）。
 /// 门控标量：β=sigmoid(b)，g=−exp(A_log)·softplus(a+dt_bias)
 ///
-/// 访存形态：每 token 对状态行 3 趟（kvm 读、更新读、写；v4 向量）——
-/// 原始 4 趟 6 次访问的 decay 写/读往返改为更新趟同式重算 S1=S0·decay
-/// （同表达式位不变），kvm/o 累加与逐元素运算序逐操作数保持（位对齐
-/// 合同不动：o16/o20/o19 与 wein≡vLLM oracle 原样有效）
+/// 状态池 bf16：寄存器 f32 累加、**落池收 bf16**——o 与下一 token 递推
+/// 全吃收过的同一存储值（reference 同式镜像，kernel↔reference 位对齐
+/// 保持；重开的是对外合同：vs vLLM 逐字节全同 → 量化容差，o25 钉预算）。
+///
+/// 访存形态：每 token 对状态行 3 趟（kvm 读、更新读、写；u64=4×bf16）——
+/// decay 写/读往返由更新趟同式重算 S1=S0·decay（同表达式位不变），
+/// kvm/o 累加与逐元素运算序逐操作数保持
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn deltanet(
     q: *const u16,        // [tokens, k_heads, k_dim]
@@ -778,7 +782,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     b: *const u16,        // [tokens, v_heads]
     a_log: *const f32,    // [v_heads]
     dt_bias: *const u16,  // [v_heads]
-    state: *mut f32,      // [rows, v_heads, v_dim, k_dim]（in/out）
+    state: *mut u16,      // [rows, v_heads, v_dim, k_dim] bf16（in/out）
     core_out: *mut u16,   // [tokens, v_heads*v_dim]
     row_start: *const u32, // [rows]
     row_count: *const u32, // [rows]
@@ -830,54 +834,133 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         }
         let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
         let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
-        // kvm 趟（读 S0）：S1=S0·decay 只在寄存器（更新趟同式重算，位不变），
-        // 累加 j 升序同参考
-        let mut kvm = 0.0f32;
-        if kd % 4 == 0 {
-            let mut j = 0usize;
-            while j < kd {
-                let s = *ld4(srow.add(j)).as_array();
-                kvm = (s[0] * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
-                kvm = (s[1] * decay) * (bf16_to_f32(*k.add(qb + j + 1)) * invk) + kvm;
-                kvm = (s[2] * decay) * (bf16_to_f32(*k.add(qb + j + 2)) * invk) + kvm;
-                kvm = (s[3] * decay) * (bf16_to_f32(*k.add(qb + j + 3)) * invk) + kvm;
-                j += 4;
+        // kvm 趟 + 更新趟（读 S0 写 S2）。kd=128 走宏展开·行驻寄存器快路径：
+        // 32×u64 装进组元组——无循环、恒定索引，SROA 必拆 SSA 驻寄存器（数组
+        // 过不了：for 不全展开 → local depot，实测 0.589ms 反劣）。更新趟零
+        // 重读——状态访存 3 趟 → 2 趟（1R+1W），105MB 工作集被 L2 逐出不再
+        // 是墙；行内无他写者（每线程独占自家 srow），寄存器值 ≡ 存储值，位
+        // 不变。展开式与通用路径逐句同构（j = c*4+lane），o20(kd=128) 钉位。
+        // 通用路径：装载即展宽（存储值 bf16），u64 一次载 4×bf16、u32 双车
+        // 道展宽——bf16 位即 f32 高 16 位；S1=S0·decay 两趟同式各算（位不
+        // 变）；S2 落池收 bf16（值留 u32 高半）、o 就地 j 升序累加——吃收过
+        // 的存储值，与 reference 同式同位
+        let o: f32 = if kd == 128 {
+            let mut kvm = 0.0f32;
+            macro_rules! kvm4 {
+                ($e:expr, $c:literal) => {{
+                    let (lo, hi) = ($e as u32, ($e >> 32) as u32);
+                    kvm = (f32::from_bits(lo << 16) * decay) * (bf16_to_f32(*k.add(qb + $c * 4)) * invk) + kvm;
+                    kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk) + kvm;
+                    kvm = (f32::from_bits(hi << 16) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk) + kvm;
+                    kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk) + kvm;
+                }};
             }
+            let w128 = (
+                *(srow.add(0) as *const u64), *(srow.add(4) as *const u64),
+                *(srow.add(8) as *const u64), *(srow.add(12) as *const u64),
+                *(srow.add(16) as *const u64), *(srow.add(20) as *const u64),
+                *(srow.add(24) as *const u64), *(srow.add(28) as *const u64),
+                *(srow.add(32) as *const u64), *(srow.add(36) as *const u64),
+                *(srow.add(40) as *const u64), *(srow.add(44) as *const u64),
+                *(srow.add(48) as *const u64), *(srow.add(52) as *const u64),
+                *(srow.add(56) as *const u64), *(srow.add(60) as *const u64),
+                *(srow.add(64) as *const u64), *(srow.add(68) as *const u64),
+                *(srow.add(72) as *const u64), *(srow.add(76) as *const u64),
+                *(srow.add(80) as *const u64), *(srow.add(84) as *const u64),
+                *(srow.add(88) as *const u64), *(srow.add(92) as *const u64),
+                *(srow.add(96) as *const u64), *(srow.add(100) as *const u64),
+                *(srow.add(104) as *const u64), *(srow.add(108) as *const u64),
+                *(srow.add(112) as *const u64), *(srow.add(116) as *const u64),
+                *(srow.add(120) as *const u64), *(srow.add(124) as *const u64),
+            );
+            kvm4!(w128.0, 0); kvm4!(w128.1, 1); kvm4!(w128.2, 2); kvm4!(w128.3, 3);
+            kvm4!(w128.4, 4); kvm4!(w128.5, 5); kvm4!(w128.6, 6); kvm4!(w128.7, 7);
+            kvm4!(w128.8, 8); kvm4!(w128.9, 9); kvm4!(w128.10, 10); kvm4!(w128.11, 11);
+            kvm4!(w128.12, 12); kvm4!(w128.13, 13); kvm4!(w128.14, 14); kvm4!(w128.15, 15);
+            kvm4!(w128.16, 16); kvm4!(w128.17, 17); kvm4!(w128.18, 18); kvm4!(w128.19, 19);
+            kvm4!(w128.20, 20); kvm4!(w128.21, 21); kvm4!(w128.22, 22); kvm4!(w128.23, 23);
+            kvm4!(w128.24, 24); kvm4!(w128.25, 25); kvm4!(w128.26, 26); kvm4!(w128.27, 27);
+            kvm4!(w128.28, 28); kvm4!(w128.29, 29); kvm4!(w128.30, 30); kvm4!(w128.31, 31);
+            let vin = bf16_to_f32(*v.add((g * vh + h) * vd + vv));
+            let delta = (vin - kvm) * beta;
+            let mut o = 0.0f32;
+            macro_rules! upd4 {
+                ($e:expr, $c:literal) => {{
+                    let (lo, hi) = ($e as u32, ($e >> 32) as u32);
+                    let r0 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4)) * invk) * delta + (f32::from_bits(lo << 16) * decay));
+                    let r1 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
+                    let r2 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk) * delta + (f32::from_bits(hi << 16) * decay));
+                    let r3 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                    // lane0 ← r0>>16；lane1 已在位；lane2 ← r2<<16；lane3 ← r3<<32
+                    *(srow.add($c * 4) as *mut u64) =
+                        (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
+                    o = f32::from_bits(r0) * ((bf16_to_f32(*q.add(qb + $c * 4)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r1) * ((bf16_to_f32(*q.add(qb + $c * 4 + 1)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r2) * ((bf16_to_f32(*q.add(qb + $c * 4 + 2)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r3) * ((bf16_to_f32(*q.add(qb + $c * 4 + 3)) * invq) / kd_sqrt) + o;
+                }};
+            }
+            upd4!(w128.0, 0); upd4!(w128.1, 1); upd4!(w128.2, 2); upd4!(w128.3, 3);
+            upd4!(w128.4, 4); upd4!(w128.5, 5); upd4!(w128.6, 6); upd4!(w128.7, 7);
+            upd4!(w128.8, 8); upd4!(w128.9, 9); upd4!(w128.10, 10); upd4!(w128.11, 11);
+            upd4!(w128.12, 12); upd4!(w128.13, 13); upd4!(w128.14, 14); upd4!(w128.15, 15);
+            upd4!(w128.16, 16); upd4!(w128.17, 17); upd4!(w128.18, 18); upd4!(w128.19, 19);
+            upd4!(w128.20, 20); upd4!(w128.21, 21); upd4!(w128.22, 22); upd4!(w128.23, 23);
+            upd4!(w128.24, 24); upd4!(w128.25, 25); upd4!(w128.26, 26); upd4!(w128.27, 27);
+            upd4!(w128.28, 28); upd4!(w128.29, 29); upd4!(w128.30, 30); upd4!(w128.31, 31);
+            o
         } else {
-            let mut j = 0usize;
-            while j < kd {
-                kvm = (*srow.add(j) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
-                j += 1;
+            let mut kvm = 0.0f32;
+            if kd % 4 == 0 {
+                let mut j = 0usize;
+                while j < kd {
+                    let w = *(srow.add(j) as *const u64);
+                    let (lo, hi) = (w as u32, (w >> 32) as u32);
+                    kvm = (f32::from_bits(lo << 16) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+                    kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + j + 1)) * invk) + kvm;
+                    kvm = (f32::from_bits(hi << 16) * decay) * (bf16_to_f32(*k.add(qb + j + 2)) * invk) + kvm;
+                    kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + j + 3)) * invk) + kvm;
+                    j += 4;
+                }
+            } else {
+                let mut j = 0usize;
+                while j < kd {
+                    kvm = (bf16_to_f32(*srow.add(j)) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+                    j += 1;
+                }
             }
-        }
-        let vin = bf16_to_f32(*v.add((g * vh + h) * vd + vv));
-        let delta = (vin - kvm) * beta;
-        // 更新+输出趟（读 S0 写 S2）：S1 同式重算、S2 落地、o 就地 j 升序累加
-        let mut o = 0.0f32;
-        if kd % 4 == 0 {
-            let mut j = 0usize;
-            while j < kd {
-                let s = *ld4(srow.add(j)).as_array();
-                let s2_0 = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + (s[0] * decay);
-                let s2_1 = (bf16_to_f32(*k.add(qb + j + 1)) * invk) * delta + (s[1] * decay);
-                let s2_2 = (bf16_to_f32(*k.add(qb + j + 2)) * invk) * delta + (s[2] * decay);
-                let s2_3 = (bf16_to_f32(*k.add(qb + j + 3)) * invk) * delta + (s[3] * decay);
-                st4(srow.add(j), core::simd::f32x4::from_array([s2_0, s2_1, s2_2, s2_3]));
-                o = s2_0 * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
-                o = s2_1 * ((bf16_to_f32(*q.add(qb + j + 1)) * invq) / kd_sqrt) + o;
-                o = s2_2 * ((bf16_to_f32(*q.add(qb + j + 2)) * invq) / kd_sqrt) + o;
-                o = s2_3 * ((bf16_to_f32(*q.add(qb + j + 3)) * invq) / kd_sqrt) + o;
-                j += 4;
+            let vin = bf16_to_f32(*v.add((g * vh + h) * vd + vv));
+            let delta = (vin - kvm) * beta;
+            let mut o = 0.0f32;
+            if kd % 4 == 0 {
+                let mut j = 0usize;
+                while j < kd {
+                    let w = *(srow.add(j) as *const u64);
+                    let (lo, hi) = (w as u32, (w >> 32) as u32);
+                    let r0 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j)) * invk) * delta + (f32::from_bits(lo << 16) * decay));
+                    let r1 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 1)) * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
+                    let r2 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 2)) * invk) * delta + (f32::from_bits(hi << 16) * decay));
+                    let r3 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 3)) * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                    // lane0 ← r0>>16；lane1 已在位；lane2 ← r2<<16；lane3 ← r3<<32
+                    *(srow.add(j) as *mut u64) =
+                        (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
+                    o = f32::from_bits(r0) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r1) * ((bf16_to_f32(*q.add(qb + j + 1)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r2) * ((bf16_to_f32(*q.add(qb + j + 2)) * invq) / kd_sqrt) + o;
+                    o = f32::from_bits(r3) * ((bf16_to_f32(*q.add(qb + j + 3)) * invq) / kd_sqrt) + o;
+                    j += 4;
+                }
+            } else {
+                let mut j = 0usize;
+                while j < kd {
+                    let s2 = f32_to_bf16((bf16_to_f32(*k.add(qb + j)) * invk) * delta + (bf16_to_f32(*srow.add(j)) * decay));
+                    *srow.add(j) = s2;
+                    o = bf16_to_f32(s2) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+                    j += 1;
+                }
             }
-        } else {
-            let mut j = 0usize;
-            while j < kd {
-                let s2 = (bf16_to_f32(*k.add(qb + j)) * invk) * delta + (*srow.add(j) * decay);
-                *srow.add(j) = s2;
-                o = s2 * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
-                j += 1;
-            }
-        }
+            o
+        };
         *core_out.add((g * vh + h) * vd + vv) = f32_to_bf16(o);
         i += 1;
     }

@@ -502,7 +502,7 @@ pub fn deltanet(
     b: &[u16],        // [tokens, v_heads]
     a_log: &[f32],    // [v_heads]
     dt_bias: &[u16],  // [v_heads]
-    state: &mut [f32], // [rows, v_heads, v_dim, k_dim]（in/out）
+    state: &mut [u16], // [rows, v_heads, v_dim, k_dim] bf16（in/out）
     row_start: &[u32],
     row_count: &[u32],
     row_id: &[u32],
@@ -527,10 +527,12 @@ pub fn deltanet(
             let kh = h * k_heads / v_heads; // repeat_interleave 映射
             let big_a = expf(a_log[h]);
             let dtb = bf16_to_f32(dt_bias[h]);
-            // S[vv][j]，镜像 kernel 的线程私有行
+            // S[vv][j]，镜像 kernel 的线程私有行（装载即展宽——存储值是 bf16）
             let sbase = (row_id[r] as usize * v_heads + h) * v_dim * k_dim;
-            let mut s = vec![0f32; v_dim * k_dim];
-            s.copy_from_slice(&state[sbase..sbase + v_dim * k_dim]);
+            let mut s: Vec<f32> = state[sbase..sbase + v_dim * k_dim]
+                .iter()
+                .map(|&b| bf16_to_f32(b))
+                .collect();
             for i in 0..cnt {
                 let g = st + i;
                 let decay = expf(0.0 - big_a * softplus(bf16_to_f32(a[g * v_heads + h]) + dtb));
@@ -559,7 +561,11 @@ pub fn deltanet(
                     let vin = bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
                     let delta = (vin - kvm) * beta;
                     for j in 0..k_dim {
-                        srow[j] = (bf16_to_f32(k[qb + j]) * invk) * delta + srow[j];
+                        // 状态池 bf16：存储即收——o/下一 token 递推全吃收过的
+                        // 同一值（kernel 同式：寄存器 f32 累加、落池收 bf16）
+                        srow[j] = bf16_to_f32(f32_to_bf16(
+                            (bf16_to_f32(k[qb + j]) * invk) * delta + srow[j],
+                        ));
                     }
                     let mut o = 0.0f32;
                     for j in 0..k_dim {
@@ -568,7 +574,9 @@ pub fn deltanet(
                     out[(g * v_heads + h) * v_dim + vv] = f32_to_bf16(o);
                 }
             }
-            state[sbase..sbase + v_dim * k_dim].copy_from_slice(&s);
+            for (d, f) in state[sbase..sbase + v_dim * k_dim].iter_mut().zip(s) {
+                *d = f32_to_bf16(f); // 已是 bf16 可表示值——恒等往返
+            }
         }
     }
     out

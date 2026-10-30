@@ -64,7 +64,7 @@ pub struct QwenMirror {
     k_cache: Vec<Vec<u16>>,
     v_cache: Vec<Vec<u16>>,
     /// 每线性层递推状态 [v_heads, v_dim, k_dim] f32
-    lin_state: Vec<Vec<f32>>,
+    lin_state: Vec<Vec<u16>>, // 状态池 bf16（与设备侧同存储格式）
     /// 每线性层 conv 状态 [conv_dim, kernel-1]
     conv_state: Vec<Vec<u16>>,
 }
@@ -112,7 +112,7 @@ impl QwenMirror {
                     })
                 }
                 LayerType::Linear => {
-                    lin_state.push(vec![0f32; (cfg.linear_num_v_heads * cfg.linear_v_dim
+                    lin_state.push(vec![0u16; (cfg.linear_num_v_heads * cfg.linear_v_dim
                         * cfg.linear_k_dim) as usize]);
                     conv_state.push(vec![0u16; (cfg.conv_dim() * (cfg.conv_kernel - 1)) as usize]);
                     AttnHost::Linear(LinHost {

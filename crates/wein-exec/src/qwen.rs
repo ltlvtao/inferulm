@@ -1316,7 +1316,7 @@ fn lin_row_bytes(cfg: &Qwen35Config) -> usize {
     let vh = cfg.linear_num_v_heads as usize;
     let kd = cfg.linear_k_dim as usize;
     let vd = cfg.linear_v_dim as usize;
-    vh * kd * vd * 4
+    vh * kd * vd * 2 // 状态池 bf16（寄存器 f32 累加、落池收 bf16——reference 同式镜像）
 }
 
 /// conv 状态**单行**字节数 [conv_dim, kernel-1] bf16（池 = ×MAX_ROWS）

@@ -44,13 +44,13 @@ fn main() {
     let da_log = gpu.alloc_from_slice(&(0..vh).map(|h| 0.3 + 0.2 * h as f32).collect::<Vec<_>>());
     let ddtb = mk(0x6fbc, vh);
     let state_len = n_rows * vh * vd * kd;
-    let dstate = gpu.alloc_from_slice(&vec![0f32; state_len]);
+    let dstate = gpu.alloc_from_slice(&vec![0u16; state_len]); // 状态池 bf16
     let dout = gpu.alloc_bytes(tokens * vh * vd * 2);
     let drs = gpu.alloc_from_slice(&(0..n_rows as u32).collect::<Vec<_>>());
     let drc = gpu.alloc_from_slice(&vec![1u32; n_rows]);
     let dri = gpu.alloc_from_slice(&(0..n_rows as u32).collect::<Vec<_>>());
 
-    let delta_bytes = (state_len * 4 * 3) as f64; // 3 趟状态 r+w（o22 同账）
+    let delta_bytes = (state_len * 2 * 3) as f64; // 3 趟状态 r+w（o22 同账，bf16 池）
 
     let delta = |s: &wein_kernel::cuda::Stream| {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,

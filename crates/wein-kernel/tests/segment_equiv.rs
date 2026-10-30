@@ -123,7 +123,8 @@ fn o15_conv_segment_equivalence() {
 }
 
 /// o16 · deltanet 段等价：lin_state 接力后任意切段的递推输出 ≡ 整段单算。
-/// 与 o15 同批布局；GPU core 输出与末态 f32 状态分别位对齐
+/// 与 o15 同批布局；GPU core 输出与末态 bf16 状态分别位对齐（状态池
+/// bf16 化后段等价**天然保持**——段间接力传递的就是落池的 bf16 状态）
 #[test]
 fn o16_deltanet_segment_equivalence() {
     let Some(gpu) = gpu() else { return };
@@ -150,7 +151,7 @@ fn o16_deltanet_segment_equivalence() {
     // 整段真值（零状态，逐请求一次算）
     let mut truth: Vec<Vec<u16>> = vec![];
     for r in 0..rows {
-        let mut s0 = vec![0f32; vh_n * vd * kd];
+        let mut s0 = vec![0u16; vh_n * vd * kd];
         let out = reference::deltanet(
             &q_full[r], &k_full[r], &v_full[r], &a_full[r], &b_full[r], &a_log, &dtb,
             &mut s0, &[0], &[ntok as u32], &[0], kh_n, vh_n, kd, vd, eps,
@@ -159,7 +160,7 @@ fn o16_deltanet_segment_equivalence() {
     }
 
     // 分段 + 状态接力
-    let mut state_ref = vec![0f32; rows * vh_n * vd * kd];
+    let mut state_ref = vec![0u16; rows * vh_n * vd * kd];
     let dstate = gpu.alloc_from_slice(&state_ref);
     let (da_log, ddtb) = (gpu.alloc_from_slice(&a_log), gpu.alloc_from_slice(&dtb));
     for (bi, segs_b) in SEG_BATCHES.iter().enumerate() {
@@ -218,8 +219,7 @@ fn o16_deltanet_segment_equivalence() {
         }
         assert_bits(&format!("o16 批{bi}：GPU 分段 vs 整段真值"), &gpu_b, &expb);
     }
-    let got_state = dstate.read_to_vec();
-    let (gs, rs_): (Vec<f32>, Vec<f32>) = (got_state, state_ref.clone());
-    let bad = gs.iter().zip(rs_.iter()).filter(|(a, b)| a != b).count();
-    assert_eq!(bad, 0, "o16 末态：GPU f32 状态与参考不一致（{bad} 个元素）");
+    let got_state: Vec<u16> = dstate.read_to_vec();
+    let bad = got_state.iter().zip(state_ref.iter()).filter(|(a, b)| a != b).count();
+    assert_eq!(bad, 0, "o16 末态：GPU bf16 状态与参考不一致（{bad} 个元素）");
 }

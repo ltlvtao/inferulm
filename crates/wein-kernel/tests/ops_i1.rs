@@ -245,14 +245,23 @@ fn o19_conv_golden_bitwise() {
 }
 
 /// o20 · gated deltanet 位对齐：初始状态非零（in/out 状态语义）、
-/// v/k 头 2:1（repeat_interleave 映射）、最终状态回读对拍
+/// v/k 头 2:1（repeat_interleave 映射）、最终状态回读对拍。
+/// 状态池 bf16 化后：kernel↔reference 位对齐**保持**（reference 同步镜像
+/// 「存储即收 bf16」语义）——重开的是对外合同（vs vLLM 字节全同），
+/// o25 另钉量化漂移预算
 #[test]
 fn o20_deltanet_golden_bitwise() {
+    // kd=8 走通用 u64 车道路径；kd=128 走行驻留快路径（local depot/寄存器）
+    o20_case(2, 4, 8, 8);
+    o20_case(2, 4, 128, 8);
+}
+
+fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
     let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
-    let (k_heads, v_heads, k_dim, v_dim) = (2usize, 4usize, 8usize, 8usize);
+    let tag = format!("deltanet kd={k_dim}");
     let (row_start, row_count): (Vec<u32>, Vec<u32>) = (vec![0, 6], vec![6, 3]);
     let row_id: Vec<u32> = vec![0, 1];
     let tokens: usize = 9;
@@ -264,8 +273,11 @@ fn o20_deltanet_golden_bitwise() {
     let b = vec_bf16(0x7e55, tokens * v_heads, 1.0);
     let a_log: Vec<f32> = vec_f32(0x7f66, v_heads, 1.5).iter().map(|x| x - 0.5).collect();
     let dt_bias = vec_bf16(0x8077, v_heads, 0.5);
-    // 非零初始状态：证明 state 是 in/out
-    let mut state: Vec<f32> = vec_f32(0x9088, n_rows * v_heads * v_dim * k_dim, 0.5);
+    // 非零初始状态（bf16 存储——初值即收，两侧同值）：证明 state 是 in/out
+    let mut state: Vec<u16> = vec_f32(0x9088, n_rows * v_heads * v_dim * k_dim, 0.5)
+        .iter()
+        .map(|&f| reference::f32_to_bf16(f))
+        .collect();
 
     let expect_out = reference::deltanet(&q, &k, &v, &a, &b, &a_log, &dt_bias, &mut state,
         &row_start, &row_count, &row_id, k_heads, v_heads, k_dim, v_dim, 1e-6);
@@ -275,26 +287,131 @@ fn o20_deltanet_golden_bitwise() {
         gpu.alloc_from_slice(&a), gpu.alloc_from_slice(&b));
     let (da_log, ddtb) = (gpu.alloc_from_slice(&a_log), gpu.alloc_from_slice(&dt_bias));
     // GPU 侧上传同一初值（mirror 上面已原地更新 state——用同种子重造）
-    let init: Vec<f32> = vec_f32(0x9088, n_rows * v_heads * v_dim * k_dim, 0.5);
+    let init: Vec<u16> = vec_f32(0x9088, n_rows * v_heads * v_dim * k_dim, 0.5)
+        .iter()
+        .map(|&f| reference::f32_to_bf16(f))
+        .collect();
     let dstate = gpu.alloc_from_slice(&init);
     let dout = gpu.alloc_bytes(tokens * v_heads * v_dim * 2);
     let (drs, drc, dri) = (gpu.alloc_from_slice(&row_start), gpu.alloc_from_slice(&row_count), gpu.alloc_from_slice(&row_id));
     t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
         n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
     stream.sync();
-    assert_bits("deltanet core_out", &dout.read_to_vec(), &expect_out);
-    let got_state: Vec<f32> = dstate.read_to_vec();
-    assert_eq!(got_state.len(), expect_state.len(), "state 长度");
-    for i in 0..expect_state.len() {
-        assert_eq!(got_state[i].to_bits(), expect_state[i].to_bits(),
-            "state[{i}] 位不对齐（GPU {:e} vs 参考 {:e}）", got_state[i], expect_state[i]);
+    assert_bits(&format!("{tag} core_out"), &dout.read_to_vec(), &expect_out);
+    assert_bits(&format!("{tag} state"), &dstate.read_to_vec(), &expect_state);
+}
+
+/// o25 · 状态池 bf16 化漂移预算：同输入同门同 l2norm 下，bf16 存态递推
+/// （现行语义——存储即收，o/递推全吃收过的值）vs f32 存态递推（本刀前
+/// 语义）。这是对外合同重开的量化账：vs vLLM 逐字节全同 → 容差对照，
+/// 本测试钉"递推层自身引入多少漂移"。真形状 kd=vd=128、T=256 长递推，
+/// 输出端逐 token 相对误差 max + 末态相对误差 max，门 = 实测 × 裕量
+#[test]
+fn o25_deltanet_bf16_state_drift_budget() {
+    let (k_heads, v_heads, k_dim, v_dim) = (1usize, 2usize, 128usize, 128usize);
+    let tokens = 256usize;
+    let q = vec_bf16(0xa5a5, tokens * k_heads * k_dim, 2.0);
+    let k = vec_bf16(0xa6b6, tokens * k_heads * k_dim, 2.0);
+    let v = vec_bf16(0xa7c7, tokens * v_heads * v_dim, 2.0);
+    let a = vec_bf16(0xa8d8, tokens * v_heads, 1.0);
+    let b = vec_bf16(0xa9e9, tokens * v_heads, 1.0);
+    let a_log: Vec<f32> = (0..v_heads).map(|h| 0.3 + 0.2 * h as f32).collect();
+    let dt_bias = vec_bf16(0xaaf0, v_heads, 0.5);
+    let eps = 1e-6f32;
+    let kd_sqrt = (k_dim as f32).sqrt();
+
+    // f32 存态真值：与 reference::deltanet 逐句同构，仅缺"落池收 bf16"
+    // 那一跳（s 保持 f32 不收）——即本刀前的递推语义
+    let mut s: Vec<f32> = vec![0.0; v_heads * v_dim * k_dim];
+    let mut out_f32 = vec![0u16; tokens * v_heads * v_dim];
+    for h in 0..v_heads {
+        let kh = h * k_heads / v_heads;
+        let big_a = reference::expf(a_log[h]);
+        let dtb = reference::bf16_to_f32(dt_bias[h]);
+        let sbase = h * v_dim * k_dim;
+        for g in 0..tokens {
+            let decay = reference::expf(0.0 - big_a * reference::softplus(reference::bf16_to_f32(a[g * v_heads + h]) + dtb));
+            let beta = reference::bf16_to_f32(reference::f32_to_bf16(
+                1.0f32 / (1.0f32 + reference::expf(0.0 - reference::bf16_to_f32(b[g * v_heads + h]))),
+            ));
+            let qb = (g * k_heads + kh) * k_dim;
+            let (mut sq, mut sk) = (0.0f32, 0.0f32);
+            for j in 0..k_dim {
+                let qv = reference::bf16_to_f32(q[qb + j]);
+                let kv = reference::bf16_to_f32(k[qb + j]);
+                sq = qv * qv + sq;
+                sk = kv * kv + sk;
+            }
+            let invq = 1.0f32 / ((sq + eps).sqrt());
+            let invk = 1.0f32 / ((sk + eps).sqrt());
+            for vv in 0..v_dim {
+                let srow = &mut s[sbase + vv * k_dim..][..k_dim];
+                for j in 0..k_dim {
+                    srow[j] *= decay;
+                }
+                let mut kvm = 0.0f32;
+                for j in 0..k_dim {
+                    kvm = srow[j] * (reference::bf16_to_f32(k[qb + j]) * invk) + kvm;
+                }
+                let vin = reference::bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
+                let delta = (vin - kvm) * beta;
+                for j in 0..k_dim {
+                    srow[j] = (reference::bf16_to_f32(k[qb + j]) * invk) * delta + srow[j];
+                }
+                let mut o = 0.0f32;
+                for j in 0..k_dim {
+                    o = srow[j] * ((reference::bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                }
+                out_f32[(g * v_heads + h) * v_dim + vv] = reference::f32_to_bf16(o);
+            }
+        }
     }
+
+    // bf16 存态（现行 reference——存储即收）
+    let mut s_bf = vec![0u16; v_heads * v_dim * k_dim];
+    let out_bf = reference::deltanet(
+        &q, &k, &v, &a, &b, &a_log, &dt_bias, &mut s_bf, &[0], &[tokens as u32], &[0],
+        k_heads, v_heads, k_dim, v_dim, eps,
+    );
+
+    // 度量：单元素相对误差在近零输出上无意义（分母→0），用归一化账——
+    // Frobenius 相对误差（整体能量占比）+ 峰值归一（max|Δ|/max|y|）+ 位差计数
+    fn norm_err(xs: impl Iterator<Item = (f32, f32)>) -> (f64, f64) {
+        let (mut sse, mut sy, mut max_d, mut max_y) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (x, y) in xs {
+            sse += ((x - y) * (x - y)) as f64;
+            sy += (y * y) as f64;
+            max_d = max_d.max((x - y).abs() as f64);
+            max_y = max_y.max(y.abs() as f64);
+        }
+        ((sse / sy).sqrt(), max_d / max_y)
+    };
+    let (rel2_o, maxn_o) = norm_err(
+        out_bf.iter().zip(out_f32.iter())
+            .map(|(&b, &f)| (reference::bf16_to_f32(b), reference::bf16_to_f32(f))),
+    );
+    let (rel2_s, maxn_s) = norm_err(
+        s_bf.iter().zip(s.iter()).map(|(&b, &f)| (reference::bf16_to_f32(b), f)),
+    );
+    let diff_cnt = out_bf.iter().zip(out_f32.iter()).filter(|(a, c)| a != c).count();
+    eprintln!(
+        "o25 bf16 池漂移（T=256, kd=vd=128）：输出 rel2 {rel2_o:.3e}/峰值归一 {maxn_o:.3e}（{diff_cnt}/{} 位不同），末态 rel2 {rel2_s:.3e}/峰值归一 {maxn_s:.3e}",
+        out_bf.len()
+    );
+    // 门 = 实测 × ~4 裕量（实测 rel2 1.3e-3/峰值 4.2e-3——decay 收缩使量化
+    // 误差稳态不累计，峰值 ≈ 1 个 bf16 量子）。rel2 是能量占比（对近零元素
+    // 稳健），峰值归一钉最坏单点。越门 = 存/读舍入位变动（kernel↔reference
+    // 镜像破坏），非量化噪声
+    assert!(rel2_o <= 5.0e-3, "o25 输出 rel2 漂移越门：{rel2_o:.3e} > 5.0e-3");
+    assert!(maxn_o <= 2.0e-2, "o25 输出峰值漂移越门：{maxn_o:.3e} > 2.0e-2");
+    assert!(rel2_s <= 5.0e-3, "o25 末态 rel2 漂移越门：{rel2_s:.3e} > 5.0e-3");
+    assert!(maxn_s <= 2.0e-2, "o25 末态峰值漂移越门：{maxn_s:.3e} > 2.0e-2");
 }
 
 /// o22 · deltanet 时延金丝雀：满负荷 decode 形状（m=100 行 × 32 v 头 ×
-/// kd=vd=128，每行 1 token）单 launch 事件计时。状态池 200MB/层是该 kernel
-/// 的带宽账（BASELINE §7：6 趟访存 → 3 趟 + v4 合并后地板 ~0.6ms）。
-/// 门禁 1.5ms 是 2× 地板余量——防"每线程串行扫 S 行"形态回归
+/// kd=vd=128，每行 1 token）单 launch 事件计时。状态池 bf16 + kd=128 行驻
+/// 寄存器后 105MB/层（2 趟 210MB，地板 ~0.26ms，实测 0.47——占用率相抵
+/// 的现实值）。门禁 0.8ms——防"每线程串行扫 S 行"形态回归
 #[test]
 fn o22_deltanet_latency_canary() {
     let _g = guard();
@@ -311,7 +428,7 @@ fn o22_deltanet_latency_canary() {
     let a_log: Vec<f32> = (0..v_heads).map(|h| 0.3 + 0.2 * h as f32).collect();
     let dt_bias = vec_bf16(0x6fbc, v_heads, 0.5);
     let state_len = n_rows * v_heads * v_dim * k_dim;
-    let state = vec![0f32; state_len]; // 时延与数据值无关
+    let state = vec![0u16; state_len]; // 状态池 bf16——时延与数据值无关
     let row_start: Vec<u32> = (0..n_rows as u32).collect();
     let row_count = vec![1u32; n_rows];
     let row_id: Vec<u32> = (0..n_rows as u32).collect();
@@ -347,7 +464,7 @@ fn o22_deltanet_latency_canary() {
     stream.sync();
     let per_launch = e1.elapsed_ms(&e0) / 20.0;
     eprintln!("o22 deltanet m=100×32×128²：{per_launch:.3} ms/launch（20 拍均值）");
-    assert!(per_launch < 1.5, "deltanet {per_launch:.3}ms 超 1.5ms 门禁——状态访存形态回归（串行扫 S 行）");
+    assert!(per_launch < 0.8, "deltanet {per_launch:.3}ms 超 0.8ms 门禁——状态访存形态回归（串行扫 S 行）");
 }
 
 /// o23 · rms 系时延金丝雀：满负荷 decode 两真实形状——主 norm
