@@ -89,6 +89,7 @@ async fn q11_real_model_http_serves_paris() {
     });
     let resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        .no_proxy()
         .build()
         .unwrap()
         .post(format!("{base}/v1/completions"))
@@ -153,6 +154,7 @@ async fn q12_chat_endpoint_template_end_to_end() {
     });
     let resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        .no_proxy()
         .build()
         .unwrap()
         .post(format!("{base}/v1/chat/completions"))

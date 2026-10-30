@@ -41,6 +41,13 @@ pub fn chat_body(max_tokens: u32) -> Value {
     })
 }
 
+/// 直连客户端：禁用代理。WSL autoProxy 会注入指向 Windows 侧的 http_proxy，
+/// 且其 no_proxy 是 Windows 通配风格（127.*），reqwest 不识别——
+/// 不加这条，全部本地测试请求会被整体劫持到代理上。
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 /// 发起流式请求（自动置 stream=true——这是本函数的语义，调用方无须记得设），
 /// 读回全部 SSE data 帧（按序）。帧内容必须整体是合法 UTF-8——
 /// 这本身就是一条断言：多字节字符绝不能被切成半个吐出去。
@@ -49,6 +56,7 @@ pub async fn post_sse(url: &str, body: &Value) -> Vec<String> {
     body["stream"] = serde_json::json!(true);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
+        .no_proxy()
         .build()
         .unwrap();
     let resp = client.post(url).json(&body).send().await.expect("send failed");

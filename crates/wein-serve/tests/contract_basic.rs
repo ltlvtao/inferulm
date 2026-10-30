@@ -8,7 +8,7 @@ use wein_engine::MockScript;
 #[tokio::test]
 async fn models_list_contains_served_model() {
     let ts = start(MockScript::default(), default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(format!("{}/v1/models", ts.base))
         .send()
         .await
@@ -24,7 +24,7 @@ async fn models_list_contains_served_model() {
 async fn chat_completion_non_stream() {
     let script = MockScript { pieces: vec![0, 1, 2], ..Default::default() };
     let ts = start(script, default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(3))
         .send()
@@ -48,7 +48,7 @@ async fn chat_completion_non_stream() {
 async fn completions_legacy_endpoint() {
     let script = MockScript { pieces: vec![0, 1], ..Default::default() };
     let ts = start(script, default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/completions", ts.base))
         .json(&json!({"model": "mock-model", "prompt": "once upon", "max_tokens": 2}))
         .send()
@@ -64,7 +64,7 @@ async fn completions_legacy_endpoint() {
 #[tokio::test]
 async fn unknown_model_returns_404_with_openai_error_body() {
     let ts = start(MockScript::default(), default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&json!({"model": "nope", "messages": [{"role": "user", "content": "x"}]}))
         .send()
@@ -81,7 +81,7 @@ async fn out_of_range_temperature_returns_400() {
     let ts = start(MockScript::default(), default_tok()).await;
     let mut body = chat_body(2);
     body["temperature"] = json!(3.0);
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&body)
         .send()
@@ -97,7 +97,7 @@ async fn bad_stop_type_returns_400() {
     let ts = start(MockScript::default(), default_tok()).await;
     let mut body = chat_body(2);
     body["stop"] = json!(42);
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&body)
         .send()
@@ -111,7 +111,7 @@ async fn max_tokens_zero_returns_empty_immediately() {
     let script = MockScript { per_token_delay: std::time::Duration::from_millis(50), ..Default::default() };
     let ts = start(script, default_tok()).await;
     let t0 = tokio::time::Instant::now();
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(0))
         .send()
@@ -128,7 +128,7 @@ async fn max_tokens_zero_returns_empty_immediately() {
 #[tokio::test]
 async fn unknown_route_returns_json_404() {
     let ts = start(MockScript::default(), default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(format!("{}/v1/nope", ts.base))
         .send()
         .await

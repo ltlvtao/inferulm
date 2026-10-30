@@ -6,6 +6,9 @@
 //!   债 > 1 即 prefill/recompute（按 chunk 切）；追平的那一步顺带采样（vLLM 追赶模型）
 //! - **chunked prefill**：完成追赶的那一步同时产出 token（forward 最后一个 token
 //!   即得到下一个采样，采样不额外计预算）
+//! - **混合步封顶**（`mix_cap`）：批内有稳定 decode 时单步总 token 封顶——
+//!   重步拆轻，decode 行的 ITL 不被同车的大 prefill chunk 打穿（p99 账）；
+//!   纯 prefill 波不受限；decode 占满时下限保 [`PREFILL_MIN`]（进度保证）
 //! - **容量模型可插拔**（`CapacityModel`）：准入反压与抢占触发全部经此钩子。
 //!   默认 `TokenCapacity`（批内 Σ(prompt+generated) ≤ limit 的聚合模型）；
 //!   wein-memory 的 BlockPool 水位模型经 wein-engine 适配器接入，调度策略不变
@@ -41,15 +44,34 @@ pub struct SchedConfig {
     /// 单请求单步 prefill 上限
     pub chunk_size: usize,
     /// 聚合容量上限 Σ(prompt + generated)——默认容量模型 TokenCapacity 的 limit；
-      /// 接入 BlockPool 水位模型后此字段仅作默认回退
+    /// 接入 BlockPool 水位模型后此字段仅作默认回退
     pub max_batch_tokens: usize,
+    /// 混合步封顶：批内存在稳定 decode 请求时，单步总 token（decode + prefill）
+    /// 不超过此值。满负荷 ITL p99 账：混合步时延 ∝ T，预算 512 会把波次切换/
+    /// 爬坡期的 ~400 prefill token 与 ~100 decode 行塞进同一步（T≈512 计算
+    /// 受限 ~65ms），搭乘的 decode 行 ITL 被打穿——封顶后重步拆轻。批内无
+    /// 稳定 decode（纯 prefill 波）不受限（TTFT/吞吐优先）；decode 行数占满
+    /// cap 时至少留 [`PREFILL_MIN`] 给 prefill（进度保证）
+    pub mix_cap: usize,
 }
 
 impl Default for SchedConfig {
     fn default() -> Self {
-        Self { token_budget: 512, max_running: 256, chunk_size: 256, max_batch_tokens: 65536 }
+        Self {
+            token_budget: 512,
+            max_running: 256,
+            chunk_size: 256,
+            max_batch_tokens: 65536,
+            // T≈192 的混合步 ≈ 纯 decode 步的 1.4×（qwen_mixed_probe 曲线），
+            // p99 与 TTFT 的平衡点——battery 仲裁
+            mix_cap: 192,
+        }
     }
 }
+
+/// 混合步封顶的下限保护：decode 行占满 cap 时 prefill 每步至少推进的 token 数
+///（~1ms 步时延的代价换等待 prefill 的有界推进）
+pub const PREFILL_MIN: usize = 8;
 
 pub struct ReqInput {
     pub id: ReqId,
@@ -195,6 +217,13 @@ impl Req {
     /// 上下文长度 = prompt + 已生成（KV 压力的来源：只增不减，直到请求离批）
     fn context(&self) -> usize {
         self.prompt_len() + self.generated as usize
+    }
+    /// 稳定 decode 态：prompt 已追平且债 ≤ 1（每步 1 token 的采样-前向循环）。
+    /// 混合步封顶的判据——批内有此态请求时本步总 token 受 mix_cap 约束
+    fn is_decode(&self) -> bool {
+        self.generated < self.max_tokens
+            && self.forwarded >= self.prompt_len()
+            && self.prompt_len() + self.generated as usize - self.forwarded <= 1
     }
 }
 
@@ -346,11 +375,16 @@ impl Scheduler {
             self.preempt_one(victim);
         }
 
-        // --- 预算规划：批序（FIFO 准入序）逐个分账；预算尽则 break（先来者保护）。
+        // --- 预算规划：两相位（批序 = FIFO 准入序）。
         //     债 backlog = prompt_len + generated - forwarded（未 forward 的 token 数）。
         //     债 ≤ 1 且 prompt 已 forward ⇒ decode（成本 1）；否则按 chunk 追赶，
-        //     追平的那一步顺带采样（采样不额外计预算——它就是那最后一次 forward 的输出）---
+        //     追平的那一步顺带采样（采样不额外计预算——它就是那最后一次 forward 的输出）。
+        //     相位一 decode 先落位（每请求 1 token，ITL 进度优先）；相位二 prefill
+        //     受混合步封顶约束：批内有稳定 decode 时总 token ≤ mix_cap（重步拆轻），
+        //     否则全预算；decode 占满 cap 时下限保 PREFILL_MIN（进度保证）---
         let mut budget = self.cfg.token_budget;
+        let any_decoder = self.batch.iter().any(|id| self.reqs[&id].is_decode());
+        let mut cap = if any_decoder { self.cfg.mix_cap } else { self.cfg.token_budget };
         let mut plan = StepPlan { batch: self.batch.iter().collect(), ..Default::default() };
         for &id in &plan.batch {
             let r = self.reqs.get_mut(&id).unwrap();
@@ -364,24 +398,47 @@ impl Scheduler {
                     break;
                 }
                 budget -= backlog;
+                cap = cap.saturating_sub(backlog);
                 r.forwarded += backlog;
                 r.generated += 1;
                 plan.decode.push(id);
                 self.cap.on_sample(id);
-            } else {
-                let chunk = backlog.min(self.cfg.chunk_size).min(budget);
-                if chunk == 0 {
-                    break;
-                }
-                r.forwarded += chunk;
-                budget -= chunk;
-                plan.prefill.push((id, chunk));
-                if r.forwarded == r.prompt_len() + r.generated as usize {
-                    // 追平：本次 forward 的最后一个 token 直接产出下一个采样
-                    r.generated += 1;
-                    plan.decode.push(id);
-                    self.cap.on_sample(id);
-                }
+            }
+        }
+        // decode 占满 cap（slack 0）时给 prefill 留下限（等待中的 prefill 有界
+        // 推进）。仅 slack==0 触发：decode 行数 < mix_cap 时 T ≤ mix_cap 是严格
+        // 不变量。有 prefill 工作的请求 = 非 decode 态且未达标
+        if any_decoder
+            && cap == 0
+            && self.batch.iter().any(|id| {
+                let r = &self.reqs[&id];
+                r.generated < r.max_tokens && !r.is_decode()
+            })
+        {
+            cap = PREFILL_MIN;
+        }
+        for &id in &plan.batch {
+            let r = self.reqs.get_mut(&id).unwrap();
+            if r.generated >= r.max_tokens {
+                continue;
+            }
+            let backlog = r.prompt_len() + r.generated as usize - r.forwarded;
+            if backlog <= 1 && r.forwarded >= r.prompt_len() {
+                continue; // 相位一已落位
+            }
+            let chunk = backlog.min(self.cfg.chunk_size).min(budget).min(cap);
+            if chunk == 0 {
+                break;
+            }
+            r.forwarded += chunk;
+            budget -= chunk;
+            cap -= chunk;
+            plan.prefill.push((id, chunk));
+            if r.forwarded == r.prompt_len() + r.generated as usize {
+                // 追平：本次 forward 的最后一个 token 直接产出下一个采样
+                r.generated += 1;
+                plan.decode.push(id);
+                self.cap.on_sample(id);
             }
         }
 
@@ -448,8 +505,14 @@ mod tests {
     use std::time::Instant;
 
     fn cfg(budget: usize, max_running: usize, chunk: usize) -> SchedConfig {
-        // 默认容量给到天文数字：非压力用例不关心抢占
-        SchedConfig { token_budget: budget, max_running, chunk_size: chunk, max_batch_tokens: 1 << 30 }
+        // 默认容量给到天文数字：非压力用例不关心抢占；mix_cap 同理不封顶
+        SchedConfig {
+            token_budget: budget,
+            max_running,
+            chunk_size: chunk,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+        }
     }
 
     /// 跑到全部完成，返回 (plans, events)；max_steps 防死循环。
@@ -536,6 +599,7 @@ mod tests {
             max_running: 8,
             chunk_size: 16,
             max_batch_tokens: 6,
+            mix_cap: 1 << 30,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 2], max_tokens: 8 }); // A
         s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 2], max_tokens: 8 }); // C
@@ -640,6 +704,67 @@ mod tests {
         assert_eq!(events.iter().filter(|e| matches!(e, SchedEvent::Finished { .. })).count(), 20);
         assert!(s.metrics().steps < 100, "20 个小请求不该超过 100 步：{}", s.metrics().steps);
         assert!(t0.elapsed().as_millis() < 1000, "纯逻辑调度器必须亚毫秒级处理此规模");
+    }
+
+    /// s10 · 混合步封顶（mix_cap）：满负荷 ITL p99 账——稳定 decode 在批时
+    ///      单步总 token（decode + prefill）≤ mix_cap（波次切换/爬坡期的大
+    ///      prefill chunk 不再把搭乘的 decode 行打进计算受限的重步）；批内
+    ///      无稳定 decode（纯 prefill 波）不受限（TTFT/吞吐优先）；cap 被
+    ///      decode 行占满时至少留 PREFILL_MIN 给 prefill（进度保证）
+    #[test]
+    fn s10_mixed_step_cap_shields_decoders() {
+        // 预算 16 / cap 8：请求 1（prompt 1）步 1 追平后成为稳定 decode，
+        // 请求 2（prompt 30）的 prefill 从步 2 起被 cap 切片
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 16,
+            max_running: 8,
+            chunk_size: 16,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 8,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 10 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 30], max_tokens: 10 });
+        let (plans, _) = run_to_idle(&mut s, 100);
+
+        // 步 1：批内无稳定 decode（两者都在追平）→ 全预算：1 追平 + 2 推 15
+        assert_eq!(plans[0].prefill, vec![(1, 1), (2, 15)], "无 decode 在批 → 不封顶");
+
+        // 步 2+：请求 1 稳定 decode → 混合步 T = chunk + 1 ≤ 8（chunk ≤ 7）
+        let mut chunks_after = Vec::new();
+        for p in plans.iter().skip(1) {
+            if let Some(&(_, n)) = p.prefill.iter().find(|&&(id, _)| id == 2) {
+                assert!(!p.decode.contains(&2) || n <= 7, "追平步同样计入 cap");
+                if !p.decode.contains(&2) {
+                    assert!(p.decode.contains(&1), "稳定 decode 每步在场");
+                    assert!(n <= 7, "混合步总 token ≤ cap 8（chunk {n} + decode 1）");
+                }
+                chunks_after.push(n);
+            }
+        }
+        assert_eq!(
+            chunks_after.iter().sum::<usize>(),
+            15,
+            "cap 切片不丢 token：30 = 15（步 1）+ Σ 后续"
+        );
+        // 收敛与总量：两请求各 10 token
+        assert_eq!(plans.iter().map(|p| p.decode.len()).sum::<usize>(), 20);
+
+        // 下限保护：cap 2 < decode 行数 4 → prefill 仍至少推进 PREFILL_MIN
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 64,
+            max_running: 8,
+            chunk_size: 64,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 2,
+        });
+        for id in 1..=4u64 {
+            s.submit(ReqInput { id, prompt_token_ids: vec![0; 1], max_tokens: 10 });
+        }
+        s.submit(ReqInput { id: 5, prompt_token_ids: vec![0; 100], max_tokens: 10 });
+        s.step(); // 四请求追平 + 5 推 60（步 1 无稳定 decode → 全预算 64）
+        let p2 = s.step();
+        let n5: usize = p2.prefill.iter().filter(|&&(id, _)| id == 5).map(|(_, n)| n).sum();
+        assert!(n5 >= PREFILL_MIN, "decode 行占满 cap 时 prefill 至少推进 {PREFILL_MIN}（得 {n5}）");
     }
 
     /// s9 · 容量钩子真实可插拔：准入与抢占由容量模型驱动，而非调度器内置聚合

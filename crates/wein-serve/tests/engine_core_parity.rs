@@ -17,7 +17,7 @@ fn core(pieces: Vec<u32>, step_delay_ms: u64) -> CoreConfig {
 #[tokio::test]
 async fn p1_chat_non_stream_content_usage_and_finish() {
     let ts = start_core(core(vec![0, 1, 2], 1), default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(3))
         .send()
@@ -66,7 +66,7 @@ async fn p3_utf8_multibyte_never_split_across_frames() {
 async fn p4_stop_param_truncates_and_cancels_engine() {
     let tok = MockTokenizer::from_texts(&["Alpha", " beta", " gamma", " done"]);
     let ts = start_core(core(vec![0, 1, 2, 3], 1), tok).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&json!({
             "model": "mock-model",
@@ -93,7 +93,7 @@ async fn p5_disconnect_cancels_and_server_stays_healthy() {
     let mut body = chat_body(200); // 长生成，确保断开时仍在跑
     body["stream"] = json!(true);
     {
-        let client = reqwest::Client::new();
+        let client = client();
         let resp = client
             .post(format!("{}/v1/chat/completions", ts.base))
             .json(&body)
@@ -107,7 +107,7 @@ async fn p5_disconnect_cancels_and_server_stays_healthy() {
 
     eventually(Duration::from_secs(2), || ts.stats.cancelled_count() >= 1).await;
 
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(2))
         .send()
@@ -157,7 +157,7 @@ async fn p6_concurrent_streams_exact_content_and_accepted() {
 async fn p7_max_tokens_zero_empty_immediate() {
     let ts = start_core(core(vec![0], 50), default_tok()).await;
     let t0 = Instant::now();
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(0))
         .send()
@@ -187,7 +187,7 @@ async fn p8_abort_storm_then_healthy_and_clean() {
         let url = url.clone();
         let body = body.clone();
         handles.push(tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = client();
             let resp = client.post(&url).json(&body).send().await.unwrap();
             let mut stream = resp.bytes_stream();
             let _ = stream.next().await;
@@ -200,7 +200,7 @@ async fn p8_abort_storm_then_healthy_and_clean() {
     eventually(Duration::from_secs(3), || ts.stats.cancelled_count() >= 30).await;
 
     // 风暴之后：正常请求完整且精确
-    let resp = reqwest::Client::new().post(&url).json(&chat_body(3)).send().await.unwrap();
+    let resp = client().post(&url).json(&chat_body(3)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "Hello world");
@@ -223,7 +223,7 @@ async fn p9_memory_enabled_core_protocol_parity() {
 
     // 内容与 usage（对照 p1）
     let ts = start_core(mem_cfg(vec![0, 1, 2]), default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(3))
         .send()
@@ -251,7 +251,7 @@ async fn p9_memory_enabled_core_protocol_parity() {
     // 前缀缓存真实命中：同 prompt（2 token = 1 整块）第二问，cache_hit_tokens ≥ 2
     let ts = start_core(mem_cfg(vec![0, 1, 2]), default_tok()).await;
     for _ in 0..2 {
-        let resp = reqwest::Client::new()
+        let resp = client()
             .post(format!("{}/v1/chat/completions", ts.base))
             .json(&chat_body(3))
             .send()

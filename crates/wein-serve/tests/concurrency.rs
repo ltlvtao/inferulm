@@ -62,7 +62,7 @@ async fn slow_consumer_does_not_block_fast_ones() {
     // 慢消费者：每帧之间停 80ms
     let slow_url = url.clone();
     let slow = tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = client();
         let resp = client
             .post(&slow_url)
             .json(&{
@@ -121,7 +121,7 @@ async fn server_state_clean_after_concurrent_load() {
         tokio::time::timeout(Duration::from_secs(30), h).await.unwrap().unwrap();
     }
     // 一轮并发后：单个请求依旧精确
-    let resp = reqwest::Client::new().post(&url).json(&chat_body(3)).send().await.unwrap();
+    let resp = client().post(&url).json(&chat_body(3)).send().await.unwrap();
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "Hello world");
     assert_eq!(ts.mock.cancelled_count(), 0, "全部自然结束，不应有取消");

@@ -9,6 +9,7 @@ mod common;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use common::client;
 use serde_json::{json, Value};
 use wein_engine::{CoreConfig, EngineCore};
 use wein_serve::{spawn_server, ChatMessage, ServeState, Tokenizer};
@@ -56,7 +57,7 @@ async fn start_tok(tok: TplTok) -> String {
 #[tokio::test]
 async fn cs1_template_output_is_the_engine_prompt() {
     let base = start_tok(TplTok { eos: None, fail: false }).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": "mock-model",
@@ -77,7 +78,7 @@ async fn cs1_template_output_is_the_engine_prompt() {
 #[tokio::test]
 async fn cs2_template_rejection_maps_to_400() {
     let base = start_tok(TplTok { eos: None, fail: true }).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": "mock-model",
@@ -99,7 +100,7 @@ async fn cs2_template_rejection_maps_to_400() {
 #[tokio::test]
 async fn cs3_eos_stops_generation_without_emitting() {
     let base = start_tok(TplTok { eos: Some(7), fail: false }).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": "mock-model",
@@ -121,7 +122,7 @@ async fn cs3_eos_stops_generation_without_emitting() {
 #[tokio::test]
 async fn cs4_completions_also_stop_at_eos() {
     let base = start_tok(TplTok { eos: Some(7), fail: false }).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{base}/v1/completions"))
         .json(&json!({
             "model": "mock-model",

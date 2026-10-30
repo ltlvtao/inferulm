@@ -17,6 +17,11 @@ fn arg(args: &[String], k: &str, d: &str) -> String {
         .unwrap_or_else(|| d.to_string())
 }
 
+/// 可选数值旗标（缺省 None）——覆盖类配置（如 --mix-cap）
+fn arg_opt(args: &[String], k: &str) -> Option<String> {
+    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+}
+
 /// HfTokenizer + ChatTemplate → serve Tokenizer 桥（组装在 cli 层——
 /// serve 不依赖 model，§2 单向）。组合合同由 q11/q12（wein-serve tests）
 /// 钉住，此处与之间构
@@ -122,7 +127,18 @@ fn main() {
                 }
             };
             let engine = EngineCore::spawn_with(
-                CoreConfig::scripted(vec![], Duration::ZERO),
+                {
+                    // --mix-cap N：混合步封顶覆盖（battery 调参用；默认走
+                    // SchedConfig::default 的 192）
+                    let mut cfg = CoreConfig::scripted(vec![], Duration::ZERO);
+                    if let Some(v) = arg_opt(&args, "--mix-cap") {
+                        cfg.sched.mix_cap = v.parse().unwrap_or_else(|_| {
+                            eprintln!("--mix-cap 须为非负整数：{v}");
+                            std::process::exit(1)
+                        });
+                    }
+                    cfg
+                },
                 Box::new(ex),
             )
             .0;

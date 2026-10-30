@@ -11,7 +11,7 @@ async fn natural_stop_yields_finish_reason_stop() {
     // 引擎在第 2 个 token 前自然停止（模拟 EOS）
     let script = MockScript { pieces: vec![0, 1, 2, 3], stop_at: Some(2), ..Default::default() };
     let ts = start(script, default_tok()).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&chat_body(10))
         .send()
@@ -29,7 +29,7 @@ async fn stop_param_truncates_content_and_cancels_engine() {
     let script = MockScript { pieces: vec![0, 1, 2, 3], ..Default::default() };
     let ts = start(script, tok).await;
 
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&json!({
             "model": "mock-model",
@@ -55,7 +55,7 @@ async fn stop_as_string_form_also_works() {
     let tok = MockTokenizer::from_texts(&["aa", "bb", "cc"]);
     let script = MockScript { pieces: vec![0, 1, 2], ..Default::default() };
     let ts = start(script, tok).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
         .json(&json!({
             "model": "mock-model",

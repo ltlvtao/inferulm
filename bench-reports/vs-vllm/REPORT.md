@@ -222,5 +222,40 @@ heuristic 时代单次）对 12.30 的对比被小形状择优翻转污染——
 时钟/地址状态），3 发协议中位数更优故保持。**gemm 段无布局可挖余量，
 大形状已处 cuBLASLt 该形状可达带**；后续吞吐杠杆只有 W8A8（权重流减半）。
 
+### 5.6 混合步封顶 mix_cap：p99 尖峰的调度侧解（2026-10-30 当日三续）
+
+§5.4 后满负荷 p99 66.1 vs vLLM 38.8 成唯一大差距项，任务清单首刀原定
+PIECEWISE 图档——**证伪**：① eager 与 FULL 图档 p99 完全相同（66.09/66.11）
+→ 尖峰非 launch 债；② `qwen_mixed_probe` T-谱（d=100 常驻 decode + 混合步
+T 扫描，GPU 独占）：24.33ms@T100 → 64.81ms@T512，~100µs/token 线性 →
+混合步计算受限。根因在调度：token_budget=512 把波次切换期 ~412 prefill
+token 与 ~100 decode 行塞进同一步，重步拖长全体 decode 行 ITL → p99；
+图分片救不了计算本体。
+
+**解法（wein-sched `mix_cap`，默认 192）**：批内有 decode 态请求 → 本步
+Σ(decode+prefill token) ≤ 192（decode 计入 cap）；纯 prefill 波不受限
+（TTFT 优先）；cap 被 decode 占满时 prefill 保底 `PREFILL_MIN=8`（仅
+slack==0 触发，保 T≤cap 严格不变量）。规划两相位：decode 全先落位
+（每 token 都是 ITL 进度），prefill 后切。CLI `--mix-cap N` 可调。
+cap 取舍：224 → p99 44.18 输 vLLM，192 定默认（ITL p99 主账）。
+
+battery-20261030-164027（图档满负荷 c=100）：ITL p50 22.90 / **p99 36.33**
+（旧 66.11，−45%）/ tps 3633（旧 3671，−1.0% 预算自选）/ TTFT p50 68.12
+（旧 109.63）/ TTFT p99 269.46（旧 183.6，prefill 排队后移的代价）。
+eager 满负荷：p50 24.74/p99 49.18/tps 3441.9/TTFT 68.50/264.77。
+轻载 c=4 图档 ITL 12.36/TTFT 41.14 带内无回归。
+
+对 vLLM c=100（§5.1）：ITL p50 22.90 vs 25.23、p99 36.33 vs 38.80、
+TTFT p50 68.12 vs 121.2、tps 3633 vs 3431 **全胜**；TTFT p99 269.46 vs
+228.4 落后（ITL 平稳换波次排队——预算自选，SLO 期可调）。
+
+oracle 复验：wein 侧重捕 + compare 4/5 精确同 + 1 既知近并列翻转
+（fibonacci `n-1`）+ chat 模板 11/11——调度重排不改单请求前向序，数值
+合同不受影响。测试：s10_mixed_step_cap_shields_decoders（两相位/cap
+不变量/切片不丢 token/下限触发）。wein-serve 39 测试全绿（**代理变量
+注入环境下**验收：测试 reqwest 全部改 `common::client()` no_proxy 直连，
+759b55d 事故复发面闭合）。PIECEWISE 从任务清单除名——其目标已由调度侧
+一步达成。
+
 外推边界声明：单卡 4090/WSL、Qwen3.5-4B dense、短上下文（~43 tok）、greedy、
 c≤128。长上下文（KV 流量改账 + wein T_MAX=512 限制）、多卡、MoE 不在此外推内。
