@@ -1672,9 +1672,10 @@ impl Executor for Qwen35Executor {
                 if nb == 0 || grid == 0 || (p + 1) % grid != 0 {
                     continue;
                 }
+                // nb <= blocks.len() 即该边界所在页已分配（防御：请求已不在）
                 let (row, blk) = match self.reqs.get(&id) {
-                    Some(st) if st.blocks.len() == nb => (st.row, st.blocks[nb - 1]),
-                    _ => continue, // 页未盖满（防御）或请求已不在
+                    Some(st) if st.blocks.len() >= nb => (st.row, st.blocks[nb - 1]),
+                    _ => continue,
                 };
                 let Some(slot) = self.acquire_slot() else {
                     continue; // 槽耗尽：降级无快照

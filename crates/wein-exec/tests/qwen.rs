@@ -494,3 +494,150 @@ fn qs5_snap_slot_exhaustion_recycles() {
     }
     assert!(hits >= 3, "驱逐须按 LRU 保最新条目（最新 5 中命中 {hits}）");
 }
+
+// ── qs6/qs7：Agent 形负载（多轮增长前缀 + 工具结果追加 + 多会话共享系统提示）
+//    ——前缀缓存的价值全在这里，块级用例（qs1-qs5）覆盖不到 ──
+
+/// 多轮会话增长：系统提示 + 用户问 → 助手输出 ‖ 工具结果 ‖ 新指示 逐轮追加
+/// （工具结果非模型生成，正是 Agent 的 prompt 形态）。断言命中落在已就绪
+/// 块界且随轮次加深，且**命中恢复后的续算与全量重放逐 token 位级一致**——
+/// 冷参考走抢占回滚（qs3 已钉：抢占=从 0 全量重放），两侧以同样 16-token
+/// 块驱动 ⇒ 产样本的步同形（末块余数在 hit 为 16 倍数时相同），位级可比
+#[test]
+fn qs6_agent_session_growth_hit_equals_replay() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let sys = tok.encode(
+        "You are a coding agent with access to tools: read_file, write_file, run_shell, search. \
+         Always inspect the relevant code before editing, keep changes minimal, and report exactly \
+         which files changed. Prefer small diffs, never delete user data, and ask before any \
+         destructive action. If a test fails, read the assertion message before guessing.",
+    );
+    let q1 = tok.encode("The parser rejects leading whitespace. Find the root cause and fix it.");
+    let tool = tok.encode(
+        "tool: read_file(path=\"parser.rs\") -> fn parse(input: &str) -> Result<Ast> { \
+         let s = input.trim_start_matches(' '); scan(s) }",
+    );
+    let q2 = tok.encode("Now apply the fix and run the test suite.");
+    let q3 = tok.encode("Summarize the diff in one line.");
+    let mut convo: Vec<u32> = sys.clone();
+    convo.extend_from_slice(&q1);
+    assert!(convo.len() > 64 && convo.len() % 16 != 0, "首轮 prompt 须跨多块且非整块（{}）", convo.len());
+    let (mut prev, mut last_hit, mut last_len) = (Vec::new(), 0usize, 0usize);
+    for turn in 1..=3u32 {
+        if turn > 1 {
+            convo.extend_from_slice(&prev); // 上一轮助手输出回到上下文
+            convo.extend_from_slice(&tool); // 工具结果（非模型生成）
+            convo.extend_from_slice(if turn == 2 { &q2 } else { &q3 });
+        }
+        let l = convo.len();
+        assert!(l <= 240, "第 {turn} 轮 prompt 须在 MAX_POS 内（{l}）");
+        let hit = ex.admitted(1, &convo);
+        assert_eq!(hit % 16, 0, "第 {turn} 轮命中须为整块（hit={hit}）");
+        assert!(hit < l, "命中边界须严格小于 prompt 长（hit={hit} l={l}）");
+        if turn == 1 {
+            assert_eq!(hit, 0, "首轮无共享前缀");
+        } else {
+            assert!(hit > last_hit, "会话增长 → 命中加深（{last_hit} → {hit}）");
+            assert!(hit >= last_len / 16 * 16, "上一轮已就绪的整块须全命中（hit={hit} last={last_len}）");
+        }
+        // 暖路径：从 hit 起 16-token 块驱动到末块（末块带采样），再 3 步 decode
+        let mut rem = l - hit;
+        while rem > 16 {
+            let _ = ex.step(&StepPlan { prefill: vec![(1, 16)], decode: vec![], batch: vec![] });
+            rem -= 16;
+        }
+        let t = ex.step(&StepPlan { prefill: vec![(1, rem)], decode: vec![1], batch: vec![] });
+        let mut warm = vec![t[0].1];
+        for _ in 0..3 {
+            let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+            warm.push(d[0].1);
+        }
+        // 冷参考：抢占回滚 → 从 0 逐块全量重放（同形）
+        ex.preempted(1);
+        let mut rem = l;
+        while rem > 16 {
+            let _ = ex.step(&StepPlan { prefill: vec![(1, 16)], decode: vec![], batch: vec![] });
+            rem -= 16;
+        }
+        let t = ex.step(&StepPlan { prefill: vec![(1, rem)], decode: vec![1], batch: vec![] });
+        let mut cold = vec![t[0].1];
+        for _ in 0..3 {
+            let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+            cold.push(d[0].1);
+        }
+        assert_eq!(warm, cold, "第 {turn} 轮：命中恢复 ≡ 全量重放（同形驱动，hit={hit}）");
+        prev = warm;
+        last_hit = hit;
+        last_len = l;
+        ex.retain(&[]); // 移交：本轮全部块（命中段 unpin、新段进树）
+    }
+}
+
+/// 多会话共享系统提示（Agent 部署的典型形态：同一 system + tools，不同问）：
+/// 系统提示段须整段命中；反复 admit/移交不得漏页漏槽——页池 512 页是硬上限，
+/// 记账漏一页就随轮次单调涨，故钉 pages_used 的稳态
+#[test]
+fn qs7_shared_system_prompt_many_sessions() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut sys = tok.encode(
+        "You are a coding agent with access to tools: read_file, write_file, run_shell, search. \
+         Always inspect the relevant code before editing, keep changes minimal, and report exactly \
+         which files changed. Prefer small diffs, never delete user data, and ask before any \
+         destructive action. If a test fails, read the assertion message before guessing.",
+    );
+    let blocks = sys.len() / 16;
+    sys.truncate(blocks * 16); // 系统提示整块对齐 → 命中深度可精确钉
+    assert!(blocks >= 4, "系统提示须跨多块（{}）", blocks);
+    let qs: Vec<Vec<u32>> = [
+        "Why does the parser reject leading whitespace?",
+        "Fix the failing test in ci/lint.rs",
+        "Add a regression test for the parser fix",
+        "Explain the diff to the user in two lines",
+    ]
+    .iter()
+    .map(|s| tok.encode(s))
+    .collect();
+    let mut steady: Option<usize> = None;
+    for round in 0..16u32 {
+        for (s, q) in qs.iter().enumerate() {
+            let id = (round as u64 * 8) + s as u64 + 1;
+            let mut p = sys.clone();
+            p.extend_from_slice(q);
+            let hit = ex.admitted(id, &p);
+            assert_eq!(hit % 16, 0, "命中须为整块（hit={hit}）");
+            // 首个请求（round 0 / 会话 0）建树时无前缀可命中；此后每个会话
+            // 都共享同一段系统提示，须整段命中
+            let shared_prefix = round > 0 || s > 0;
+            if shared_prefix {
+                assert!(hit >= blocks * 16, "第 {round} 轮会话 {s}：系统提示段须全命中（hit={hit}）");
+            }
+            let mut rem = p.len() - hit;
+            while rem > 16 {
+                let _ = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![], batch: vec![] });
+                rem -= 16;
+            }
+            let t = ex.step(&StepPlan { prefill: vec![(id, rem)], decode: vec![id], batch: vec![] });
+            assert_eq!(t.len(), 1, "每会话产出 1 token");
+            ex.retain(&[]);
+        }
+        let used = ex.pages_used();
+        eprintln!("[qs7] round {round}: pages_used={used}");
+        match steady {
+            // 首轮建树 + 次轮钉稳态；此后不许再涨（漏页/漏 unpin 会单调累积）
+            None => {}
+            Some(u) if round == 1 => {
+                assert_eq!(used, u, "第 2 轮页占用须与第 1 轮持平（round {round}）");
+            }
+            Some(u) => assert_eq!(used, u, "页占用稳态（round {round}: {used} vs {u}）"),
+        }
+        if round == 1 {
+            steady = Some(used);
+        }
+    }
+}
