@@ -850,6 +850,13 @@ pub struct GemmLt<'a> {
     pub(crate) lt: Box<crate::cuda::BlasLt<'a>>,
 }
 
+impl GemmLt<'_> {
+    /// gemm autotune 审计（诊断出口；见 `BlasLt::tune_report`）
+    pub fn tune_report(&self) -> Vec<crate::cuda::GemmTuneRecord> {
+        self.lt.tune_report()
+    }
+}
+
 impl GemmOp for GemmLt<'_> {
     fn run(&self, a: &DevBuf, b: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
         self.lt.gemm(a, b, c, m, n, k, stream)

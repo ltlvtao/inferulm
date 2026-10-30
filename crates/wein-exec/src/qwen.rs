@@ -417,6 +417,11 @@ impl Qwen35Executor {
         Self::open_with_tune(dir, &tune)
     }
 
+    /// gemm 调优审计（布局/选型 A/B 的判别仪器：每形状 chosen/best_ms）
+    pub fn gemm_tune_report(&self) -> Vec<wein_kernel::cuda::GemmTuneRecord> {
+        self.session.table().gemm.tune_report()
+    }
+
     fn open_with_tune(dir: &Path, tune_m: &[u32]) -> Result<Self, String> {
         let session = DeviceSession::open_tuned(tune_m)?;
         let gpu = session.gpu();

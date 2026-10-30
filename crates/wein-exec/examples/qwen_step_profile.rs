@@ -65,4 +65,13 @@ fn main() {
         println!("\n===== m={m}（{steps} 步，wall(含插桩) {wall_ms:.2} ms/步）=====");
         println!("{}", ex.step_profile_report().expect("插桩已由 example 激活"));
     }
+    // 调优审计：每形状 chosen/argmin/best_ms（布局 A/B 的选型判别——
+    // gemm 段漂移须先排除跨进程择优翻转）。末尾打——记录在首次调用后才有。
+    if std::env::var("WEIN_TUNE_DUMP").is_ok() {
+        for r in ex.gemm_tune_report() {
+            if r.candidates > 0 {
+                println!("tune m={} n={} k={} wt={} chosen={} argmin={} best={:.4}ms", r.m, r.n, r.k, r.wt, r.chosen, r.argmin, r.best_ms);
+            }
+        }
+    }
 }
