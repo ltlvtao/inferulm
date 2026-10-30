@@ -146,3 +146,56 @@ W5 的模板渲染获得生产级外部确认：同一 `chat_template.jinja`、�
    CUDACXX+PATH 揭面具；
 4. 真错误现身：flashinfer JIT 的 CCCL 与 nvcc 13.4↔torch cu130 版本错配 →
    `VLLM_USE_FLASHINFER_SAMPLER=0` 绕开（贪心负载无行为差）。
+
+## 5. c=100 满负荷补测 + 流量账（2026-10-30，wein@`c721cbd`）——修正 ×2.9 外推
+
+§1 只实测到 c=16，"对 vLLM ×2.9@c=100" 是按权重流外推的。本节补齐实测（同尺子
+wein-bench / 同卡同权重 / GPU 互斥串行；JSON 落 `../vs-vllm-vllm/mid-c32.json`、
+`full-c100.json`，c=16 复测 `mid-c16-rerun.json`），并给每步 DRAM 流量账。
+
+### 5.1 实测（c=100/n=500/mt=32 与 battery L3q 满负荷同 profile）
+
+| 端 | ITL p50/p99 (ms) | TTFT p50 (ms) | tps |
+|---|---|---|---|
+| wein eager（battery-124320） | 27.26 / 80.88 | 160.9 | 3022 |
+| wein 图档（battery-124320） | 25.84 / — | 127.2 | 3183 |
+| **vLLM 0.32.0** | **25.23 / 38.80** | **121.2** | **3431** |
+
+**真实差距 ×1.08（ITL p50）**，不是 ×2.9。c=16→32→100 的 vLLM ITL 曲线
+13.0→15.4→25.2ms：边际 ~145µs/行——**线性注意力状态池流量随批线性放大**，
+外推假设"ITL 停在权重流 ~12ms"不成立。尾部与 TTFT 仍是 vLLM 好
+（p99 38.8 vs 80.9；TTFT 121 vs 161——wein 混合步全 eager，PIECEWISE 刀的靶）。
+
+### 5.2 每步 DRAM 流量账（c=100，短上下文 ~43 tok，4090 峰值 1008GB/s）
+
+| 项 | wein | vLLM | 依据 |
+|---|---|---|---|
+| 权重 bf16（含 lm_head 1.27GB） | 8.4GB | 8.4GB | |
+| 线性注意力状态 r+w | **5.15GB**（bf16 池） | **10.3GB**（**f32**） | config `mamba_ssm_dtype: float32` 被 vLLM 遵守（`vllm/model_executor/layers/mamba/mamba_utils.py:98-110`）；状态 [32,128,128]/层/序列，decode 每步全量读+原地全量写（`third_party/flash_linear_attention/ops/fused_recurrent.py:344-497`，grid (NV, B·HV)） |
+| conv 状态 + align 快照拷贝 | 0.12GB | 0.5-0.8GB | vLLM mamba 前缀缓存（align 模式，block_size=16 边界快照）默认开 |
+| KV/激活/logits | ~0.4GB | ~0.4GB | |
+| **合计** | **~14.1GB** | **~19.7GB** | |
+
+wein 搬的字节少 30%，但实测达成效率 521GB/s vs vLLM 773GB/s——**净平价**。
+差距是 kernel 效率工程，不是物理：gemm 段 683 vs ~800GB/s（布局刀，−1.5ms）、
+delta 段 398GB/s（kd=128 行驻寄存器 4 块/SM 占用率代价，−3.5~5.5ms——
+**占用率刀，已提上顺位**）。
+
+### 5.3 vLLM 未打的牌（评估"好多少"时须计入）
+
+1. **`--mamba-ssm-cache-dtype bfloat16`**：一个 flag 状态流量减半
+   （`models/config.py:944-954`）→ 他们 ~18ms/~4500 tps；数值验证他们没做过
+   （wein o25 已钉漂移预算 rel2≈1 bf16 量子，这张考卷 wein 先交了）。
+2. **MTP 投机解码**：config `mtp_num_hidden_layers=1`，vLLM 有现成融合 kernel
+   （`fused_gdn_decode_post_conv_mtp`）——开了可能 ×1.4-1.6。wein 路线图暂无
+   投机解码条目（**战略缺口，已入 open questions**；行分账状态池做 draft/verify
+   回滚有天然优势：状态快照=行拷贝）。
+3. **W8A8/fp8 量化 checkpoint**：vLLM 走 GEMM 层量化需序列化 checkpoint；
+   wein W8A8 是 v1 硬需求开箱即用。
+
+**终局判断（本卡/本模型/短上下文/纯 decode 吞吐轴）**：双方出完牌后平价 ±10%。
+wein 的确定性优势在 W8A8 开箱、状态 bf16 已验证、单静态二进制，以及**昇腾轴**
+（vllm-ascend 对 GDN 混合架构支持远未到位——M1 见真章）。
+
+外推边界声明：单卡 4090/WSL、Qwen3.5-4B dense、短上下文（~43 tok）、greedy、
+c≤128。长上下文（KV 流量改账 + wein T_MAX=512 限制）、多卡、MoE 不在此外推内。
