@@ -54,6 +54,7 @@ pub struct Driver {
     cu_memset_d8: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResult,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResult,
+    cu_stream_wait_event: unsafe extern "C" fn(*mut c_void, *mut c_void, u32) -> CuResult,
     cu_event_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult,
     cu_event_elapsed_time:
@@ -114,6 +115,7 @@ impl Driver {
                 cu_memset_d8: try_get(&lib, &["cuMemsetD8Async"])?,
                 cu_stream_create: try_get(&lib, &["cuStreamCreate"])?,
                 cu_stream_synchronize: try_get(&lib, &["cuStreamSynchronize"])?,
+                cu_stream_wait_event: try_get(&lib, &["cuStreamWaitEvent"])?,
                 cu_event_create: try_get(&lib, &["cuEventCreate"])?,
                 cu_event_record: try_get(&lib, &["cuEventRecord"])?,
                 cu_event_elapsed_time: try_get(&lib, &["cuEventElapsedTime"])?,
@@ -247,6 +249,15 @@ impl Driver {
     }
     pub(crate) fn stream_synchronize(&self, s: *mut c_void) -> Result<(), CuError> {
         self.check(unsafe { (self.cu_stream_synchronize)(s) }, "cuStreamSynchronize")
+    }
+    /// 流间依赖边：s 排队等待事件 e（flags=0）。fork/join 重叠的 join 原语
+    pub(crate) fn stream_wait_event(
+        &self,
+        s: *mut c_void,
+        e: *mut c_void,
+        flags: u32,
+    ) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_stream_wait_event)(s, e, flags) }, "cuStreamWaitEvent")
     }
     /// 计时事件（CU_EVENT_DEFAULT；同一事件可重复 record——池化复用）
     pub(crate) fn event_create(&self) -> Result<*mut c_void, CuError> {

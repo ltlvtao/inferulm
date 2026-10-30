@@ -185,6 +185,12 @@ impl Stream<'_> {
         self.drv.stream_synchronize(self.handle).expect("cuStreamSynchronize");
     }
 
+    /// 流间 join：本流后续工作排队等待事件完成（跨流依赖边）。
+    /// fork/join 重叠的根基；图捕获区间内合法——依赖边烤进图拓扑
+    pub fn wait_event(&self, e: &Event) {
+        self.drv.stream_wait_event(self.handle, e.handle, 0).expect("cuStreamWaitEvent");
+    }
+
     /// 进入流捕获：此后的 launch 序列录制进图（THREAD_LOCAL 模式）。
     /// 区间内隐式同步/分配在 debug 构建直接 panic（§4 安全规则）
     pub fn begin_capture(&self) {

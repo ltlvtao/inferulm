@@ -13,6 +13,10 @@
 //!         回放结果对 f64 参考容差对拍（g 系准则——图不改变数值合同）
 //! - gr5 · 捕获中隐式同步守卫：sync/回读/分配在捕获区间内 debug 直接
 //!         panic（ZoS forbid_cuda_sync 的 Rust 化——意外同步是图污染源）
+//! - gr6 · 双流 fork/join：wait_event 跨流依赖边的位一致 + 跨流图捕获
+//!         （s1 经事件 join 进 s0 的捕获 → 拓扑含跨流边，回放位一致）。
+//!         机制面来自 overlap probe（§7：4090 DRAM 单墙，重叠证伪）——
+//!         昇腾/多墙设备走重叠时此路已验证
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use wein_kernel::cuda::Gpu;
@@ -277,4 +281,73 @@ fn gr5_capture_forbids_implicit_sync() {
     stream.sync();
     let _ = t.rms_norm.name(); // table 保活
     let _ = (&dx, &dw);
+}
+
+/// gr6 · 双流 fork/join：wait_event 跨流依赖边的位一致 + 跨流图捕获。
+/// 直发侧 s1 经事件等 s0 的 norm，再跑 silu——依赖边断裂会读到未初始化
+/// 显存（位错）；图侧 s1 经同一事件模式 join 进 s0 的捕获区间，跨流边
+/// 烤进拓扑，回放与串行位一致
+#[test]
+fn gr6_dual_stream_fork_join() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let s0 = gpu.stream();
+    let s1 = gpu.stream();
+    let t = table(&gpu);
+    let (rows, hidden) = (4u32, 2048u32);
+    let x: Vec<u16> = (0..rows as usize * hidden as usize)
+        .map(|i| reference::f32_to_bf16(reference::splitmix_f32(i as u64 ^ 0xc1)))
+        .collect();
+    let w: Vec<u16> = (0..hidden as usize)
+        .map(|i| reference::f32_to_bf16(reference::splitmix_f32(i as u64 ^ 0xc2)))
+        .collect();
+
+    // 串行参考（单流）
+    let (dx, dw, d1, d2) = (
+        gpu.alloc_from_slice(&x),
+        gpu.alloc_from_slice(&w),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+    );
+    t.rms_norm.run(&dx, &dw, &d1, rows, hidden, 1e-6, &s0);
+    t.silu.run(&d1, &d2, rows * hidden, &s0);
+    s0.sync();
+    let expect = d2.read_to_vec::<u16>();
+
+    // fork/join 直发：norm@s0 → ev → silu@s1（d1 未初始化——抢跑即位错）
+    let (fx, fw, f1, f2) = (
+        gpu.alloc_from_slice(&x),
+        gpu.alloc_from_slice(&w),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+    );
+    t.rms_norm.run(&fx, &fw, &f1, rows, hidden, 1e-6, &s0);
+    let ev = gpu.event();
+    ev.record_on(&s0);
+    s1.wait_event(&ev);
+    t.silu.run(&f1, &f2, rows * hidden, &s1);
+    s1.sync();
+    assert_eq!(f2.read_to_vec::<u16>(), expect, "fork/join 双流须与串行位一致");
+
+    // fork/join 图捕获：跨流边入拓扑，回放位一致
+    let (gx, gw, g1, g2) = (
+        gpu.alloc_from_slice(&x),
+        gpu.alloc_from_slice(&w),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+        gpu.alloc_bytes(rows as usize * hidden as usize * 2),
+    );
+    s0.begin_capture();
+    t.rms_norm.run(&gx, &gw, &g1, rows, hidden, 1e-6, &s0);
+    let fev = gpu.event();
+    fev.record_on(&s0); // fork 点
+    s1.wait_event(&fev); // s1 join 进捕获
+    t.silu.run(&g1, &g2, rows * hidden, &s1);
+    let jev = gpu.event();
+    jev.record_on(&s1); // join 回 s0
+    s0.wait_event(&jev);
+    let graph = s0.end_capture();
+    let exec = graph.instantiate();
+    exec.launch(&s0);
+    s0.sync();
+    assert_eq!(g2.read_to_vec::<u16>(), expect, "跨流图回放须与串行位一致");
 }
