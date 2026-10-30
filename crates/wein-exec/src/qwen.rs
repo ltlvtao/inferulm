@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 static TRACE_STEP: AtomicU32 = AtomicU32::new(0);
 
 use wein_engine::Executor;
+use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
     AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetOp, EmbedOp, GemmOp, KvScatterOp,
@@ -39,6 +40,7 @@ use wein_kernel::ops::{
 };
 use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
+use wein_memory::radix::RadixCache;
 use wein_model::{LayerType, Qwen35Config, WeightStore};
 use wein_sched::{ReqId, StepPlan};
 
@@ -53,6 +55,11 @@ const MAX_POS: usize = 256;
 /// KV 页池页数（全注意力层共用一个池容量）
 const NUM_PAGES: u32 = 512;
 const BLOCK: u32 = 16;
+/// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
+/// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
+/// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
+/// 都要有槽才可能被命中——单活跃槽只保末边界时祖先无槽、命中恒 0）
+const SNAP_SLOTS: usize = 64;
 /// linear 侧 q/k l2norm eps（FLA 对齐，modeling l2norm）
 const L2_EPS: f32 = 1e-6;
 
@@ -134,6 +141,11 @@ struct ReqState {
     forwarded: usize,
     row: u32,
     blocks: Vec<u32>,
+    /// blocks[..shared] 是 radix 命中来的共享块（重放/驱逐语义分叉点）
+    shared: usize,
+    /// 活跃期落过的边界快照 (块, 槽)——每个栅格边界一份，retain 时逐块
+    /// 移交（块进树则槽随块，否则槽回池）；抢占重放则全数作废
+    snaps: Vec<(u32, u32)>,
 }
 
 /// FULL_DECODE 图档（§7；机制由 w 系在 toy 钉死，此处为 32 层真模型装配）。
@@ -380,6 +392,21 @@ pub struct Qwen35Executor {
     scr: ScrDev,
     cfg: Qwen35Config,
     pool: BlockPool,
+    /// 前缀缓存索引（token 块 → KV 页；与 pool 联动 pin/rc）
+    radix: RadixCache,
+    /// 快照池：24 层 lin + conv 的槽化副本（radix 命中恢复用——位拷贝无重算）
+    snap_lin: Vec<DevBuf<'static>>,
+    snap_conv: Vec<DevBuf<'static>>,
+    snap_free: Vec<u32>,
+    /// 块 → 槽（快照挂块：命中截断到有槽祖先；驱逐联动回收）
+    snap_of_block: HashMap<u32, u32>,
+    /// 前缀缓存总开关（WEIN_RADIX=0 关——A/B 对比用）
+    radix_on: bool,
+    /// 命中/移交诊断打印（WEIN_RADIX_DEBUG=1）
+    radix_dbg: bool,
+    /// decode 侧快照栅格（0 = 不落）。decode 边界快照只在"共享同一续写"
+    /// 场景有用（多轮对话的下一轮 prompt 含前轮生成 token），故默认稀疏
+    snap_grid_dec: usize,
     reqs: HashMap<ReqId, ReqState>,
     bt_host: Vec<u32>,
     next_row: u32,
@@ -552,6 +579,38 @@ impl Qwen35Executor {
         } else {
             None
         };
+        // 前缀缓存快照池（WEIN_RADIX=0 关：不分配、三钩子全跳过）。
+        // 池深跟状态池实际层数（lin_state=24 linear 层，非 n_layers=32）
+        let radix_on = std::env::var("WEIN_RADIX").map_or(true, |v| v != "0");
+        let radix_dbg = std::env::var("WEIN_RADIX_DEBUG").is_ok();
+        // decode 栅格默认 64（4 块）——快照 25MB/行/份 ≈ 0.23ms，栅格 16 时
+        // 满负荷每步 +1.4ms（实测）；decode 侧命中场景远少于 prompt 侧
+        let dgrid = std::env::var("WEIN_SNAP_GRID_DEC")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4 * BLOCK as usize);
+        let snap_grid_dec = dgrid.div_ceil(BLOCK as usize) * BLOCK as usize;
+        let (snap_lin, snap_conv, snap_free) = if radix_on {
+            let mut sl = Vec::with_capacity(lin_state.len());
+            let mut sc = Vec::with_capacity(conv_state.len());
+            for _ in 0..lin_state.len() {
+                let l: DevBuf<'static> = pin!(gpu.alloc_bytes(lin_row * SNAP_SLOTS));
+                sl.push(l);
+            }
+            for _ in 0..conv_state.len() {
+                let c: DevBuf<'static> = pin!(gpu.alloc_bytes(conv_row * SNAP_SLOTS));
+                sc.push(c);
+            }
+            for s in &sl {
+                s.zero_on(session.stream());
+            }
+            for s in &sc {
+                s.zero_on(session.stream());
+            }
+            (sl, sc, (0..SNAP_SLOTS as u32).rev().collect())
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         Ok(Qwen35Executor {
             layers,
@@ -566,6 +625,14 @@ impl Qwen35Executor {
             scr,
             cfg,
             pool: BlockPool::new(NUM_PAGES, 0.5),
+            radix: RadixCache::new(),
+            snap_lin,
+            snap_conv,
+            snap_free,
+            snap_of_block: HashMap::new(),
+            radix_on,
+            radix_dbg,
+            snap_grid_dec,
             reqs: HashMap::new(),
             bt_host: vec![0u32; MAX_ROWS * bpr_of()],
             next_row: 0,
@@ -811,17 +878,16 @@ impl Qwen35Executor {
     /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）
     fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) {
         let need = upto_pos / BLOCK as usize + 1;
-        let row = match self.reqs.get_mut(&id) {
-            Some(st) if st.blocks.len() < need => st.row as usize,
-            _ => return,
-        };
+        if !matches!(self.reqs.get(&id), Some(st) if st.blocks.len() < need) {
+            return;
+        }
         let bpr = self.bpr;
+        let row = self.reqs.get(&id).unwrap().row as usize;
+        let have = self.reqs.get(&id).unwrap().blocks.len();
+        // 先攒本地（alloc_page 可能驱逐 radix，须避开 st 的借用）
+        let news: Vec<u32> = (have..need).map(|_| self.alloc_page()).collect();
         let st = self.reqs.get_mut(&id).unwrap();
-        while st.blocks.len() < need {
-            let b = self
-                .pool
-                .alloc()
-                .unwrap_or_else(|| panic!("页池耗尽（{} 页）——I1 配置须保证容量", self.pool.total()));
+        for b in news {
             self.bt_host[row * bpr + st.blocks.len()] = b;
             st.blocks.push(b);
         }
@@ -837,6 +903,86 @@ impl Qwen35Executor {
         for s in &self.conv_state {
             s.zero_range_on(off * cr, cr, stream);
         }
+    }
+
+    // ── radix 前缀缓存（快照原语：行↔槽位 D2D 位拷贝，无重算——
+    //     命中恢复后的递推与"从未中断"逐位一致是本刀的数值合同）──
+
+    /// 行状态 → 快照槽的段表（流序：调用方在本步前向 kernel 之后一批发行）。
+    /// 每槽 24 lin + 24 conv 段——逐段 async memcpy 的驱动调用开销在 WSL
+    /// 约 4µs/次，每步多次跨块会放大成 ms 级；段表攒齐后一次 cuMemcpyBatchAsync
+    fn push_snapshot_ops(&self, row: u32, slot: u32, ops: &mut Vec<CuBatchOp>) {
+        let (ro, so) = (row as usize * self.lin_row, slot as usize * self.lin_row);
+        for (s, t) in self.snap_lin.iter().zip(&self.lin_state) {
+            ops.push(CuBatchOp {
+                dst: s.device_ptr() + so as u64,
+                src: t.device_ptr() + ro as u64,
+                size: self.lin_row,
+            });
+        }
+        let (ro, so) = (row as usize * self.conv_row, slot as usize * self.conv_row);
+        for (s, t) in self.snap_conv.iter().zip(&self.conv_state) {
+            ops.push(CuBatchOp {
+                dst: s.device_ptr() + so as u64,
+                src: t.device_ptr() + ro as u64,
+                size: self.conv_row,
+            });
+        }
+    }
+
+    /// 快照槽 → 行状态（radix 命中恢复，一次批量 D2D）
+    fn restore_row_snapshot(&self, row: u32, slot: u32) {
+        let mut ops: Vec<CuBatchOp> =
+            Vec::with_capacity(self.lin_state.len() + self.conv_state.len());
+        let (ro, so) = (row as usize * self.lin_row, slot as usize * self.lin_row);
+        for (t, s) in self.lin_state.iter().zip(&self.snap_lin) {
+            ops.push(CuBatchOp {
+                dst: t.device_ptr() + ro as u64,
+                src: s.device_ptr() + so as u64,
+                size: self.lin_row,
+            });
+        }
+        let (ro, so) = (row as usize * self.conv_row, slot as usize * self.conv_row);
+        for (t, s) in self.conv_state.iter().zip(&self.snap_conv) {
+            ops.push(CuBatchOp {
+                dst: t.device_ptr() + ro as u64,
+                src: s.device_ptr() + so as u64,
+                size: self.conv_row,
+            });
+        }
+        self.session.stream().memcpy_batch(&ops);
+    }
+
+    /// 借槽（耗尽时 LRU 驱逐 radix 腾槽；无可驱逐返回 None——本请求降级无快照）
+    fn acquire_slot(&mut self) -> Option<u32> {
+        while self.snap_free.is_empty() {
+            let freed = self.radix.evict_blocks(&mut self.pool, 1);
+            if freed.is_empty() {
+                return None;
+            }
+            for b in freed {
+                if let Some(s) = self.snap_of_block.remove(&b) {
+                    self.snap_free.push(s);
+                }
+            }
+        }
+        self.snap_free.pop()
+    }
+
+    /// 页分配（耗尽时 LRU 驱逐 radix 腾页——槽随块联动回收）
+    fn alloc_page(&mut self) -> u32 {
+        if self.pool.free_now() == 0 {
+            let freed = self.radix.evict_blocks(&mut self.pool, 8);
+            for b in freed {
+                if let Some(s) = self.snap_of_block.remove(&b) {
+                    self.snap_free.push(s);
+                }
+            }
+            self.pool.recycle();
+        }
+        self.pool
+            .alloc()
+            .unwrap_or_else(|| panic!("页池耗尽（{} 页）——I1 配置须保证容量", self.pool.total()))
     }
 
     /// 批前向 + 设备端采样。rows: (块表行, token, 位置)；samples: 采样行
@@ -1352,7 +1498,17 @@ impl Executor for Qwen35Executor {
         self.row_capacity as usize
     }
 
-    fn admitted(&mut self, id: ReqId, prompt: &[u32]) {
+    /// 块边界（= 快照检查点/前缀共享粒度）。radix 关时上报 1：调度账与
+    /// 旧版逐位一致（A/B 基线）
+    fn prefix_align(&self) -> usize {
+        if self.radix_on {
+            BLOCK as usize
+        } else {
+            1
+        }
+    }
+
+    fn admitted(&mut self, id: ReqId, prompt: &[u32]) -> usize {
         assert!(
             prompt.iter().all(|&t| t < self.cfg.vocab_size),
             "token 越界（vocab {}）",
@@ -1369,7 +1525,61 @@ impl Executor for Qwen35Executor {
             self.next_row += 1;
             r
         });
-        self.reqs.insert(id, ReqState { seq, forwarded: 0, row, blocks: Vec::new() });
+        // radix 前缀缓存命中：最长匹配后截断到有快照槽的祖先（无槽尾块
+        // 不共享——恢复点之后的重算覆盖写会以 ulp 漂移污染共享页），
+        // 槽→行状态恢复 + 块表继承 + 前向游标前移。边界还须严格小于
+        // seq.len()：恢复到 prompt 末尾 = 无 token 可喂 = 无采样位
+        // （vLLM 同款"末 token 重算"规则——精确块对齐 prompt 不命中）
+        let mut blocks = Vec::new();
+        let mut shared = 0usize;
+        if self.radix_on {
+            let m = self.radix.match_prefix(&mut self.pool, &seq);
+            if self.radix_dbg {
+                eprintln!(
+                    "[radix] match blocks={} tokens={} seq={} snap_keys={:?}",
+                    m.blocks.len(),
+                    m.tokens,
+                    seq.len(),
+                    self.snap_of_block.keys().take(8).collect::<Vec<_>>()
+                );
+            }
+            if !m.blocks.is_empty() {
+                let keep = (0..m.blocks.len())
+                    .rev()
+                    .find(|&i| {
+                        ((i + 1) * BLOCK as usize) < seq.len()
+                            && self.snap_of_block.contains_key(&m.blocks[i])
+                    })
+                    .map_or(0, |i| i + 1);
+                if keep < m.blocks.len() {
+                    self.radix.unpin_range(&mut self.pool, &seq, keep, m.blocks.len());
+                }
+                if keep > 0 {
+                    let slot = self.snap_of_block[&m.blocks[keep - 1]];
+                    self.restore_row_snapshot(row, slot);
+                    let base = row as usize * self.bpr;
+                    for (j, &b) in m.blocks[..keep].iter().enumerate() {
+                        self.bt_host[base + j] = b;
+                    }
+                    blocks = m.blocks[..keep].to_vec();
+                    shared = keep;
+                }
+            }
+        }
+        if self.radix_dbg {
+            eprintln!(
+                "[radix] admit seq={} keep_blocks={} hit_tokens={}",
+                seq.len(),
+                shared,
+                shared * BLOCK as usize
+            );
+        }
+        let forwarded = shared * BLOCK as usize;
+        self.reqs.insert(
+            id,
+            ReqState { seq, forwarded, row, blocks, shared, snaps: Vec::new() },
+        );
+        forwarded
     }
 
     fn step(&mut self, plan: &StepPlan) -> Vec<(ReqId, u32)> {
@@ -1378,6 +1588,8 @@ impl Executor for Qwen35Executor {
             row: u32,
             tok: u32,
             pos: u32,
+            /// 该行是 prefill（prompt）token——决定用哪条快照栅格
+            pref: bool,
         }
         let mut batch: Vec<RowIn> = Vec::new();
         let mut samples: Vec<(ReqId, usize)> = Vec::new();
@@ -1392,6 +1604,7 @@ impl Executor for Qwen35Executor {
                     row: st.row,
                     tok: st.seq[start + j],
                     pos: (start + j) as u32,
+                    pref: true,
                 });
             }
             st.forwarded += take;
@@ -1407,7 +1620,13 @@ impl Executor for Qwen35Executor {
             let Some(st) = self.reqs.get_mut(&id) else { continue };
             if st.forwarded < st.seq.len() {
                 let pos = st.forwarded;
-                batch.push(RowIn { id, row: st.row, tok: st.seq[pos], pos: pos as u32 });
+                batch.push(RowIn {
+                    id,
+                    row: st.row,
+                    tok: st.seq[pos],
+                    pos: pos as u32,
+                    pref: false,
+                });
                 st.forwarded += 1;
                 samples.push((id, batch.len() - 1));
             }
@@ -1429,6 +1648,51 @@ impl Executor for Qwen35Executor {
         let rows: Vec<(u32, u32, u32)> = batch.iter().map(|r| (r.row, r.tok, r.pos)).collect();
         let sample_rows: Vec<u32> = samples.iter().map(|s| s.1 as u32).collect();
         let toks = self.forward_rows(&rows, &sample_rows, plan.prefill.is_empty());
+        // 边界快照：本步把行推过硬栅格边界时落一份位拷贝（radix 命中恢复
+        // 点；每请求逐边界各借一槽、完成时随块移交）。流序：批
+        // 量 memcpy 排在前向 kernel 之后，读到的是落定状态；全步段表攒齐
+        // 一次发行（逐段 async 在 WSL 约 4µs/次驱动开销）。栅格按相位分：
+        // prompt 侧 = BLOCK（命中粒度 = 块），decode 侧默认 64（快照 25MB/
+        // 行/份，16 栅格在 c=100 满负荷 +1.4ms/步，decode 命中场景稀疏）
+        if self.radix_on {
+            let mut last_pos: HashMap<ReqId, (usize, bool)> = HashMap::new();
+            for r in &batch {
+                let e = last_pos.entry(r.id).or_insert((0, r.pref));
+                if r.pos as usize >= e.0 {
+                    *e = (r.pos as usize, r.pref);
+                }
+            }
+            // 槽位决策先做完（耗尽驱逐会动 radix/snap_free），再攒段表
+            let mut snaps: Vec<(u32, u32)> = Vec::new();
+            for (id, (p, pref)) in last_pos {
+                let nb = (p + 1) / BLOCK as usize;
+                // prompt 侧恒按 BLOCK（块边界才可共享/可恢复；密度由调度
+                // 侧 chunk 对齐到块边界决定）；decode 侧按 snap_grid_dec
+                let grid = if pref { BLOCK as usize } else { self.snap_grid_dec };
+                if nb == 0 || grid == 0 || (p + 1) % grid != 0 {
+                    continue;
+                }
+                let (row, blk) = match self.reqs.get(&id) {
+                    Some(st) if st.blocks.len() == nb => (st.row, st.blocks[nb - 1]),
+                    _ => continue, // 页未盖满（防御）或请求已不在
+                };
+                let Some(slot) = self.acquire_slot() else {
+                    continue; // 槽耗尽：降级无快照
+                };
+                if let Some(st) = self.reqs.get_mut(&id) {
+                    st.snaps.push((blk, slot));
+                }
+                snaps.push((row, slot));
+            }
+            if !snaps.is_empty() {
+                let per = self.snap_lin.len() + self.snap_conv.len();
+                let mut ops: Vec<CuBatchOp> = Vec::with_capacity(snaps.len() * per);
+                for (row, slot) in snaps {
+                    self.push_snapshot_ops(row, slot, &mut ops);
+                }
+                self.session.stream().memcpy_batch(&ops);
+            }
+        }
         let mut out = Vec::new();
         for ((id, _), tok) in samples.iter().zip(toks) {
             if let Some(st) = self.reqs.get_mut(id) {
@@ -1445,10 +1709,60 @@ impl Executor for Qwen35Executor {
             self.reqs.keys().copied().filter(|k| !active.contains(k)).collect();
         for id in gone {
             if let Some(st) = self.reqs.remove(&id) {
+                // 前缀缓存移交：本请求写过的完整私有块串挂 radix（所有权
+                // 转移，rc 不变）；沿途边界快照随块挂（槽内容 = 该块末的
+                // 位拷贝——恢复点与共享前缀严格对齐才有效）
+                let full = (st.forwarded / BLOCK as usize).min(st.blocks.len());
+                let shared = st.shared.min(full);
+                // 逐块移交：块进树则槽随块（snap_of_block），未进树/冗余段的
+                // 槽回池。多槽是常态——prompt 侧每个 chunk 尾各一份
+                let mut kept: Vec<u32> = Vec::new();
+                if self.radix_on && full > shared {
+                    let tok_end = full * BLOCK as usize;
+                    // 树既有覆盖深度（>= shared：命中段被 pin 不可逐）。
+                    // [shared..d) 私有块与树重叠 = 冗余页，释放；只把分叉
+                    // 后新段 [d..full) 交 insert（blocks 契约 = 分叉点对齐）
+                    let d = self.radix.coverage(&st.seq[..tok_end]);
+                    debug_assert!(d >= shared, "命中段被 pin，覆盖不可能更浅");
+                    for &b in &st.blocks[shared..d] {
+                        self.pool.release(b);
+                    }
+                    if self.radix_dbg {
+                        eprintln!(
+                            "[radix] retain seq={} fwd={} full={} shared={} cover={} snaps={:?}",
+                            st.seq.len(),
+                            st.forwarded,
+                            full,
+                            shared,
+                            d,
+                            st.snaps
+                        );
+                    }
+                    if d < full {
+                        kept = st.blocks[d..full].to_vec();
+                        self.radix.insert(&st.seq[..tok_end], &kept);
+                    }
+                }
+                for &(b, slot) in &st.snaps {
+                    if kept.contains(&b) {
+                        self.snap_of_block.insert(b, slot);
+                    } else {
+                        self.snap_free.push(slot);
+                    }
+                }
+                // 页记账：命中共享块 unpin（请求份释放）；已移交私有块保留
+                // （radix 份）；未移交的完整块与部分尾块 release。
+                // radix 关闭态 shared 恒 0 → 全量 release = 旧语义
+                if self.radix_on && shared > 0 {
+                    self.radix.unpin(&mut self.pool, &st.seq, shared);
+                }
+                let released_from = if self.radix_on { full } else { 0 };
+                for &b in &st.blocks[released_from..] {
+                    self.pool.release(b);
+                }
                 let base = st.row as usize * self.bpr;
-                for (j, b) in st.blocks.iter().enumerate() {
+                for j in 0..st.blocks.len() {
                     self.bt_host[base + j] = 0;
-                    self.pool.release(*b);
                 }
                 self.zero_row_state(st.row, stream); // 回收行状态零化（q10 钉）
                 self.free_rows.push(st.row);
@@ -1458,9 +1772,29 @@ impl Executor for Qwen35Executor {
     }
 
     fn preempted(&mut self, id: ReqId) {
-        let stream = self.session.stream();
-        if let Some(st) = self.reqs.get(&id) {
+        if let Some(st) = self.reqs.get_mut(&id) {
             let row = st.row;
+            // 快照槽全数作废回池（行即将零化；重放重新落槽）
+            for (_, slot) in st.snaps.drain(..) {
+                self.snap_free.push(slot);
+            }
+            // 去共享：命中块换新私有页——重放覆盖写有 ulp 漂移（跨批
+            // 形状 GEMM algo 差），共享页不可重写（污染缓存/他人）
+            let shared = st.shared;
+            if self.radix_on && shared > 0 {
+                let head: Vec<u32> = st.seq[..shared * BLOCK as usize].to_vec();
+                self.radix.unpin(&mut self.pool, &head, shared);
+                let bpr = self.bpr;
+                let base = row as usize * bpr;
+                let news: Vec<u32> = (0..shared).map(|_| self.alloc_page()).collect();
+                let st2 = self.reqs.get_mut(&id).unwrap();
+                for (j, b) in news.into_iter().enumerate() {
+                    self.bt_host[base + j] = b;
+                    st2.blocks[j] = b;
+                }
+                st2.shared = 0;
+            }
+            let stream = self.session.stream();
             self.zero_row_state(row, stream); // 重放从 pos 0 起步：递推状态必须归零
             self.reqs.get_mut(&id).unwrap().forwarded = 0;
         }

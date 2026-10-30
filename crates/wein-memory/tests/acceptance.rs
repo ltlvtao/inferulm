@@ -177,6 +177,23 @@ mod m5_radix {
         assert_eq!(cache.match_prefix(&mut pool, &[1, 2, 3, 4]).blocks.len(), 2);
         assert_eq!(cache.match_prefix(&mut pool, &[1, 2, 8, 8]).tokens, 2, "分叉后只共享 [1,2]");
     }
+
+    /// m5c · 同首 token 不同块并存：子节点按整块内容索引。首 token 单键会
+    /// 让后插的链把先插的覆盖掉（另一条链的块泄漏且永不命中）——chat 模板
+    /// 让所有请求的首块都同首 token，这个坑在真实流量下必踩
+    #[test]
+    fn same_first_token_blocks_coexist() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool(16);
+        let a: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        let b: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[7, 1, 2, 3], &a); // 首块 [7,1]，次块 [2,3]
+        cache.insert(&[7, 9, 8, 6], &b); // 首块 [7,9]——与 a 只共享首 token
+
+        assert_eq!(cache.match_prefix(&mut pool, &[7, 1, 2, 3]).blocks.len(), 2, "先插的链仍完整命中");
+        assert_eq!(cache.match_prefix(&mut pool, &[7, 9, 8, 6]).blocks.len(), 2, "后插的链独立命中");
+        assert_eq!(cache.match_prefix(&mut pool, &[7, 1, 9, 9]).tokens, 2, "同首块派生 = 共享 1 块");
+    }
 }
 
 mod m6_radix {
@@ -399,5 +416,62 @@ mod m10_state {
         mem.release(1, false);
         assert_eq!(mem.stats().deferred_releases, 5);
         assert!(!mem.over_pressure(), "在途块算入 free_soon");
+    }
+}
+
+// ---------- m11 前缀缓存部分退回与块列表驱逐（radix 快照接线底座） ----------
+
+mod m11_radix {
+    use wein_memory::pool::BlockPool;
+    use wein_memory::radix::RadixCache;
+
+    fn bs2_pool() -> BlockPool {
+        BlockPool::new(16, 0.1)
+    }
+
+    /// m11 · unpin_range：match 全量 pin 后退回尾段 [from,to)——
+    /// 命中截断到有快照槽祖先的支撑语义。头部 pin 保持、尾部 rc 回落、
+    /// 树形不变（unpin 不是驱逐）。
+    #[test]
+    fn unpin_range_releases_tail_keeps_head() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool();
+        let blocks: Vec<_> = (0..3).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[1, 2, 3, 4, 5, 6], &blocks);
+
+        let m = cache.match_prefix(&mut pool, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(m.blocks.len(), 3);
+        // 退回尾部 2 块（命中截断到块 0）
+        cache.unpin_range(&mut pool, &[1, 2, 3, 4, 5, 6], 1, 3);
+        assert_eq!(pool.rc_of(m.blocks[0]), 2, "头部 pin 保持（cache+请求）");
+        for &b in &m.blocks[1..] {
+            assert_eq!(pool.rc_of(b), 1, "尾部退回 cache 份");
+        }
+        // 头部 unpin 后树完整（三块都可再命中——未被驱逐）
+        cache.unpin(&mut pool, &[1, 2, 3, 4, 5, 6], 1);
+        let again = cache.match_prefix(&mut pool, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(again.blocks.len(), 3, "unpin_range 不动树形");
+        cache.unpin(&mut pool, &[1, 2, 3, 4, 5, 6], 3);
+        pool.recycle();
+    }
+
+    /// m11b · evict_blocks：返回被逐块列表（快照槽挂块的联动钩子）——
+    /// 数量与 evict 一致、id 唯一、被逐块确已不在树上。
+    #[test]
+    fn evict_blocks_returns_list() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool();
+        let a: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        let b: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[1, 1, 1, 1], &a);
+        cache.insert(&[2, 2, 2, 2], &b);
+
+        let freed = cache.evict_blocks(&mut pool, 1);
+        assert_eq!(freed.len(), 1, "驱逐 1 块");
+        assert_eq!(cache.evict(&mut pool, 1), 1, "计数口径与列表一致");
+        assert_eq!(cache.match_prefix(&mut pool, &[1, 1, 1, 1]).tokens, 0, "A 已逐出");
+        let alive = cache.match_prefix(&mut pool, &[2, 2, 2, 2]);
+        assert_eq!(alive.tokens, 4, "B 存活（LRU 后插）");
+        cache.unpin(&mut pool, &[2, 2, 2, 2], alive.blocks.len());
     }
 }

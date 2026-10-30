@@ -316,6 +316,78 @@ fn k9_event_timing() {
     assert!(zero < 0.1, "同点事件时距 {zero:.3}ms 超量化上界");
 }
 
+/// k10 · D2D 区间拷贝位保持：copy_range_on 是状态快照原语的物理底座——
+/// 区间内逐位同源、区间外原值不动（未写坏别人的槽）、非零双向偏移成立。
+/// 快照语义的数值合同由此钉死：存/恢复就是位搬运，无重算。
+#[test]
+fn k10_dtod_range_copy_bitwise() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let n = 1024usize;
+    let src: Vec<f32> = (0..n as u32).map(|i| splitmix(i as u64)).collect();
+    let src = gpu.alloc_from_slice(&src);
+    let dst = gpu.alloc_bytes(n * 4);
+    dst.zero_on(&stream);
+    stream.sync();
+
+    // 中段拷贝：dst[256..768) ← src[128..640)
+    dst.copy_range_on(256 * 4, &src, 128 * 4, 512 * 4, &stream);
+    stream.sync();
+    let back: Vec<f32> = dst.read_to_vec();
+    for i in 0..256 {
+        assert_eq!(back[i].to_bits(), 0, "区间外被污染（前段）");
+    }
+    let want: Vec<f32> = src.read_to_vec();
+    for i in 0..512 {
+        assert_eq!(back[256 + i].to_bits(), want[128 + i].to_bits(), "区间内位失真 @{i}");
+    }
+    for i in 768..n {
+        assert_eq!(back[i].to_bits(), 0, "区间外被污染（后段）");
+    }
+}
+
+/// k11 · 批量 D2D 位一致：多段（异源异靶、含区间偏移）一次 cuMemcpyBatchAsync
+/// 搬完，段内逐位同、段外不受污染——快照段表的正确性底座
+#[test]
+fn k11_dtod_batch_copy_bitwise() {
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    use wein_kernel::cuda::driver::CuBatchOp;
+    let n = 512usize;
+    let mk = |seed: u64, n: usize| -> Vec<f32> {
+        (0..n as u32).map(|i| splitmix(seed + i as u64)).collect()
+    };
+    let s1 = gpu.alloc_from_slice(&mk(11, n));
+    let s2 = gpu.alloc_from_slice(&mk(22, n));
+    let d1 = gpu.alloc_bytes(n * 4);
+    let d2 = gpu.alloc_bytes(n * 4);
+    d1.zero_on(&stream);
+    d2.zero_on(&stream);
+    stream.sync();
+    // 段 1：d1[0..256) ← s1[128..384)；段 2：d2[64..320) ← s2[0..256)
+    let ops = [
+        CuBatchOp { dst: d1.device_ptr(), src: s1.device_ptr() + 128 * 4, size: 256 * 4 },
+        CuBatchOp { dst: d2.device_ptr() + 64 * 4, src: s2.device_ptr(), size: 256 * 4 },
+    ];
+    stream.memcpy_batch(&ops);
+    stream.sync();
+    let (b1, b2): (Vec<f32>, Vec<f32>) = (d1.read_to_vec(), d2.read_to_vec());
+    let (w1, w2): (Vec<f32>, Vec<f32>) = (s1.read_to_vec(), s2.read_to_vec());
+    for i in 0..256 {
+        assert_eq!(b1[i].to_bits(), w1[128 + i].to_bits(), "段 1 位失真 @{i}");
+        assert_eq!(b2[64 + i].to_bits(), w2[i].to_bits(), "段 2 位失真 @{i}");
+    }
+    for i in 256..n {
+        assert_eq!(b1[i].to_bits(), 0, "段 1 区间外被污染 @{i}");
+    }
+    for i in 0..64 {
+        assert_eq!(b2[i].to_bits(), 0, "段 2 区间外被污染（前）@{i}");
+    }
+    for i in 320..n {
+        assert_eq!(b2[i].to_bits(), 0, "段 2 区间外被污染（后）@{i}");
+    }
+}
+
 // ───────────────────────── 测试侧工具 ─────────────────────────
 
 /// splitmix32——确定性 f32 源（不用 rand，冒烟测试要自含）

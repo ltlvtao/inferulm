@@ -137,6 +137,13 @@ fn main() {
                             std::process::exit(1)
                         });
                     }
+                    // --chunk-size N：单请求单步 prefill 上限（同上，调参用）
+                    if let Some(v) = arg_opt(&args, "--chunk-size") {
+                        cfg.sched.chunk_size = v.parse().unwrap_or_else(|_| {
+                            eprintln!("--chunk-size 须为正整数：{v}");
+                            std::process::exit(1)
+                        });
+                    }
                     cfg
                 },
                 Box::new(ex),

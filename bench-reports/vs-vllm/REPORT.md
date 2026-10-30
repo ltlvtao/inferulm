@@ -259,3 +259,72 @@ oracle 复验：wein 侧重捕 + compare 4/5 精确同 + 1 既知近并列翻转
 
 外推边界声明：单卡 4090/WSL、Qwen3.5-4B dense、短上下文（~43 tok）、greedy、
 c≤128。长上下文（KV 流量改账 + wein T_MAX=512 限制）、多卡、MoE 不在此外推内。
+
+### 5.7 radix 前缀缓存接线 + 状态快照原语（2026-10-30 当日四续）
+
+vLLM 侧有 mamba 前缀缓存（16-token 边界快照，默认开），wein 的
+`wein-memory` radix 一直是"有树无接线"（M 系列只验记账）。本刀把
+**一机制三用**的第一用接线落地：递推状态快照原语（radix 命中恢复 /
+MTP 回滚 / 抢占换出共用同一批槽）。
+
+**快照池**：64 槽 × (24 层 lin 1MB + 24 层 conv 48KB) ≈ 25.2MB/槽，
+预分配；单份快照 ≈ 0.23ms（`cuMemcpyBatchAsync` 一次发行全 48 段——
+逐段 `cuMemcpyDtoDAsync` 在 WSL 约 4µs/次驱动开销，实测 +1.6ms/步）。
+槽挂 radix 块（`snap_of_block`），**逐边界各借一槽**：单活跃槽只保
+末边界时树上祖先无槽，`admitted` 的"最长有槽祖先"永远查不到 → 命中恒 0
+（v1 设计错误，实测 `[radix] admit keep_blocks=0`）。
+
+**命中规则**：`match_prefix` 后截断到"有槽的最深祖先块"，且边界严格
+`< seq.len()`（末 token 重算，vLLM 同款——精确块对齐 prompt 不命中）。
+恢复 = 槽→行状态批量 D2D + 块表继承 + 前向游标前移。
+
+**栅格按相位分**（唯一同时拿到零回退与块级命中的组合）：unified 栅格
+扫描（满负荷 c=100，`bench/snap_grid_ab.sh`；eager / 图档 itl_p50）：
+
+| 栅格 | eager | 图档 |
+|---|---|---|
+| off | 24.71 | 23.18 |
+| 16（每块） | 26.17 (+1.5) | 24.56 (+1.4) |
+| 32 | 25.90 | 24.36 |
+| 64 | 25.14 | 23.23 |
+| 128 | 25.30 | 23.45 |
+
+栅格越大越接近基线但命中粒度越粗——矛盾无法靠调档化解。改为
+**prefill 侧恒按 BLOCK（16）、decode 侧按 `snap_grid_dec`（默认 64）**：
+prompt 段的命中粒度由调度侧 chunk 对齐保证，decode 段稀疏落槽不付
+每步流量。`SchedConfig.snap_align` 由 `Executor::prefix_align()` 注入
+（真执行器 radix 开=16，其余=1 → 关态账与旧版逐位一致）。
+
+**两个真 bug（都是接线才暴露的）**：
+1. **命中晚于规划** → `[radix] admit hit=128` 后本步 chunk 仍按旧债切
+   128，exec 只剩 0 token 可喂，调度器按追平逐 token 记账 → 请求
+   `completion_tokens=0` / `finish_reason=length` 静默终结。修法：
+   `Scheduler::step()` 拆成 `advance()`（完成回放→准入→抢占）+ `plan()`
+   （预算切片），pump 夹在两段之间——命中必须在规划之前进账。
+2. **radix 树同首 token 覆盖**：`children: HashMap<u32, Node>` 按块**首
+   token** 键 + `or_insert_with` → 后插同首 token 链静默丢先插链（块泄漏
+   且永不命中；chat 模板下必踩）。改键为整块 token 内容 `Vec<u32>`。
+
+**性能（battery-20261030-181733 vs 174539 `WEIN_RADIX=0` 同机同轮）**：
+L3q 满负荷 eager 24.83/3447.3 tps vs 24.67/3418.5；图档 23.08/3621.1 vs
+22.82/3603.7；TTFT p50 67.85/68.39 vs 69.98/74.44（命中还赚）；轻载 c=4
+ITL 14.03/12.64 vs 14.47/12.91。**结论：带内，零回退**（L0 164.7k qps
+无变化）。前版（逐边界但仍 unified 栅格）26.17/24.45 → 本版回收到基线。
+
+**收益（长 prompt 暖前缀，`bench/prefix_ab.sh`）**：~200 词共享前缀，
+A 冷启 / B 暖启 TTFT：radix 开 272.2/175.9ms，关 259.1/232.1ms——
+**暖请求快 56ms（−24%）**，冷请求贵 13ms（每块取一份快照）。命中省下
+的是 256 token 的 prefill 计算，与 chunk/块粒度一致。
+
+**数值合同**：qs1（命中恢复位级一致）/qs2（精确块对齐不命中）/qs3
+（抢占去共享重放位级复原）/qs4（关态旧语义）/qs5（槽耗尽→驱逐腾槽→
+恢复仍位级一致，70 个互不共享的 33-token prompt 打满 64 槽）。oracle
+重捕 compare：4/5 精确同 + #5 既知近并列翻转（`n-1`）+ chat 11/11；
+另跑 4 进程矩阵（off×2/on×2）确认 #5 之外的差异只出现在**当轮首个
+进程**（`off1` 离群、其余三方一致）——跨进程 cuBLASLt 选型差异，
+与 radix 无关。
+
+**边界**：radix 只覆盖 24 个 linear 层的递推状态 + conv 状态（8 个 full
+attn 层本来就是 KV 页，命中时页面直接共享）；快照槽与页池 LRU 联动回收
+（槽耗尽 → 驱逐树叶子块 → 腾槽）。MTP 回滚 / 抢占换出的槽回收已在
+`preempted` 钩子用同一批槽实现，MTP 落地时直接复用。

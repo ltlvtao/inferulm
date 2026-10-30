@@ -11,6 +11,25 @@ use libloading::Library;
 pub type CuResult = c_int;
 pub const CUDA_SUCCESS: CuResult = 0;
 
+/// cuMemcpyBatchAsync 的段描述（Rust 侧形态；驱动 API 是并列数组，wrapper 摊平）
+#[repr(C)]
+pub struct CuBatchOp {
+    pub dst: u64,
+    pub src: u64,
+    pub size: usize,
+}
+
+/// cuMemcpyBatchAsync 的 CUmemcpyAttributes（24B；文档要求每条拷贝都有
+/// 对应属性，否则 INVALID_VALUE）。顺序属性取 STREAM：源是本流 kernel 的
+/// 落定结果，按流序访问
+#[repr(C)]
+struct CuMemcpyAttrs {
+    src_access_order: c_int,  // CU_MEMCPY_SRC_ACCESS_ORDER_STREAM = 1
+    src_loc_hint: [c_int; 2], // CUmemLocation { type, id }（恒零 = 忽略）
+    dst_loc_hint: [c_int; 2],
+    flags: u32,
+}
+
 /// cuDeviceGetAttribute 的属性号（只列用到的）
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
@@ -62,6 +81,20 @@ pub struct Driver {
     cu_event_destroy: unsafe extern "C" fn(*mut c_void) -> CuResult,
     cu_memcpy_htod_async:
         unsafe extern "C" fn(u64, *const c_void, usize, *mut c_void) -> CuResult,
+    cu_memcpy_dtod_async: unsafe extern "C" fn(u64, u64, usize, *mut c_void) -> CuResult,
+    /// 批量异步 D2D（CUDA 12.8+）：一次驱动调用搬多段——快照逐层小拷贝
+    /// 的调用开销摊销（WSL 每调用 ~4µs，48 层段 × 每步多次跨块会吃满 ms 级）。
+    /// 并列数组形态（dsts/srcs/sizes），段间无序
+    cu_memcpy_batch_async: unsafe extern "C" fn(
+        *const u64,     // dsts
+        *const u64,     // srcs
+        *const usize,   // sizes
+        usize,          // count
+        *const c_void,  // attrs（null = 无属性）
+        *const usize,   // attrsIdxs
+        usize,          // numAttrs（0）
+        *mut c_void,    // stream
+    ) -> CuResult,
     cu_stream_begin_capture: unsafe extern "C" fn(*mut c_void, c_int) -> CuResult,
     cu_stream_end_capture: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuResult,
     cu_graph_instantiate_with_flags:
@@ -123,6 +156,14 @@ impl Driver {
                 cu_memcpy_htod_async: try_get(
                     &lib,
                     &["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"],
+                )?,
+                cu_memcpy_dtod_async: try_get(
+                    &lib,
+                    &["cuMemcpyDtoDAsync_v2", "cuMemcpyDtoDAsync"],
+                )?,
+                cu_memcpy_batch_async: try_get(
+                    &lib,
+                    &["cuMemcpyBatchAsync_v2", "cuMemcpyBatchAsync"],
                 )?,
                 cu_stream_begin_capture: try_get(&lib, &["cuStreamBeginCapture"])?,
                 cu_stream_end_capture: try_get(&lib, &["cuStreamEndCapture"])?,
@@ -292,6 +333,52 @@ impl Driver {
         self.check(
             unsafe { (self.cu_memcpy_htod_async)(dst, src, n, stream) },
             "cuMemcpyHtoDAsync",
+        )
+    }
+    /// 异步 D2D（流上排队——状态快照的存/恢复：行↔槽位拷贝）
+    pub(crate) fn memcpy_dtod_async(
+        &self,
+        dst: u64,
+        src: u64,
+        n: usize,
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(
+            unsafe { (self.cu_memcpy_dtod_async)(dst, src, n, stream) },
+            "cuMemcpyDtoDAsync",
+        )
+    }
+    /// 批量异步 D2D（流上排队，段间无序——各段独立位拷贝；无属性直拷）
+    pub(crate) fn memcpy_batch_async(
+        &self,
+        ops: &[CuBatchOp],
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        // 驱动 API 是并列数组形态：摊平三条（每步百级条目，摊平开销可忽略）
+        let dsts: Vec<u64> = ops.iter().map(|o| o.dst).collect();
+        let srcs: Vec<u64> = ops.iter().map(|o| o.src).collect();
+        let sizes: Vec<usize> = ops.iter().map(|o| o.size).collect();
+        let attrs = CuMemcpyAttrs {
+            src_access_order: 1, // CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+            src_loc_hint: [0; 2],
+            dst_loc_hint: [0; 2],
+            flags: 0,
+        };
+        let attrs_idxs = [0usize]; // 单属性组覆盖全部拷贝（首项必须 0）
+        self.check(
+            unsafe {
+                (self.cu_memcpy_batch_async)(
+                    dsts.as_ptr(),
+                    srcs.as_ptr(),
+                    sizes.as_ptr(),
+                    ops.len(),
+                    &attrs as *const CuMemcpyAttrs as *const c_void,
+                    attrs_idxs.as_ptr(),
+                    attrs_idxs.len(),
+                    stream,
+                )
+            },
+            "cuMemcpyBatchAsync",
         )
     }
     /// 进入流捕获（THREAD_LOCAL 模式：别的线程的潜在同步不误伤本捕获）

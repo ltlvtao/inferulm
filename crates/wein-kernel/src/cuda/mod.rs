@@ -191,6 +191,14 @@ impl Stream<'_> {
         self.drv.stream_wait_event(self.handle, e.handle, 0).expect("cuStreamWaitEvent");
     }
 
+    /// 批量 D2D（流上排队，段间独立无序）：一次驱动调用搬多段——快照
+    /// 逐层小拷贝的调用开销摊销（48 段 × 每步多次跨块：WSL 每调用 ~4µs
+    /// 会把 0.25ms 的流量账放大成 ms 级）
+    pub fn memcpy_batch(&self, ops: &[driver::CuBatchOp]) {
+        assert!(!ops.is_empty(), "空批不发行（cuMemcpyBatchAsync 须 numOps > 0）");
+        self.drv.memcpy_batch_async(ops, self.handle).expect("cuMemcpyBatchAsync");
+    }
+
     /// 进入流捕获：此后的 launch 序列录制进图（THREAD_LOCAL 模式）。
     /// 区间内隐式同步/分配在 debug 构建直接 panic（§4 安全规则）
     pub fn begin_capture(&self) {
@@ -285,6 +293,21 @@ impl DevBuf<'_> {
         self.drv
             .memset_d8(self.ptr + start as u64, 0, len, stream.handle)
             .expect("cuMemsetD8Async");
+    }
+    /// 区间 D2D 拷贝（流上排队——快照存/恢复：本缓冲区间 ← 源缓冲区间，位拷贝）
+    pub fn copy_range_on(
+        &self,
+        dst_start: usize,
+        src: &DevBuf,
+        src_start: usize,
+        len: usize,
+        stream: &Stream,
+    ) {
+        assert!(dst_start + len <= self.bytes, "D2D 目标区间越界");
+        assert!(src_start + len <= src.bytes, "D2D 源区间越界");
+        self.drv
+            .memcpy_dtod_async(self.ptr + dst_start as u64, src.ptr + src_start as u64, len, stream.handle)
+            .expect("cuMemcpyDtoDAsync");
     }
     pub fn read_to_vec<T: Copy + Default>(&self) -> Vec<T> {
         capture_guard();

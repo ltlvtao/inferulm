@@ -658,7 +658,7 @@ impl Executor for ToyExecutor {
         self.row_capacity as usize
     }
 
-    fn admitted(&mut self, id: ReqId, prompt: &[u32]) {
+    fn admitted(&mut self, id: ReqId, prompt: &[u32]) -> usize {
         assert!(
             prompt.iter().all(|&t| t < self.cfg.vocab),
             "toy 词表越界（vocab {}）",
@@ -667,16 +667,13 @@ impl Executor for ToyExecutor {
         // 空 prompt → BOS(0)：调度器看长度 0 直接 decode，首步前向 BOS
         let seq = if prompt.is_empty() { vec![0u32] } else { prompt.to_vec() };
         let row = self.free_rows.pop().unwrap_or_else(|| {
-            assert!(
-                self.next_row < self.row_capacity,
-                "块表行耗尽（{}，图档含 sink 让位 1 行）——M0 toy 上限",
-                self.row_capacity
-            );
+            assert!(self.next_row < self.row_capacity, "toy 行耗尽");
             let r = self.next_row;
             self.next_row += 1;
             r
         });
         self.reqs.insert(id, ReqState { seq, forwarded: 0, row, blocks: Vec::new() });
+        0 // toy 无前缀缓存
     }
 
     fn step(&mut self, plan: &StepPlan) -> Vec<(ReqId, u32)> {

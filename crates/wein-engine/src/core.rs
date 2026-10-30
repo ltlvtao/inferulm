@@ -144,8 +144,10 @@ pub trait Executor: Send {
     /// 步末回收：清理已离批请求的执行器内部状态（DeferredRelease 钩子）
     fn retain(&mut self, active: &[ReqId]);
     /// 准入通知：prompt 在此首次可见（执行器建立自己的序列/KV 记账）。
-    /// 空指针不算——空 prompt 由执行器自行决定 BOS 语义
-    fn admitted(&mut self, _id: ReqId, _prompt: &[u32]) {}
+    /// 空指针不算——空 prompt 由执行器自行决定 BOS 语义。
+    /// 返回值 = 执行器已就绪的 token 数（前缀缓存命中恢复的部分），
+    /// engine 会把它回填进调度债（sched.prefix_hit）——无缓存执行器返回 0
+    fn admitted(&mut self, _id: ReqId, _prompt: &[u32]) -> usize { 0 }
     /// 抢占通知：调度器会以 recompute 语义重放（forwarded 清零）——
     /// 执行器须把自己的前向游标一并归零，否则重放位置错位（x6 验收钉死）
     fn preempted(&mut self, _id: ReqId) {}
@@ -155,6 +157,12 @@ pub trait Executor: Send {
     /// （脚本件无行概念）
     fn row_capacity(&self) -> usize {
         usize::MAX
+    }
+    /// 前缀缓存的对齐粒度：调度器把非末块 prefill chunk 尾圆到此粒度，
+    /// 使 chunk 尾落在执行器的块边界上（= 可共享/可恢复的状态检查点）。
+    /// 默认 1（不对齐）——无前缀缓存的执行器账与旧版逐位一致
+    fn prefix_align(&self) -> usize {
+        1
     }
 }
 
@@ -223,6 +231,8 @@ impl EngineCore {
         // 引擎任务（I1 满负荷批界）——超容请求排队等行（e5）
         let mut cfg = cfg;
         cfg.sched.max_running = cfg.sched.max_running.min(exec.row_capacity());
+        // 前缀缓存对齐：执行器（真模型 radix 开时 = KV 块大小）→ 调度 chunk 尾
+        cfg.sched.snap_align = cfg.sched.snap_align.max(exec.prefix_align());
         let mut sched = match cfg.memory {
             Some(mem_cfg) => Scheduler::with_capacity(
                 cfg.sched,
@@ -249,10 +259,14 @@ impl EngineCore {
             // 因此取消后客户端至多再收到在飞那一步的 token（e2 验收钉死的边界）
             while !sched.is_idle() {
                 Self::drain(&mut cmd_rx, &mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
-                let plan = sched.step();
+                // 两段式：准入相位 → 回放事件（建行 + 前缀命中对账 + 完成
+                // 回收）→ 规划相位。命中必须在规划之前进账：晚一步本步预算
+                // 会按未命中的债切 chunk，执行器按真实游标少喂 → 两侧漂移
+                sched.advance();
                 // 事件先于 exec.step：本步新准入者先建行（exec.admitted）
                 // 再进前向——否则 step 查不到行会静默空转
                 Self::pump(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
+                let plan = sched.plan();
                 stats.steps.fetch_add(1, Ordering::Relaxed);
                 if !cfg.step_delay.is_zero() {
                     sleep(cfg.step_delay).await;
@@ -427,7 +441,12 @@ impl EngineCore {
             exec.retain(&keep);
             for id in admitted_ids {
                 if let Some(p) = prompts.remove(&id) {
-                    exec.admitted(id, &p);
+                    let hit = exec.admitted(id, &p);
+                    if hit > 0 {
+                        // 前缀缓存命中对账：exec 已恢复的状态让调度债等量消减
+                        // （预算切片/mix_cap/追平判定按剩余段计算）
+                        sched.prefix_hit(id, hit);
+                    }
                 }
             }
         }

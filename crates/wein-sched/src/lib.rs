@@ -53,6 +53,12 @@ pub struct SchedConfig {
     /// 稳定 decode（纯 prefill 波）不受限（TTFT/吞吐优先）；decode 行数占满
     /// cap 时至少留 [`PREFILL_MIN`] 给 prefill（进度保证）
     pub mix_cap: usize,
+    /// prefill chunk 尾对齐粒度（0/1 = 不对齐）。前缀缓存的递推状态检查点
+    /// 只能落在"某次 forward 的最后一 token"上，而共享/恢复点必须是块边界
+    /// ——非末块 chunk 尾圆到该粒度，chunk 尾即成为检查点（密度 = chunk，
+    /// 成本 = 每 chunk 一次状态位拷贝）。执行器经 `Executor::prefix_align`
+    /// 上报（无前缀缓存的执行器恒 1，账与旧版逐位一致）
+    pub snap_align: usize,
 }
 
 impl Default for SchedConfig {
@@ -65,6 +71,7 @@ impl Default for SchedConfig {
             // T≈192 的混合步 ≈ 纯 decode 步的 1.4×（qwen_mixed_probe 曲线），
             // p99 与 TTFT 的平衡点——battery 仲裁
             mix_cap: 192,
+            snap_align: 1,
         }
     }
 }
@@ -330,6 +337,17 @@ impl Scheduler {
         true
     }
 
+    /// 前缀缓存命中回填：执行器恢复了 k 个 token 的递推/KV 状态（radix
+    /// 命中，prefill 无须重算），调度债等量消减——预算切片/mix_cap/追平
+    /// 判定全部按剩余前向段计算。与抢占的 forwarded 清零对称：一增一减
+    /// 都是"执行器先行、调度器对账"的同步点。超额命中钳到债上界。
+    pub fn prefix_hit(&mut self, id: ReqId, tokens: usize) {
+        if let Some(r) = self.reqs.get_mut(&id) {
+            let bound = r.prompt_len() + r.generated as usize;
+            r.forwarded = (r.forwarded + tokens).min(bound);
+        }
+    }
+
     /// 引擎强制抢占（容量模型 on_token 失败时调用，如块耗尽）。
     /// 批内仅剩此请求时拒绝（重排后立刻被强制再准入 → 活锁；应在上游拒绝请求）。
     pub fn preempt(&mut self, id: ReqId) -> bool {
@@ -341,8 +359,18 @@ impl Scheduler {
         false
     }
 
-    /// 推进一步：完成回放 → 准入（含容量反压）→ 抢占（增长驱动）→ 预算规划。
+    /// 推进一步 = 准入相位 + 规划相位（脚本件/测试用；引擎走两段式以在
+    /// 两者之间跑执行器的建行与前缀命中对账——见 [`Self::advance`]）
     pub fn step(&mut self) -> StepPlan {
+        self.advance();
+        self.plan()
+    }
+
+    /// 准入相位：完成回放 → 准入（含容量反压）→ 抢占（增长驱动）。
+    /// 事件在此产出，引擎须在 [`Self::plan`] 之前回放干净：新准入者的
+    /// 前缀命中（执行器先行的状态恢复）会消减本步预算要切的债——晚应用
+    /// 一步就会让规划多切 chunk，执行器按真实游标少喂，两侧账漂移。
+    pub fn advance(&mut self) {
         self.m.steps += 1;
 
         // --- 完成回放（DeferredRelease）：上一步达标者此刻释放容量并回放事件；
@@ -375,6 +403,10 @@ impl Scheduler {
             self.preempt_one(victim);
         }
 
+    }
+
+    /// 规划相位：本步预算切片（prefill/decode 两相位 + 混合步封顶）
+    pub fn plan(&mut self) -> StepPlan {
         // --- 预算规划：两相位（批序 = FIFO 准入序）。
         //     债 backlog = prompt_len + generated - forwarded（未 forward 的 token 数）。
         //     债 ≤ 1 且 prompt 已 forward ⇒ decode（成本 1）；否则按 chunk 追赶，
@@ -426,9 +458,17 @@ impl Scheduler {
             if backlog <= 1 && r.forwarded >= r.prompt_len() {
                 continue; // 相位一已落位
             }
-            let chunk = backlog.min(self.cfg.chunk_size).min(budget).min(cap);
+            let mut chunk = backlog.min(self.cfg.chunk_size).min(budget).min(cap);
             if chunk == 0 {
                 break;
+            }
+            // 块边界对齐（上方 snap_align 论证）：圆掉不足一个粒度且会归零
+            // 时不做（PREFILL_MIN 短推时进度优先，那一步不出检查点）
+            if self.cfg.snap_align > 1 {
+                let a = chunk - chunk % self.cfg.snap_align;
+                if a > 0 {
+                    chunk = a;
+                }
             }
             r.forwarded += chunk;
             budget -= chunk;
@@ -512,6 +552,7 @@ mod tests {
             chunk_size: chunk,
             max_batch_tokens: 1 << 30,
             mix_cap: 1 << 30,
+            snap_align: 1,
         }
     }
 
@@ -600,6 +641,7 @@ mod tests {
             chunk_size: 16,
             max_batch_tokens: 6,
             mix_cap: 1 << 30,
+            snap_align: 1,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 2], max_tokens: 8 }); // A
         s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 2], max_tokens: 8 }); // C
@@ -721,6 +763,7 @@ mod tests {
             chunk_size: 16,
             max_batch_tokens: 1 << 30,
             mix_cap: 8,
+            snap_align: 1,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 10 });
         s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 30], max_tokens: 10 });
@@ -756,6 +799,7 @@ mod tests {
             chunk_size: 64,
             max_batch_tokens: 1 << 30,
             mix_cap: 2,
+            snap_align: 1,
         });
         for id in 1..=4u64 {
             s.submit(ReqInput { id, prompt_token_ids: vec![0; 1], max_tokens: 10 });
@@ -830,5 +874,67 @@ mod tests {
             2,
             "压力解除后全部收敛"
         );
+    }
+
+    /// s11 · 前缀命中回填（prefix_hit）：执行器恢复 k token 后调度债等量
+    ///      消减——预算按剩余段切片、追平判定前移、超额命中安全钳制
+    #[test]
+    fn s11_prefix_hit_reduces_debt() {
+        let mut s = Scheduler::new(cfg(4, 8, 4));
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 10], max_tokens: 3 });
+        s.prefix_hit(1, 8); // 执行器恢复 8 token：债 10 → 2
+        let (plans, _) = run_to_idle(&mut s, 50);
+        let prefill_chunks: Vec<usize> =
+            plans.iter().filter(|p| !p.prefill.is_empty()).map(|p| p.prefill[0].1).collect();
+        assert_eq!(prefill_chunks, vec![2], "命中后只切剩余 2 token");
+        assert_eq!(plans.iter().map(|p| p.decode.len()).sum::<usize>(), 3);
+
+        // 超额钳制：命中 > 债 → 钳到上界（不产生负债/越界 forwarded）
+        let mut s = Scheduler::new(cfg(4, 8, 4));
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 3], max_tokens: 2 });
+        s.prefix_hit(1, 100);
+        let (plans, _) = run_to_idle(&mut s, 50);
+        assert!(plans.iter().all(|p| p.prefill.is_empty()), "全额命中无 prefill 段");
+        assert_eq!(plans.iter().map(|p| p.decode.len()).sum::<usize>(), 2);
+    }
+
+    /// s12 · prefill chunk 尾对齐（前缀缓存检查点只在"forward 最后一 token
+    /// 落在块边界"时存在，故非末块 chunk 尾圆到 snap_align；末块不圆——
+    /// 追平步照常采样，TTFT 少付一步；对齐全开与全关的总 token 数一致）
+    #[test]
+    fn s12_prefill_chunks_align_to_checkpoint_granularity() {
+        let run = |align: usize| {
+            let mut s = Scheduler::new(SchedConfig {
+                token_budget: 16,
+                max_running: 8,
+                chunk_size: 16,
+                max_batch_tokens: 1 << 30,
+                mix_cap: 1 << 30,
+                snap_align: align,
+            });
+            s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 10], max_tokens: 2 });
+            let (plans, _) = run_to_idle(&mut s, 50);
+            let chunks: Vec<usize> =
+                plans.iter().filter(|p| !p.prefill.is_empty()).map(|p| p.prefill[0].1).collect();
+            let decodes = plans.iter().map(|p| p.decode.len()).sum::<usize>();
+            (chunks, decodes)
+        };
+        assert_eq!(run(1), (vec![10], 2), "不对齐：prompt 一步追平");
+        assert_eq!(run(4), (vec![8, 2], 2), "对齐 4：首块 8（块边界）+ 末块 2");
+        // 多块预算切片：仍逐段对齐，末块不圆
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 16,
+            max_running: 8,
+            chunk_size: 6,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            snap_align: 4,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 10], max_tokens: 2 });
+        let (plans, _) = run_to_idle(&mut s, 50);
+        let chunks: Vec<usize> =
+            plans.iter().filter(|p| !p.prefill.is_empty()).map(|p| p.prefill[0].1).collect();
+        assert_eq!(chunks, vec![4, 4, 2], "chunk 6 圆到 4，末块 2");
+        assert_eq!(plans.iter().map(|p| p.decode.len()).sum::<usize>(), 2);
     }
 }

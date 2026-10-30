@@ -299,3 +299,198 @@ fn q13_step_profile_sections() {
     }
     eprintln!("{rep}");
 }
+
+// ── qs 系列：radix 前缀缓存 + 状态快照（命中恢复位级合同 / 末 token
+//    重算规则 / 抢占去共享 / 关闭态基线）──
+
+/// 33-token prompt（2 整块 + 1）：跨块界落快照 → 完成移交 → 第二请求
+/// 命中 32 恢复状态，重算末 token（m=1 同批形状）后续生成逐 token 位级
+/// 一致——快照是 D2D 位拷贝，恢复后的递推 ≡ 从未中断（本刀数值合同）
+#[test]
+fn qs1_radix_hit_restore_bitwise() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p.truncate(33);
+    assert_eq!(p.len(), 33, "截断后 33 token（2 整块 + 1 尾）");
+    // 请求一：32+1 分段前向——首段不采样（请求二无 pos31 采样位，对齐
+    // 两者的喂入流），快照落在 32 界，末 token 以 m=1 批形状重放
+    ex.admitted(1, &p);
+    let _ = ex.step(&StepPlan { prefill: vec![(1, 32)], decode: vec![], batch: vec![] });
+    let t2 = ex.step(&StepPlan { prefill: vec![(1, 1)], decode: vec![1], batch: vec![] });
+    let mut base = vec![t2[0].1];
+    for _ in 0..4 {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+        base.push(d[0].1);
+    }
+    ex.retain(&[]); // 移交：2 整块挂树，末块挂快照槽
+    // 请求二：同 prompt 命中 32（恢复点边界 32 < 33，留末 token 作采样位）
+    let hit = ex.admitted(2, &p);
+    assert_eq!(hit, 32, "须命中 2 整块");
+    let t = ex.step(&StepPlan { prefill: vec![(2, 1)], decode: vec![2], batch: vec![] });
+    assert_eq!(t[0].1, base[0], "恢复后末 token 重放（m=1 同形状）→ 位级一致");
+    for k in 1..base.len() {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![2], batch: vec![] });
+        assert_eq!(d[0].1, base[k], "恢复后续生成第 {k} token 位级一致（快照位拷贝合同）");
+    }
+}
+
+/// 精确块对齐 prompt（恰 32）不命中——恢复到 prompt 末尾 = 无 token 可
+/// 喂 = 无采样位（末 token 重算规则）；长一 token 的 prompt 共享前 32
+/// 块正常命中
+#[test]
+fn qs2_exact_multiple_rule() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p32 = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p32.truncate(32);
+    ex.admitted(1, &p32);
+    let t = ex.step(&StepPlan { prefill: vec![(1, 32)], decode: vec![1], batch: vec![] });
+    let mut base = vec![t[0].1];
+    for _ in 0..3 {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+        base.push(d[0].1);
+    }
+    ex.retain(&[]); // 捐 2 块，槽在末块
+    let hit = ex.admitted(2, &p32);
+    assert_eq!(hit, 0, "边界 32 == len 32 → 不命中（末 token 重算规则）");
+    ex.retain(&[]); // 请求二未消费任何块，清退
+    let mut p33 = p32.clone();
+    p33.push(7u32);
+    let hit = ex.admitted(3, &p33);
+    assert_eq!(hit, 32, "长一 token 的 prompt 命中 2 整块");
+    let t = ex.step(&StepPlan { prefill: vec![(3, 1)], decode: vec![3], batch: vec![] });
+    assert_eq!(t.len(), 1, "命中路径重算末 token 采样正常");
+}
+
+/// 抢占去共享：命中恢复的请求被抢占（共享页换私有页 + 状态零化 + 游标
+/// 归零）后同批形状全量重放位级复原；radix 树无恙——第三请求仍命中
+#[test]
+fn qs3_preempt_deshare_replay() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p.truncate(33);
+    // 请求一：32+1 驱动 → 基线 6 token；移交
+    ex.admitted(1, &p);
+    let t = ex.step(&StepPlan { prefill: vec![(1, 32)], decode: vec![1], batch: vec![] });
+    let t2 = ex.step(&StepPlan { prefill: vec![(1, 1)], decode: vec![1], batch: vec![] });
+    let mut base = vec![t[0].1, t2[0].1];
+    for _ in 0..4 {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+        base.push(d[0].1);
+    }
+    ex.retain(&[]);
+    // 请求二：命中 32 → 抢占 → 全量重放（32+1 同批形状）
+    assert_eq!(ex.admitted(2, &p), 32);
+    ex.preempted(2);
+    let t = ex.step(&StepPlan { prefill: vec![(2, 32)], decode: vec![2], batch: vec![] });
+    assert_eq!(t[0].1, base[0], "抢占重放 32 段（同形状）→ 位级一致");
+    let t2 = ex.step(&StepPlan { prefill: vec![(2, 1)], decode: vec![2], batch: vec![] });
+    assert_eq!(t2[0].1, base[1], "重放末 token 位级一致");
+    for k in 2..base.len() {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![2], batch: vec![] });
+        assert_eq!(d[0].1, base[k], "重放续生成第 {k} token 位级一致");
+    }
+    ex.retain(&[]); // 重放块与树重叠 → 冗余释放（coverage 路径）
+    // 请求三：树无恙，仍命中
+    assert_eq!(ex.admitted(3, &p), 32, "抢占/重放后 radix 树仍可命中");
+}
+
+/// WEIN_RADIX=0 关闭态：重复 prompt 不命中（旧语义），生成正常——A/B 基线
+#[test]
+fn qs4_radix_off_baseline() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    std::env::set_var("WEIN_RADIX", "0");
+    let ex = exec(&dir);
+    std::env::remove_var("WEIN_RADIX");
+    let Some(mut ex) = ex else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p.truncate(33);
+    ex.admitted(1, &p);
+    let t = ex.step(&StepPlan { prefill: vec![(1, 33)], decode: vec![1], batch: vec![] });
+    assert_eq!(t.len(), 1, "关闭态全量前向正常");
+    for _ in 0..3 {
+        let d = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+        assert_eq!(d.len(), 1);
+    }
+    ex.retain(&[]);
+    assert_eq!(ex.admitted(2, &p), 0, "关闭态重复 prompt 不命中（旧语义）");
+}
+
+/// 槽耗尽 → 驱逐腾槽（块与槽联动回收）+ 之后的命中恢复仍位级正确：
+/// 借槽/还槽记账一旦双借或漏还，两个块共用一槽 → 恢复出别人的行状态 →
+/// 采样 token 必偏离基线（快照位拷贝合同不让步）。N = SNAP_SLOTS(64) + 6
+/// 个首 token 各异（无共享前缀）的 33-token prompt，每个捐 2 块 1 槽
+#[test]
+fn qs5_snap_slot_exhaustion_recycles() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p0 = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p0.truncate(33);
+    const N: usize = 70;
+    let id = |i: usize| i as u64 + 1;
+    let mut base: Vec<[u32; 3]> = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut p = p0.clone();
+        p[0] = 100 + i as u32; // 首 token 各异 → 互不共享前缀（各自独立捐块）
+        assert_eq!(ex.admitted(id(i), &p), 0, "#{i} 不命中");
+        let _ = ex.step(&StepPlan { prefill: vec![(id(i), 32)], decode: vec![], batch: vec![] });
+        let t = ex.step(&StepPlan { prefill: vec![(id(i), 1)], decode: vec![id(i)], batch: vec![] });
+        let d1 = ex.step(&StepPlan { prefill: vec![], decode: vec![id(i)], batch: vec![] });
+        let d2 = ex.step(&StepPlan { prefill: vec![], decode: vec![id(i)], batch: vec![] });
+        base.push([t[0].1, d1[0].1, d2[0].1]);
+        ex.retain(&[]); // 移交：块进树、槽随块
+    }
+    // 复验：先探最老 5（大概率已被驱逐 → 全量重放），再探最新 5（LRU 应留
+    // → 命中 32）。两条路径都须与基线逐 token 位级一致
+    let mut hits = 0;
+    for i in (0..5).chain(N - 5..N) {
+        let mut p = p0.clone();
+        p[0] = 100 + i as u32;
+        let hit = ex.admitted(id(i) + 1000, &p);
+        if hit == 0 {
+            let _ =
+                ex.step(&StepPlan { prefill: vec![(id(i) + 1000, 32)], decode: vec![], batch: vec![] });
+        } else {
+            assert_eq!(hit, 32, "#{i} 命中粒度须为整块（2 块）");
+            hits += 1;
+        }
+        let t = ex.step(&StepPlan {
+            prefill: vec![(id(i) + 1000, 33 - hit)],
+            decode: vec![id(i) + 1000],
+            batch: vec![],
+        });
+        assert_eq!(t[0].1, base[i][0], "#{i} 恢复后重算末 token 位级一致（hit={hit}）");
+        for k in 1..3 {
+            let d = ex.step(&StepPlan {
+                prefill: vec![],
+                decode: vec![id(i) + 1000],
+                batch: vec![],
+            });
+            assert_eq!(d[0].1, base[i][k], "#{i} 续生成第 {k} token 位级一致（hit={hit}）");
+        }
+        ex.retain(&[]);
+    }
+    assert!(hits >= 3, "驱逐须按 LRU 保最新条目（最新 5 中命中 {hits}）");
+}
