@@ -14,6 +14,8 @@
 # GPU 互斥：两端各自起服→跑→停（4090 24G 装不下双份模型）
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 基准必须直连：环境代理（WSL autoProxy 注入的 http_proxy）会劫持 127.0.0.1 流量
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 
 SIDE=${1:?用法: bench/vs_vllm.sh <wein|vllm> [tag]}
 TAG=${2:-$SIDE}

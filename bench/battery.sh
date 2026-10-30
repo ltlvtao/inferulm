@@ -17,6 +17,8 @@
 # 用法：bench/battery.sh [release|debug]     （默认 release；报告落 bench-reports/battery-<时间戳>/）
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 基准必须直连：环境代理（WSL autoProxy 注入的 http_proxy）会劫持 127.0.0.1 流量
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 
 PROFILE=${1:-release}
 PORT=${WEIN_BENCH_PORT:-8125}

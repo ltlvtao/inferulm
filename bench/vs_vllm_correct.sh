@@ -10,6 +10,8 @@
 #       bench/vs_vllm_correct.sh compare
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 基准必须直连：环境代理（WSL autoProxy 注入的 http_proxy）会劫持 127.0.0.1 流量
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 
 OUT=bench-reports/vs-vllm-correct
 CMD=${1:?用法: vs_vllm_correct.sh capture <wein|vllm> <base_url> | compare}

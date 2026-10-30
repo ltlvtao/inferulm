@@ -90,7 +90,10 @@ fn meta() -> Value {
 
 /// GET /v1/models 洪泛：量 router（accept/parse/route/小 JSON 响应）的 QPS 上限。
 async fn flood(args: &Args) {
+    // 基准客户端必须直连：环境代理（WSL autoProxy 注入的 http_proxy）会把 127.0.0.1
+    // 流量劫持到 xray——洪泛打爆代理后表现为 60s 超时挂死 + 两成错误。
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap();
@@ -106,11 +109,19 @@ async fn flood(args: &Args) {
         let sem = sem.clone();
         let client = client.clone();
         let url = url.clone();
+        let spawned = Instant::now();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let t0 = Instant::now();
-            let ok = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
-            (ok, t0.elapsed().as_secs_f64() * 1e3)
+            let wait_ms = t0.duration_since(spawned).as_secs_f64() * 1e3;
+            let res = client.get(&url).send().await;
+            let lat_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let err = match &res {
+                Ok(r) if r.status().is_success() => None,
+                Ok(r) => Some(format!("status {}", r.status())),
+                Err(e) => Some(format!("send: {e}")),
+            };
+            (err.is_none(), wait_ms, lat_ms, err)
         }));
     }
     let results = futures::future::join_all(handles)
@@ -120,17 +131,27 @@ async fn flood(args: &Args) {
         .collect::<Vec<_>>();
     let wall = wall0.elapsed().as_secs_f64();
 
-    let lat: Vec<f64> = results.iter().map(|(_, ms)| *ms).collect();
-    let errors = results.iter().filter(|(ok, _)| !ok).count();
+    let lat: Vec<f64> = results.iter().map(|(_, _, ms, _)| *ms).collect();
+    let waits: Vec<f64> = results.iter().map(|(_, w, _, _)| *w).collect();
+    let mut err_kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_, _, _, e) in &results {
+        if let Some(e) = e {
+            *err_kinds.entry(e.clone()).or_default() += 1;
+        }
+    }
+    let errors = results.iter().filter(|(ok, ..)| !ok).count();
     let report = json!({
         "mode": "flood GET /v1/models",
         "meta": meta(),
         "config": {"concurrency": args.concurrency, "num": args.num},
         "result": {
             "errors": errors,
+            "error_kinds": err_kinds,
             "qps": args.num as f64 / wall,
             "lat_p50_ms": percentile(lat.clone(), 0.50),
             "lat_p99_ms": percentile(lat.clone(), 0.99),
+            "wait_p50_ms": percentile(waits.clone(), 0.50),
+            "wait_p99_ms": percentile(waits.clone(), 0.99),
             "wall_s": wall,
         }
     });
@@ -275,6 +296,7 @@ async fn main() {
     }
 
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(300))
         .build()
         .unwrap();
