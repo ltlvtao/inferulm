@@ -1,0 +1,19 @@
+subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/home/lvtao/.cache/flashinfer/0.7.0.post1/89/cached_ops/batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_e4m3_dtype_o_bf16_dtype_idx_i32_head_dim_qk_256_head_dim_vo_256_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False_kv_stride_equal', '-f', '/home/lvtao/.cach
+RuntimeError: Ninja build failed. Ninja output:
+subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/home/lvtao/.cache/flashinfer/0.7.0.post1/89/cached_ops/batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_e4m3_dtype_o_bf16_dtype_idx_i32_head_dim_qk_256_head_dim_vo_256_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False_kv_stride_equal', '-f', '/home/lvtao/.cach
+---
+  File "/home/lvtao/venvs/vllm/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lvtao/venvs/vllm/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 1120, in __init__
+    super().__init__(
+  File "/home/lvtao/venvs/vllm/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 682, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/home/lvtao/.local/share/uv/python/cpython-3.12.16-linux-x86_64-gnu/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/home/lvtao/venvs/vllm/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1351, in launch_core_engines
+    wait_for_engine_startup(
+  File "/home/lvtao/venvs/vllm/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1431, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}

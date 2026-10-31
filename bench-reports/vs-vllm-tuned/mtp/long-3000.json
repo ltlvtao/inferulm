@@ -1,0 +1,253 @@
+{
+  "ts_unix": 1793434872,
+  "config": {
+    "target_tokens": 3000,
+    "prompt_tokens_local": 3000,
+    "max_tokens": 32,
+    "repeats": 3,
+    "temperature": 0,
+    "endpoint": "/v1/chat/completions (stream, include_usage)",
+    "cold": true,
+    "hot": true,
+    "note": "cfg=mtp maxlen=8192"
+  },
+  "cold": [
+    {
+      "ttft_ms": 218.74747198307887,
+      "n_tokens": 17,
+      "itl_ms": [
+        15.753977990243584,
+        15.847165021114051,
+        15.417525020893663,
+        16.020166978705674,
+        13.87576898559928,
+        13.716249028220773,
+        14.881486014928669,
+        16.445308981928974,
+        14.303008967544883,
+        14.194296032655984,
+        15.322146995458752,
+        16.26113400561735,
+        13.6778749874793,
+        13.796310988254845,
+        14.746761997230351,
+        16.457458026707172
+      ],
+      "itl_p50_ms": 15.10181650519371,
+      "itl_mean_ms": 15.044790001411457,
+      "wall_ms": 459.4641120056622,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "reset_prefix_cache": true,
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 0.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      }
+    },
+    {
+      "ttft_ms": 222.37486101221293,
+      "n_tokens": 17,
+      "itl_ms": [
+        16.36995596345514,
+        15.719652001280338,
+        16.47360803326592,
+        15.415942994877696,
+        16.154300014022738,
+        15.822278975974768,
+        16.458106983918697,
+        15.899773046839982,
+        16.050827980507165,
+        15.836739970836788,
+        15.918733028229326,
+        14.550904976204038,
+        14.911895035766065,
+        15.339609002694488,
+        15.579875966068357,
+        13.933608017396182
+      ],
+      "itl_p50_ms": 15.829509473405778,
+      "itl_mean_ms": 15.652238249458605,
+      "wall_ms": 472.8106730035506,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "reset_prefix_cache": true,
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 0.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      }
+    },
+    {
+      "ttft_ms": 210.30255098594353,
+      "n_tokens": 17,
+      "itl_ms": [
+        14.24667501123622,
+        15.135447029024363,
+        14.725867949891835,
+        16.43746200716123,
+        13.662995013874024,
+        14.264244004152715,
+        14.772902999538928,
+        15.547002025414258,
+        15.07380697876215,
+        13.988827995490283,
+        14.2504459945485,
+        15.290728013496846,
+        15.920842997729778,
+        13.721130962949246,
+        14.113684999756515,
+        15.537315048277378
+      ],
+      "itl_p50_ms": 14.749385474715382,
+      "itl_mean_ms": 14.793086189456517,
+      "wall_ms": 446.9919300172478,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "reset_prefix_cache": true,
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 0.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      }
+    }
+  ],
+  "hot": [
+    {
+      "ttft_ms": 72.48575601261109,
+      "n_tokens": 17,
+      "itl_ms": [
+        13.6215400416404,
+        15.180155984126031,
+        15.891499002464116,
+        14.283448981586844,
+        15.658640011679381,
+        16.63743401877582,
+        16.738766978960484,
+        16.287922975607216,
+        16.880796989426017,
+        17.056612006854266,
+        16.438468010164797,
+        16.84841903625056,
+        17.10739196278155,
+        16.84566104086116,
+        16.706277965568006,
+        16.831305983942002
+      ],
+      "itl_p50_ms": 16.671855992171913,
+      "itl_mean_ms": 16.18839631191804,
+      "wall_ms": 331.50009700329974,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 2112.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      },
+      "ref_cold_ttft_ms": 218.747
+    },
+    {
+      "ttft_ms": 70.55751798907295,
+      "n_tokens": 17,
+      "itl_ms": [
+        16.63225400261581,
+        15.630796027835459,
+        13.908464985433966,
+        14.229792985133827,
+        15.509436023421586,
+        15.558656014036387,
+        15.886310953646898,
+        14.125263027381152,
+        14.111409022007138,
+        15.187902958132327,
+        15.585471992380917,
+        13.715441047679633,
+        14.267565973568708,
+        16.663966001942754,
+        14.900495996698737,
+        13.926576008088887
+      ],
+      "itl_p50_ms": 15.044199477415532,
+      "itl_mean_ms": 14.989987688750261,
+      "wall_ms": 310.39732100907713,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 2112.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      },
+      "ref_cold_ttft_ms": 222.375
+    },
+    {
+      "ttft_ms": 71.8799329479225,
+      "n_tokens": 17,
+      "itl_ms": [
+        14.413964003324509,
+        14.07643302809447,
+        16.901498020160943,
+        15.177786990534514,
+        13.797540974337608,
+        15.718171023763716,
+        15.448011981789023,
+        15.12117002857849,
+        14.438110985793173,
+        13.867911009583622,
+        14.947490009944886,
+        16.7122189886868,
+        13.808382966089994,
+        14.31979303015396,
+        16.252102970611304,
+        16.54793502530083
+      ],
+      "itl_p50_ms": 15.034330019261688,
+      "itl_mean_ms": 15.09678256479674,
+      "wall_ms": 313.42845398467034,
+      "usage": {
+        "prompt_tokens": 3009,
+        "total_tokens": 3041,
+        "completion_tokens": 32
+      },
+      "metrics_delta": {
+        "num_requests_waiting": 0.0,
+        "prefix_cache_queries_total": 3009.0,
+        "prefix_cache_hits_total": 2112.0,
+        "prompt_tokens_total": 3009.0,
+        "generation_tokens_total": 32.0
+      },
+      "ref_cold_ttft_ms": 210.303
+    }
+  ],
+  "median": {
+    "cold_ttft_ms": 218.74747198307887,
+    "cold_itl_p50_ms": 15.10181650519371,
+    "hot_ttft_ms": 71.8799329479225,
+    "hot_itl_p50_ms": 15.044199477415532
+  },
+  "prompt_head": "In the autumn of the year the survey team mapped the northern valley, recording every stream, ridge and forest boundary "
+}

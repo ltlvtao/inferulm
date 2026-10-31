@@ -1,0 +1,13 @@
+ts: 2026-10-31T16:33:56+08:00
+cfg: combo-ssmbf16
+git: 1da2b26
+gpu: NVIDIA GeForce RTX 4090, 610.88
+vllm: 0.32.0
+torch: 2.13.0+cu130 13.0
+model: /home/lvtao/.cache/wein/Qwen3.5-4B-text
+max_model_len: 8192
+gpu_memory_utilization: 0.85
+extra flags: --quantization fp8 --mamba-ssm-cache-dtype bfloat16 --max-num-batched-tokens 8192 --max-num-seqs 256 --compilation-config {"mode":3,"cudagraph_capture_sizes":[1,2,4,8,16,32,64,100,128,192,256,384,512]}
+extra env: <none>
+startup_s: 107
+gpu_used_after_start_mib: 20958

@@ -1,0 +1,13 @@
+ts: 2026-10-31T15:44:54+08:00
+cfg: mbt4096
+git: 1da2b26
+gpu: NVIDIA GeForce RTX 4090, 610.88
+vllm: 0.32.0
+torch: 2.13.0+cu130 13.0
+model: /home/lvtao/.cache/wein/Qwen3.5-4B-text
+max_model_len: 8192
+gpu_memory_utilization: 0.9
+extra flags: --max-num-batched-tokens 4096 --max-num-seqs 256
+extra env: <none>
+startup_s: 109
+gpu_used_after_start_mib: 22395
