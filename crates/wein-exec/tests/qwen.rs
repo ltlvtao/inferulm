@@ -873,3 +873,211 @@ fn qs9_spec_state_rows_bitwise() {
     assert_eq!(nxt.draft_tokens.len(), 0);
     eprintln!("qs9 后续单 token 验证：target={:?}", nxt.target_tokens);
 }
+
+// ── qs10/qs11：投机解码端到端（step 接线 + per-span spec 隔离性）──
+
+/// 一次 step 产出的 token 按 id 归并（同一请求一步可多个 token——投机步）
+fn collect(out: &[(u64, u32)], got: &mut Vec<(u64, Vec<u32>)>) {
+    for &(id, tok) in out {
+        match got.iter_mut().find(|(r, _)| *r == id) {
+            Some((_, v)) => v.push(tok),
+            None => got.push((id, vec![tok])),
+        }
+    }
+}
+
+fn toks_of(got: &[(u64, Vec<u32>)], id: u64) -> Vec<u32> {
+    got.iter().find(|(r, _)| *r == id).map(|(_, v)| v.clone()).unwrap_or_default()
+}
+
+/// qs10 · 投机解码的正确性合同：同一 prompt 两个请求 A(spec_k=4) / B(spec_k=0)
+/// 各自贪心生成 24 token，**逐 token 相同**——草稿只是猜测，验证 + 逐位置
+/// state 回滚保证输出与普通 decode 逐位一致（分布不变）。
+///
+/// 批形状说明：A 的每步是"一条链 5 行"的 eager 前向，B 的每步是 1 行 eager
+/// 前向；cuBLASLt 跨 M 换 algo 会有 ~1/2048 的位差，所以此条只断言 token
+/// 序列（argmax 决策）相同，不拿 logits 位级对拍。radix 关掉（`set_radix`）：
+/// 同 prompt 的前缀缓存命中会让 B 的 prefill 形状与 A 不同。
+#[test]
+fn qs10_spec_greedy_matches_plain_bitwise() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    if !ex.has_mtp() {
+        eprintln!("SKIP（checkpoint 无 MTP 草稿层权重 mtp.*）");
+        return;
+    }
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains and the river flows quietly through the ancient forest",
+    );
+    p.truncate(24);
+    let l = p.len();
+    const N: usize = 24;
+
+    // A = 投机（k=4），B = 普通
+    ex.admitted(1, &p);
+    ex.admitted(2, &p);
+    ex.set_spec(1, 4);
+    ex.spec_stats_reset();
+    let ta = ex.step(&StepPlan { prefill: vec![(1, l)], decode: vec![1], batch: vec![] });
+    let tb = ex.step(&StepPlan { prefill: vec![(2, l)], decode: vec![2], batch: vec![] });
+    assert_eq!(ta.len(), 1, "prefill 追平步出首 token");
+    assert_eq!(tb.len(), 1, "prefill 追平步出首 token");
+    let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+    collect(&ta, &mut got);
+    collect(&tb, &mut got);
+    assert_eq!(toks_of(&got, 1), toks_of(&got, 2), "首 token（prefill 末位采样）须相同");
+
+    // 交替推进：A 每步 1..=k+1 个 token，B 每步 1 个
+    let mut per_step: Vec<usize> = Vec::new();
+    while toks_of(&got, 1).len() < N || toks_of(&got, 2).len() < N {
+        if toks_of(&got, 1).len() < N {
+            let out = ex.step(&StepPlan { prefill: vec![], decode: vec![1], batch: vec![] });
+            let n = out.iter().filter(|(id, _)| *id == 1).count();
+            assert!((1..=5).contains(&n), "投机步须出 1..=k+1 个 token（实得 {n}）");
+            per_step.push(n);
+            collect(&out, &mut got);
+        }
+        if toks_of(&got, 2).len() < N {
+            let out = ex.step(&StepPlan { prefill: vec![], decode: vec![2], batch: vec![] });
+            collect(&out, &mut got);
+        }
+    }
+    let (a, b) = (toks_of(&got, 1), toks_of(&got, 2));
+    assert_eq!(&a[..N], &b[..N], "投机序列须与普通贪心逐 token 相同");
+    let (rounds, drafts, accepted, fallbacks) = ex.spec_stats();
+    let acc = accepted as f64 / drafts.max(1) as f64;
+    eprintln!(
+        "qs10 投机 vs 普通：{N} token 逐 token 相同；接受率 {:.1}%（{accepted}/{drafts}，{rounds} 轮，退化 {fallbacks}）",
+        acc * 100.0
+    );
+    let mut hist: Vec<(usize, usize)> = Vec::new();
+    for &n in &per_step {
+        match hist.iter_mut().find(|(k, _)| *k == n) {
+            Some((_, c)) => *c += 1,
+            None => hist.push((n, 1)),
+        }
+    }
+    hist.sort();
+    eprintln!(
+        "  每步出 token 分布：{}（共 {} 步 decode）",
+        hist.iter().map(|(n, c)| format!("{n}个×{c}")).collect::<Vec<_>>().join("，"),
+        per_step.len()
+    );
+}
+
+/// qs11 · 混合步隔离性（per-span spec）：一步里 2 个投机请求 + 2 个普通请求
+/// + 1 个 prefill chunk 同批推进，所有请求的输出仍与其"单独跑（spec 关）"
+/// 的贪心序列逐 token 相同。
+///
+/// 单执行器内两趟：先单独跑参考（spec 关、每请求一行），再同批跑混合步。
+/// `set_radix(false)` 让第二趟的准入不做前缀命中（否则参考趟的 prompt 块会
+/// 被复用，前向批形状变化）。
+#[test]
+fn qs11_spec_mixed_batch() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    if !ex.has_mtp() {
+        eprintln!("SKIP（checkpoint 无 MTP 草稿层权重 mtp.*）");
+        return;
+    }
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let base = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains and the river flows quietly through the ancient forest where birds sing \
+         their evening songs before night falls over the sleeping village, and the farmers \
+         walk home along the narrow road with lanterns in their hands",
+    );
+    assert!(base.len() >= 36, "prompt 须 ≥ 36 token（实得 {}）", base.len());
+    const N: usize = 6; // 每请求比较的 token 数（形状差 1/2048 的容忍窗）
+    // 5 个不同 prompt（长度各异，prefill chunk 只有 E 留尾）
+    let prompts: Vec<Vec<u32>> = (0..5u32)
+        .map(|i| {
+            let mut q = base.clone();
+            q.truncate(20 + 4 * i as usize);
+            q.rotate_left(i as usize * 3);
+            q
+        })
+        .collect();
+
+    // ── 第一趟：参考序列（5 个请求各自单独跑，spec 关）──
+    let mut reference: Vec<Vec<u32>> = Vec::new();
+    for (i, q) in prompts.iter().enumerate() {
+        let id = 100 + i as u64;
+        ex.admitted(id, q);
+        let l = q.len();
+        let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+        // E（最后一例）按 16+尾 分两段 prefill，与混合趟同形（首段不带采样位）
+        if i == 4 {
+            let o = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![], batch: vec![] });
+            assert!(o.is_empty(), "chunked prefill 中间段不采样");
+            let o = ex.step(&StepPlan {
+                prefill: vec![(id, l - 16)],
+                decode: vec![id],
+                batch: vec![],
+            });
+            collect(&o, &mut got);
+        } else {
+            let o =
+                ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+            collect(&o, &mut got);
+        }
+        while toks_of(&got, id).len() < N + 1 {
+            let o = ex.step(&StepPlan { prefill: vec![], decode: vec![id], batch: vec![] });
+            collect(&o, &mut got);
+        }
+        reference.push(toks_of(&got, id)[..N].to_vec());
+    }
+    ex.retain(&[]); // 行/状态/页全回收
+    ex.spec_stats_reset();
+
+    // ── 第二趟：混合批（A/B 投机 k=3，C/D 普通，E 带 16 token 的 prefill 尾段）──
+    let ids: Vec<u64> = (1..=5).collect();
+    for (i, q) in prompts.iter().enumerate() {
+        ex.admitted(ids[i], q);
+    }
+    ex.set_spec(1, 3);
+    ex.set_spec(2, 3);
+    // A..D 各自 prefill 追平并出首 token（E 只喂前 16 token，尾段留给混合步）
+    let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+    for i in 0..4 {
+        let (id, l) = (ids[i], prompts[i].len());
+        let o = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+        collect(&o, &mut got);
+    }
+    let oe = ex.step(&StepPlan { prefill: vec![(5, 16)], decode: vec![], batch: vec![] });
+    assert!(oe.is_empty(), "chunked prefill 中间段不采样");
+    // 混合步 1：2 投机 + 2 普通 + 1 prefill 尾段
+    let e_tail = prompts[4].len() - 16;
+    let o = ex.step(&StepPlan {
+        prefill: vec![(5, e_tail)],
+        decode: ids.clone(),
+        batch: ids.clone(),
+    });
+    collect(&o, &mut got);
+    // 继续纯 decode 混合步（投机与普通同批）
+    while ids.iter().any(|&id| toks_of(&got, id).len() < N) {
+        let o = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: ids.clone() });
+        collect(&o, &mut got);
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let want = &reference[i];
+        let have = toks_of(&got, *id);
+        assert_eq!(
+            &have[..N],
+            &want[..],
+            "请求 {id}（{}）的输出须与单独跑（spec 关）逐 token 相同",
+            if i < 2 { "投机 k=3" } else if i < 4 { "普通" } else { "prefill 尾段" }
+        );
+    }
+    let (rounds, drafts, accepted, fallbacks) = ex.spec_stats();
+    eprintln!(
+        "qs11 混合批：5 请求 × {N} token 全部与单独跑逐 token 相同；投机接受率 {:.1}%（{accepted}/{drafts}，{rounds} 轮，退化 {fallbacks}）",
+        accepted as f64 / drafts.max(1) as f64 * 100.0
+    );
+}

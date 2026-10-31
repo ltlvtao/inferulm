@@ -242,7 +242,7 @@ impl QwenMirror {
                     let convd =
                         kref::conv1d_dw(&qkv, &w.conv, &self.conv_state[li], &[0], &[0], cd, 4);
                     self.conv_state[li] =
-                        kref::conv_state_roll(&qkv, &self.conv_state[li], &[0], &[1], &[0], cd, 4, 0);
+                        kref::conv_state_roll(&qkv, &self.conv_state[li], &[0], &[1], &[0], cd, 4, &[0]);
                     let q = convd[..keyd].to_vec();
                     let k = convd[keyd..2 * keyd].to_vec();
                     let v = convd[2 * keyd..].to_vec();
@@ -251,7 +251,7 @@ impl QwenMirror {
                     let b = gemm_bf16(&n1, &w.b, 1, vh_n, h);
                     let core = kref::deltanet(
                         &q, &k, &v, &a, &b, &w.a_log, &w.dtb, &mut self.lin_state[li], &[0], &[1],
-                        &[0], kh_n, vh_n, kd, vd, L2_EPS, 0,
+                        &[0], kh_n, vh_n, kd, vd, L2_EPS, &[0],
                     );
                     let normed = kref::rms_norm_gated(&core, &z, &w.norm, vh_n, vd, eps);
                     li += 1;

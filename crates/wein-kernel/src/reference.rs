@@ -480,14 +480,15 @@ pub fn conv_state_roll(
     row_id: &[u32],
     conv_dim: usize,
     kernel: usize,
-    spec: u32,
+    specs: &[u32],
 ) -> Vec<u16> {
     let st = kernel - 1;
+    assert_eq!(specs.len(), row_start.len(), "specs 须与段数同长（逐 span 标志）");
     let mut out = state.to_vec();
-    if spec != 0 {
-        // spec==1 镜像 kernel：第 t 个 token 处理完把窗口写行 row_id[r]+t+1
-        // （行 j = 前 j 个 token 之后的 conv 状态；spec==0 分支不动作）
-        for r in 0..row_start.len() {
+    for r in 0..row_start.len() {
+        if specs[r] != 0 {
+            // specs[r]==1 镜像 kernel：第 t 个 token 处理完把窗口写行
+            // row_id[r]+t+1（行 j = 前 j 个 token 之后的 conv 状态）
             for c in 0..conv_dim {
                 let rbase = row_id[r] as usize * conv_dim * st + c * st;
                 let t0 = row_start[r] as i64;
@@ -504,9 +505,11 @@ pub fn conv_state_roll(
                 }
             }
         }
-        return out;
     }
     for r in 0..row_start.len() {
+        if specs[r] != 0 {
+            continue; // 逐位置段不走逐段滚动（与 kernel 同分流）
+        }
         for c in 0..conv_dim {
             let base = row_id[r] as usize * conv_dim * st + c * st;
             for j in 0..st {
@@ -545,9 +548,10 @@ pub fn deltanet(
     k_dim: usize,
     v_dim: usize,
     l2_eps: f32,
-    spec: u32,
+    specs: &[u32],
 ) -> Vec<u16> {
     let kd_sqrt = (k_dim as f32).sqrt();
+    assert_eq!(specs.len(), row_start.len(), "specs 须与段数同长（逐 span 标志）");
     let total = row_start
         .iter()
         .zip(row_count)
@@ -565,10 +569,13 @@ pub fn deltanet(
             // E2 镜像（kd=vd=128）：kernel 的 kvm/o 是切片+两级折叠的
             // warp 归约树——同树镜像保位对齐；其余形状 j 严格升序
             let e2 = k_dim == 128 && v_dim == 128;
-            // 行 stride = v_heads*v_dim*k_dim（与 kernel 同）。spec==0：整段
-            // 一份 S 原地递推；spec==1：token i 读行 row_id[r]+i、写行 +i+1
-            // （逐位置落盘，与 kernel spec 分支同树同序）。S 装载即展宽、
-            // 更新即收 bf16——逐 token 装载/回写与原一次性回写位等价
+            // 行 stride = v_heads*v_dim*k_dim（与 kernel 同）。specs[r]==0：
+            // 整段一份 S 原地递推；specs[r]==1：token i 读行 row_id[r]+i、
+            // 写行 +i+1（逐位置落盘，与 kernel 逐 span 分支同树同序）。
+            // 标志按段取（与 kernel 同）——同一次调用里可混普通段与链段。
+            // S 装载即展宽、更新即收 bf16——逐 token 装载/回写与原一次性
+            // 回写位等价
+            let spec = specs[r];
             let rstride = v_heads * v_dim * k_dim;
             let base0 = (row_id[r] as usize * v_heads + h) * v_dim * k_dim;
             for i in 0..cnt {

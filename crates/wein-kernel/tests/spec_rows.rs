@@ -81,22 +81,24 @@ fn o26_conv_state_roll_spec_rows() {
     );
 
     // spec==0 回归：单段滚动 ≡ reference
-    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &drid, cd as u32, kernel as u32, 1, 0, &stream);
+    let dspec0 = gpu.alloc_from_slice(&[0u32]);
+    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &drid, cd as u32, kernel as u32, 1, &dspec0, &stream);
     stream.sync();
     let got0: Vec<u16> = dstate.read_to_vec();
     let want0 =
-        reference::conv_state_roll(&x, &init, &[0], &[cnt as u32], &[base], cd, kernel, 0);
+        reference::conv_state_roll(&x, &init, &[0], &[cnt as u32], &[base], cd, kernel, &[0]);
     assert_bits("conv_state_roll spec==0", &got0, &want0);
 
     // spec==1：逐位置落盘
     let dstate1 = gpu.alloc_from_slice(&init);
-    t.conv_state_roll.run(&dx, &dstate1, &drs, &drc, &drid, cd as u32, kernel as u32, 1, 1, &stream);
+    let dspec1 = gpu.alloc_from_slice(&[1u32]);
+    t.conv_state_roll.run(&dx, &dstate1, &drs, &drc, &drid, cd as u32, kernel as u32, 1, &dspec1, &stream);
     stream.sync();
     let got: Vec<u16> = dstate1.read_to_vec();
     let rl = cd * st;
     for j in 1..=cnt {
         let want = reference::conv_state_roll(
-            &x, &init, &[0], &[j as u32], &[base], cd, kernel, 0,
+            &x, &init, &[0], &[j as u32], &[base], cd, kernel, &[0],
         );
         assert_bits(
             &format!("conv spec 行 base+{j} ≡ 前 {j} token 的独立结果"),
@@ -145,30 +147,32 @@ fn o27_deltanet_spec_rows() {
         gpu.alloc_from_slice(&[base]),
     );
     let dout = gpu.alloc_bytes(cnt * vh * vd * 2);
-    let launch = |dstate: &wein_kernel::cuda::DevBuf, spec: u32| {
+    let launch = |dstate: &wein_kernel::cuda::DevBuf, specs: &wein_kernel::cuda::DevBuf| {
         t.deltanet.run(
             &dq, &dk, &dv, &da, &db, &da_log, &ddtb, dstate, &dout, &drs, &drc, &drid, 1,
-            kh as u32, vh as u32, kd as u32, vd as u32, eps, spec, &stream,
+            kh as u32, vh as u32, kd as u32, vd as u32, eps, specs, &stream,
         );
     };
 
     // spec==0 回归：单段单行递推 ≡ reference（位对齐合同）
     let ds0 = gpu.alloc_from_slice(&init);
-    launch(&ds0, 0);
+    let dspec0 = gpu.alloc_from_slice(&[0u32]);
+    launch(&ds0, &dspec0);
     stream.sync();
     let got0: Vec<u16> = ds0.read_to_vec();
     let out0: Vec<u16> = dout.read_to_vec();
     let mut st_ref = init.clone();
     let want0 = reference::deltanet(
         &q, &k, &v, &a, &b, &a_log, &dt_bias, &mut st_ref, &[0], &[cnt as u32], &[base], kh, vh,
-        kd, vd, eps, 0,
+        kd, vd, eps, &[0],
     );
     assert_bits("deltanet spec==0 state", &got0, &st_ref);
     assert_bits("deltanet spec==0 core_out", &out0, &want0);
 
     // spec==1：逐位置行 —— 行 base+j ≡ 前 j 个 token 的独立结果
     let ds1 = gpu.alloc_from_slice(&init);
-    launch(&ds1, 1);
+    let dspec1 = gpu.alloc_from_slice(&[1u32]);
+    launch(&ds1, &dspec1);
     stream.sync();
     let got: Vec<u16> = ds1.read_to_vec();
     let out1: Vec<u16> = dout.read_to_vec();
@@ -176,7 +180,7 @@ fn o27_deltanet_spec_rows() {
         let mut st_j = init.clone();
         let out_j = reference::deltanet(
             &q, &k, &v, &a, &b, &a_log, &dt_bias, &mut st_j, &[0], &[j as u32], &[base], kh, vh,
-            kd, vd, eps, 0,
+            kd, vd, eps, &[0],
         );
         assert_bits(
             &format!("deltanet spec 行 base+{j} ≡ 前 {j} token 的独立结果"),

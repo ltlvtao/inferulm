@@ -733,7 +733,7 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
     conv_dim: u32,
     kernel: u32,
     rows: u32,
-    spec: u32,
+    specs: *const u32, // [rows] 逐 span 投机标志（0 = 逐段滚动；1 = 逐位置落盘）
 ) {
     let cd = conv_dim as usize;
     let st = (kernel - 1) as usize;
@@ -742,11 +742,13 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
         return;
     }
     let (r, c) = (udiv(i, cd), urem(i, cd));
-    // spec==1（MTP 验证链的逐位置落盘）：第 t 个 token（段内局部下标 t）
+    // specs[r]==1（MTP 验证链的逐位置落盘）：第 t 个 token（段内局部下标 t）
     // 处理完把窗口写行 row_id[r]+t+1——行 j 即"前 j 个 token 之后"的 conv
     // 状态，与 deltanet 的 spec 分支同构。读写行不相交（读 row_id[r]、
-    // 写 row_id[r]+1..=cnt），无原地序依赖；spec==0 路径文本不动。
-    if spec != 0 {
+    // 写 row_id[r]+1..=cnt），无原地序依赖；specs[r]==0 路径文本不动。
+    // **逐 span 数组**（不是整批标量）：真实一步里普通 decode 行、prefill
+    // 行与投机链行同批，标志必须按段取——整批单标志只能表达"全批一条链"。
+    if *specs.add(r) != 0 {
         let rbase = *row_id.add(r) as usize * cd * st + c * st;
         let t0 = *row_start.add(r) as usize;
         let cnt = *row_count.add(r) as usize;
@@ -918,7 +920,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     v_dim: u32,
     l2_eps: f32,
     scratch: *mut f32, // [块, 1024]——E2 kvm/o 两级折叠槽（op 预分配，块按 blockIdx 私有）
-    spec: u32,         // 0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
+    specs: *const u32, // [rows] 逐 span：0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
 ) {
     let (kd, vd) = (k_dim as usize, v_dim as usize);
     let vh = v_heads as usize;
@@ -941,7 +943,9 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         if bid >= n_rows as usize * vh {
             return;
         }
-        // ── spec==1：逐位置 state 行（MTP 验证链的零拷贝回滚）──
+        // ── specs[r]==1：逐位置 state 行（MTP 验证链的零拷贝回滚）──
+        // 逐 span 取标志（不是整批标量）：同一步里链行与其他请求的普通行
+        // 同批——只有链段走逐位置落盘，其余段仍走下面的 spec==0 路径。
         // 链占连续 state 行 row_id[r] ..= row_id[r]+cnt：token i 读行
         // row_id[r]+i、写行 row_id[r]+i+1（行 stride = vh*vd*kd）。cnt 个 token
         // 跑完后行 +j 即"处理了前 j 个 token 之后"的递推状态——接受 j 个
@@ -949,7 +953,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         // 元素级表达式/归约树与下方 spec==0 路径逐字同式（这里是拷贝而非改
         // 公共代码）——spec==0 的文本与算术序原样不动，位对齐合同与寄存器
         // 占用都不受影响。读基址 sbase 与写基址 swrite 分离、逐 token 推进。
-        if spec != 0 {
+        if *specs.add(udiv(bid, vh)) != 0 {
             let (r, h) = (udiv(bid, vh), urem(bid, vh));
             let kh = h * k_heads as usize / vh;
             let t = _thread_idx_x() as usize;
@@ -1170,11 +1174,11 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         }
         return;
     }
-    // spec==1（逐位置 state 行）只在 kd=vd=128 的 E2 fast path 上实现——exec
-    // 侧保证投机验证链只在该形状下走 spec 分支（链形状 = 真模型快路径）；
+    // specs[r]==1（逐位置 state 行）只在 kd=vd=128 的 E2 fast path 上实现——
+    // exec 侧保证投机验证链只在该形状下走 spec 分支（链形状 = 真模型快路径）；
     // 通用路径不镜像：误用即 trap（warp 死给驱动报，不展开 panic 宿主调用——
-    // k2 的"PTX 无 call"结构门禁也保持）。spec==0 的通用路径文本不动。
-    if spec != 0 {
+    // k2 的"PTX 无 call"结构门禁也保持）。specs[r]==0 的通用路径文本不动。
+    if *specs.add(udiv(_block_idx_x() as usize, vh)) != 0 {
         unsafe { core::arch::nvptx::trap() };
     }
     let bid = _block_idx_x() as usize;

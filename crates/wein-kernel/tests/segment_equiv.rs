@@ -98,7 +98,7 @@ fn o15_conv_segment_equivalence() {
         }
         let out_ref = reference::conv1d_dw(&xb, &w, &state_ref, &tok_row, &tok_pos, cd, ks);
         assert_bits(&format!("o15 批{bi}：参考分段 vs 整段真值"), &out_ref, &expb);
-        state_ref = reference::conv_state_roll(&xb, &state_ref, &rs, &rc, &rid, cd, ks, 0);
+        state_ref = reference::conv_state_roll(&xb, &state_ref, &rs, &rc, &rid, cd, ks, &vec![0u32; rows]);
 
         let (dx, dtr, dtp) = (
             gpu.alloc_from_slice(&xb),
@@ -115,7 +115,8 @@ fn o15_conv_segment_equivalence() {
             gpu.alloc_from_slice(&rc),
             gpu.alloc_from_slice(&rid),
         );
-        t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &drid, cd as u32, ks as u32, rows as u32, 0, &stream);
+        let dspec0 = gpu.alloc_from_slice(&vec![0u32; rows]); // 非投机路径：全 0 常量数组
+        t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &drid, cd as u32, ks as u32, rows as u32, &dspec0, &stream);
         stream.sync();
         assert_bits(&format!("o15 批{bi}：GPU 分段 vs 整段真值"), &dout.read_to_vec(), &expb);
     }
@@ -154,7 +155,7 @@ fn o16_deltanet_segment_equivalence() {
         let mut s0 = vec![0u16; vh_n * vd * kd];
         let out = reference::deltanet(
             &q_full[r], &k_full[r], &v_full[r], &a_full[r], &b_full[r], &a_log, &dtb,
-            &mut s0, &[0], &[ntok as u32], &[0], kh_n, vh_n, kd, vd, eps, 0,
+            &mut s0, &[0], &[ntok as u32], &[0], kh_n, vh_n, kd, vd, eps, &[0],
         );
         truth.push(out);
     }
@@ -181,7 +182,7 @@ fn o16_deltanet_segment_equivalence() {
         }
         let out_ref = reference::deltanet(
             &qb, &kb, &vb, &ab, &bb, &a_log, &dtb, &mut state_ref, &rs, &rc, &rid,
-            kh_n, vh_n, kd, vd, eps, 0,
+            kh_n, vh_n, kd, vd, eps, &vec![0u32; rows],
         );
         // 参考输出按批内全局 token 轴铺开——重排回 (row, 段内序) 与真值对拍
         let mut gotb: Vec<u16> = vec![];
@@ -205,9 +206,10 @@ fn o16_deltanet_segment_equivalence() {
         );
         let tokens = qb.len() / keyd;
         let dout = gpu.alloc_bytes(tokens * vald * 2);
+        let dspec0 = gpu.alloc_from_slice(&vec![0u32; rows]); // 非投机路径：全 0 常量数组
         t.deltanet.run(
             &dq, &dk_, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &drid,
-            rows as u32, kh_n as u32, vh_n as u32, kd as u32, vd as u32, eps, 0, &stream,
+            rows as u32, kh_n as u32, vh_n as u32, kd as u32, vd as u32, eps, &dspec0, &stream,
         );
         stream.sync();
         // GPU 输出同为批内全局 token 轴——同法重排

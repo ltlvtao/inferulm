@@ -348,6 +348,37 @@ impl Scheduler {
         }
     }
 
+    /// 投机步的多 token 发射记账：`plan()` 每步只按"1 个 token"记了一次
+    /// （generated/forwarded 各 +1、`on_sample` 一次）；当执行器一步真实发出
+    /// n > 1 个 token 时，引擎对**第 2 个起**的每个 token 调一次本方法补齐。
+    ///
+    /// 语义：把 `generated`/`forwarded` 同步前进 1（保持 decode 不变量
+    /// `prompt_len + generated - forwarded == 1`），容量侧补一次 `on_sample`。
+    /// **额度边界**：`generated >= max_tokens` 时返回 false（不记账）——调用方
+    /// 必须丢弃该 token 并让请求以 Length 立即完成（`step` 拿不到剩余额度，
+    /// 由发射处兜底：超发部分不外吐，执行器内部序列可能多推进 1..k 个 token，
+    /// 但请求已终结，不会影响别的请求或后续输出）。
+    ///
+    /// 返回 true = 已记账（token 可外吐）。
+    pub fn on_emitted(&mut self, id: ReqId) -> bool {
+        let Some(r) = self.reqs.get_mut(&id) else { return false };
+        if r.generated >= r.max_tokens {
+            return false;
+        }
+        r.generated += 1;
+        r.forwarded += 1;
+        let fin = r.generated >= r.max_tokens;
+        self.cap.on_sample(id);
+        if fin {
+            // 与 plan() 的完成判定同路：出批 + 回放队列（下一步首释放容量）
+            self.batch.remove(id);
+            self.m.batch_removes += 1;
+            self.reqs.remove(&id);
+            self.done.push_back(id);
+        }
+        true
+    }
+
     /// 引擎强制抢占（容量模型 on_token 失败时调用，如块耗尽）。
     /// 批内仅剩此请求时拒绝（重排后立刻被强制再准入 → 活锁；应在上游拒绝请求）。
     pub fn preempt(&mut self, id: ReqId) -> bool {

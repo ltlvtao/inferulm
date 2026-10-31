@@ -49,12 +49,13 @@ fn main() {
     let drs = gpu.alloc_from_slice(&(0..n_rows as u32).collect::<Vec<_>>());
     let drc = gpu.alloc_from_slice(&vec![1u32; n_rows]);
     let dri = gpu.alloc_from_slice(&(0..n_rows as u32).collect::<Vec<_>>());
+    let dspec0 = gpu.alloc_from_slice(&vec![0u32; n_rows]); // 非投机路径：全 0 常量数组
 
     let delta_bytes = (state_len * 2 * 3) as f64; // 3 趟状态 r+w（o22 同账，bf16 池）
 
     let delta = |s: &wein_kernel::cuda::Stream| {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, kh as u32, vh as u32, kd as u32, vd as u32, 1e-6, 0, s);
+            n_rows as u32, kh as u32, vh as u32, kd as u32, vd as u32, 1e-6, &dspec0, s);
     };
 
     // ── gemm 簇：线性层全量（m=100, h=2560, ii=9728）──

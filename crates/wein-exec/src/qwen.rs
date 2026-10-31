@@ -55,6 +55,13 @@ const T_MAX: usize = 512;
 const MAX_ROWS: usize = 128;
 /// 序列长上限（paged_attn M0 单线程两遍扫的栈上分母数组；W2 flash 移除）
 const MAX_POS: usize = 256;
+/// 投机草稿的单轮上限：k 步草稿 + 1 个待喂位必须落在绝对位置上限内
+/// （MAX_POS=256）且 MTP 前向批 ≤ T_MAX；k ≤ 8 是两者下的保守上界
+/// （每次草稿 = 一次 MTP kernel 序，k=8 = 8 次 launch，仍远小于主步成本）
+const SPEC_K_MAX: u32 = 8;
+/// 草稿链的 KV 池行（`mtp_chains`）：v1 只用一条干净链，槽位 0..k-1
+const SPEC_CHAIN_ROW: u32 = 0;
+
 /// KV 页池页数（全注意力层共用一个池容量）
 const NUM_PAGES: u32 = 512;
 const BLOCK: u32 = 16;
@@ -134,7 +141,9 @@ struct MtpDev {
 pub struct MtpItem {
     /// 草稿链的块表行（每链独立 KV 页表；因果上下文 = 该链 0..=pos）
     pub kv_page_row: u32,
-    /// 链内位置（= 主模型 token 位置 p；rope 与 KV 槽位同尺）
+    /// 链内位置：page_attn/scatter 的 KV 槽位 + 因果上下文上界。
+    /// 主模型里它与 rope 位置同尺；草稿链（`spec_draft`）里两者分开——
+    /// 槽位用链内局部下标，rope 用绝对位置（见 `mtp_draft_rope`）
     pub pos: u32,
     /// 上一步前向的 hidden 行号（`last_hidden` 的切片尺）
     pub h: u32,
@@ -145,7 +154,10 @@ pub struct MtpItem {
 /// MTP 前向输入束（每项一行的 H2D 小表 + 草稿链块表）
 struct MtpIn<'a> {
     ids: &'a DevBuf<'a>,
+    /// KV 槽位/因果位置（scatter + paged_attn）
     pos: &'a DevBuf<'a>,
+    /// rope 角度位置（可与 `pos` 不同：草稿链槽位局部、rope 绝对）
+    rope_pos: &'a DevBuf<'a>,
     seqs: &'a DevBuf<'a>,
     hrows: &'a DevBuf<'a>,
     bt: &'a DevBuf<'a>,
@@ -201,7 +213,13 @@ struct ScrDev {
     logits: DevBuf<'static>, // [T, vocab]
     am_scratch: DevBuf<'static>, // [T,512] u32
     am_out: DevBuf<'static>, // [T] u32
+    /// 逐 span 投机标志的常量缓冲（长度 T_MAX，覆盖任何 n_rows ≤ T_MAX）：
+    /// 非投机路径全 0、投机链段全 1。**不每步分配/上传**——kernel 只按
+    /// 段号取 `specs[r]`，常量内容一次写定（open 期 zero/upload）
+    specs_zero: DevBuf<'static>,
+    specs_one: DevBuf<'static>,
 }
+
 
 /// 投机验证一轮的结果（`Qwen35Executor::spec_verify`）。
 /// - `accepted`：从第一个草稿起**连续**被接受的草稿数（贪心验证）
@@ -230,6 +248,12 @@ struct ReqState {
     /// 活跃期落过的边界快照 (块, 槽)——每个栅格边界一份，retain 时逐块
     /// 移交（块进树则槽随块，否则槽回池）；抢占重放则全数作废
     snaps: Vec<(u32, u32)>,
+    /// 投机草稿步数（0 = 关；`set_spec` 开）。默认 0 ⇒ 现有测试逐位不受影响
+    spec_k: u32,
+    /// 位置 `forwarded-1` 的目标末层 hidden（一行 2560 bf16）：草稿循环的
+    /// 起点 h_p。由产生该位置的 forward 现场落盘（prefill 步/普通步/spec_verify
+    /// 的落定行）——主 scratch 的行空间逐级覆写，必须单独存
+    hid: Option<DevBuf<'static>>,
 }
 
 /// FULL_DECODE 图档（§7；机制由 w 系在 toy 钉死，此处为 32 层真模型装配）。
@@ -280,8 +304,10 @@ struct FwdIn<'a> {
     ilq: &'a DevBuf<'a>,
     ilk: &'a DevBuf<'a>,
     ilv: &'a DevBuf<'a>,
-    /// 0 = 逐请求单行状态；1 = 投机验证链（逐位置落盘，见 `forward_batch_spec`）
-    spec: u32,
+    /// 逐 span 投机标志（长度 = 段数）：0 = 普通单行状态滚动；1 = 投机
+    /// 验证链（逐位置落盘，见 `forward_batch_spec`）。常量缓冲由 exec 常驻
+    /// （非投机全 0 / 链段全 1）——每步零分配、零上传
+    specs: &'a DevBuf<'a>,
 }
 
 // 独占设备句柄，exec 单线程驱动（§5）——同 DeviceSession 论证
@@ -517,6 +543,11 @@ pub struct Qwen35Executor {
     /// 步时分解插桩（WEIN_STEP_PROFILE；仅 eager——声明序先于 session，
     /// 事件池借用 gpu 与 DevBuf 同一钉扎论证）
     prof: RefCell<Option<StepProf>>,
+    /// 投机读数（测试/探针）：轮数、提出的草稿总数、接受总数、退化次数
+    spec_rounds: u64,
+    spec_drafts: u64,
+    spec_accepted: u64,
+    spec_fallbacks: u64,
     session: DeviceSession,
 }
 
@@ -711,7 +742,12 @@ impl Qwen35Executor {
             logits: pin!(gpu.alloc_bytes(bf(T_MAX * voc))),
             am_scratch: pin!(gpu.alloc_bytes(T_MAX * 512 * 4)),
             am_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            specs_zero: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            specs_one: pin!(gpu.alloc_bytes(T_MAX * 4)),
         };
+        // 逐 span 标志常量：一次写定（非投机 = 全 0；投机链段 = 全 1）
+        scr.specs_zero.zero_on(session.stream());
+        scr.specs_one.upload_on(&vec![1u32; T_MAX], session.stream());
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
         let q_scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
@@ -789,6 +825,10 @@ impl Qwen35Executor {
             q_scale,
             graph: None,
             prof: RefCell::new(prof),
+            spec_rounds: 0,
+            spec_drafts: 0,
+            spec_accepted: 0,
+            spec_fallbacks: 0,
             session,
         })
     }
@@ -871,8 +911,8 @@ impl Qwen35Executor {
             ilk: &fx_ilk,
             ilv: &fx_ilv,
             // 图档恒 spec==0：图内 rid 与块表行同命名空间，投机链不进图
-            // （spec_verify 直走 eager，见其注释）
-            spec: 0,
+            // （spec_verify 直走 eager，见其注释）——常驻全 0 标志缓冲即可
+            specs: &self.scr.specs_zero,
         };
         let voc = self.cfg.vocab_size as u32;
         let mut execs = Vec::with_capacity(buckets.len());
@@ -1087,6 +1127,9 @@ impl Qwen35Executor {
         while accepted < drafts.len() && drafts[accepted] == target[accepted] {
             accepted += 1;
         }
+        // 草稿循环起点：接受位链行 = 位置 start+accepted = 新的 forwarded-1。
+        // scr.x 此刻仍是本轮链行的 hidden（后续任何 forward 都会覆写）
+        self.stash_hidden(id, accepted);
         // 落定行 = 处理完前 1+accepted 个链 token 后的状态；拷回请求状态行
         // （每链每轮恰 1 次 25.2MB 拷回；拷入仅在链首 ≠ state_row 时发生）
         self.copy_row_state(head + 1 + accepted as u32, state_row);
@@ -1106,6 +1149,104 @@ impl Qwen35Executor {
         }
         stream.sync();
         Some(SpecRound { accepted, draft_tokens: drafts[..accepted].to_vec(), target_tokens: target })
+    }
+
+    /// 投机草稿开关（`k` = 单轮草稿数，0 = 关；> SPEC_K_MAX 时 clamp）。
+    /// 默认关闭 ⇒ 现有测试/路径逐位不变。hidden 落点（一行 2560 bf16）按需
+    /// 分配一次；显存分配不得落在图捕获区间（本方法只在运行期调用）
+    pub fn set_spec(&mut self, id: ReqId, k: u32) {
+        let k = k.min(SPEC_K_MAX);
+        let h = self.cfg.hidden_size as usize;
+        let buf = self.session.gpu();
+        let Some(st) = self.reqs.get_mut(&id) else { return };
+        st.spec_k = k;
+        if k > 0 && st.hid.is_none() {
+            st.hid = Some(pin!(buf.alloc_bytes(h * 2)));
+        }
+    }
+
+    /// 以最近一步主前向的末行 hidden + 待喂 token 为起点，自回归生成 k 个草稿。
+    ///
+    /// 语义（MTP 的正确偏移，qs8 已验）：给定位置 p 的目标末层 hidden `h_p`
+    /// 与位置 p+1 的 token，草稿层预测 p+2 的 token。于是
+    /// - 起点 h = 位置 `forwarded-1` 的末层 hidden（`ReqState::hid`，由产生该
+    ///   位置的 forward 现场落盘），tok = `seq[forwarded]`（待喂 token，位置
+    ///   forwarded）⇒ 第 1 个草稿 = 位置 forwarded+1 的预测，正是
+    ///   `spec_verify` 需要的 `drafts[0]`；
+    /// - 自回归：第 i+1 步用第 i 步草稿层的**输出 hidden**（`run_mtp_forward`
+    ///   里 `mtp.norm` 之后、logits 之前写进 `scr.n2` 的那份）当下一行 hidden，
+    ///   token = 第 i 个草稿。
+    ///
+    /// **v1 明确不做草稿链前缀 KV**：每轮一条干净链（`mtp_reset` 语义 + 链内
+    /// 槽位 0..k-1），paged_attn/scatter 的位置用链内局部下标、rope 用绝对位置
+    /// （`run_mtp_forward` 的两个入参本就分开传，见 `mtp_draft_rope`）。理由 +
+    /// 证据：qs8 的自注意消融（每项独立链、pos=0，只看得见自己）总一致率仍
+    /// 45.0%，但逐位输出全变——草稿头主要吃 target hidden + next-token embed，
+    /// 草稿链自注意对 top-1 一致率的贡献在噪声内。前缀 KV（把主链 KV 也给草稿
+    /// 层看）是后续提升项，会抬高接受率。
+    /// **这是近似：影响的是接受率，不是正确性**——草稿只是猜测，`spec_verify`
+    /// 的贪心验证 + 逐位置 state 回滚保证输出分布与普通 decode 逐位相同。
+    ///
+    /// k 上限：`MAX_POS`（绝对位置）与 `T_MAX`（批）约束下取 ≤ SPEC_K_MAX = 8，
+    /// 越界直接 clamp。链尾越界（`start + k + 1 > MAX_POS`）→ 返回空（不投机，
+    /// 调用方退化为普通步）。返回 `Vec<u32>` 长度 = 实际生成的草稿数（≤ k）。
+    pub fn spec_draft(&mut self, id: ReqId, k: u32) -> Vec<u32> {
+        let k = k.min(SPEC_K_MAX) as usize;
+        if k == 0 || self.mtp.is_none() {
+            return Vec::new();
+        }
+        let h = self.cfg.hidden_size as usize;
+        let (start, tok) = match self.reqs.get(&id) {
+            // 待喂 token 不在（序列已在尾）或 hidden 未落盘 → 不投机
+            Some(st) => match (st.seq.get(st.forwarded).copied(), st.hid.is_some()) {
+                (Some(t), true) => (st.forwarded, t),
+                _ => return Vec::new(),
+            },
+            None => return Vec::new(),
+        };
+        let k = k.min(MAX_POS.saturating_sub(start + 1));
+        if k == 0 {
+            return Vec::new();
+        }
+        // h 落主 scratch 行 0（草稿层的 hidden gather 源是主 scratch 的行空间）
+        {
+            let stream = self.session.stream();
+            let hid = self.reqs[&id].hid.as_ref().expect("hid 已判存在");
+            self.scr.x.copy_range_on(0, hid, 0, h * 2, stream);
+        }
+        self.last_t = self.last_t.max(1); // 行 0 有效（h 刚写进去）
+        let mut drafts = Vec::with_capacity(k);
+        let mut cur = tok;
+        for i in 0..k {
+            let items = [MtpItem {
+                kv_page_row: SPEC_CHAIN_ROW,
+                pos: i as u32,                     // 链内槽位（干净链）
+                h: 0,                              // 刚写进 scr.x 行 0 的 hidden
+                next_tok: cur,
+            }];
+            let rope = [start as u32 + i as u32]; // 绝对位置（旋转角）
+            let out = self.mtp_draft_rope(&items, &rope);
+            drafts.push(out[0]);
+            cur = out[0];
+            if i + 1 < k {
+                // 下一行 hidden = 本步草稿层输出（mtp.norm 之后、logits 之前）
+                let stream = self.session.stream();
+                self.scr.x.copy_range_on(0, &self.scr.n2, 0, h * 2, stream);
+            }
+        }
+        drafts
+    }
+
+    /// 位置 `forwarded-1` 的 hidden 落盘（草稿循环起点）：`row` = 该位置在
+    /// `scr.x` 里的批行号（prefill/普通步的采样行，或 spec_verify 的接受位链行）
+    fn stash_hidden(&self, id: ReqId, row: usize) {
+        let h = self.cfg.hidden_size as usize;
+        let Some(st) = self.reqs.get(&id) else { return };
+        let Some(hid) = st.hid.as_ref() else { return };
+        if row >= self.last_t {
+            return;
+        }
+        hid.copy_range_on(0, &self.scr.x, row * h * 2, h * 2, self.session.stream());
     }
 
     /// 链行空间：要 n = cnt+1 连续状态行。优先用请求自己的 state 行当链首
@@ -1381,6 +1522,12 @@ impl Qwen35Executor {
     /// 单段、rid = 链首行（deltanet/conv kernel 的 spec==1 逐位置落盘：token i
     /// 读链行 +i、写 +i+1），conv 的 tap 源行 = 链行 +i、段内局部位恒 0（每
     /// token 的前 kernel-1 个 tap 全在自己那行里）。`None` = 现有语义。
+    ///
+    /// 投机标志按**逐 span 数组**喂（长度 = 段数）：本函数的两条分路各自是
+    /// 单一取值（链 = 全 1、普通 = 全 0），故直接用 exec 常驻的常量缓冲
+    /// `specs_one` / `specs_zero`——每步零分配、零上传。将来把普通行与多条
+    /// 链行**融进同一次 launch** 时，只需按段落序号拼 `[0,1,1,..]` 用小
+    /// scratch `upload_on` 一次（kernel/op 接口已就绪，见 `DeltanetOp`）。
     fn forward_batch_spec(
         &mut self,
         rows: &[(u32, u32, u32, u32)],
@@ -1399,12 +1546,11 @@ impl Qwen35Executor {
         let mut row_start: Vec<u32> = Vec::new();
         let mut row_count: Vec<u32> = Vec::new();
         let mut row_id: Vec<u32> = Vec::new();
-        let mut spec_flag = 0u32;
+
         // conv 的 token 侧索引：tap 源状态行 + 段内局部位（tap 越段前取 state）
         let mut tok_row = Vec::with_capacity(t);
         let mut tok_pos = Vec::with_capacity(t);
         if let Some(head) = spec {
-            spec_flag = 1;
             row_start.push(0);
             row_count.push(t as u32);
             row_id.push(head);
@@ -1495,7 +1641,12 @@ impl Qwen35Executor {
             ilq: &d_ilq,
             ilk: &d_ilk,
             ilv: &d_ilv,
-            spec: spec_flag,
+            // 逐 span 标志：投机链段 = 1、普通段 = 0（常量缓冲，见函数注释）
+            specs: if spec.is_some() {
+                &self.scr.specs_one
+            } else {
+                &self.scr.specs_zero
+            },
         };
         if prof_on {
             self.prof_upload_done(tu);
@@ -1643,7 +1794,7 @@ impl Qwen35Executor {
                         // 状态存**原始 qkv**（conv 前）——tap 与段内同源；
                         // 存 qkvc（conv+silu 后）是解码递推偏差的根源
                         &self.scr.qkv, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
-                        self.cfg.conv_kernel, n_rows, inp.spec, stream,
+                        self.cfg.conv_kernel, n_rows, inp.specs, stream,
                     );
                     self.prof_mark("gather");
                     tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
@@ -1657,7 +1808,7 @@ impl Qwen35Executor {
                     tb.deltanet.run(
                         &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
                         &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
-                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, inp.spec, stream,
+                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, inp.specs, stream,
                     );
                     if trace {
                         // 定位解码递推偏差：conv 输出与 deltanet 输出（decode vs
@@ -1727,6 +1878,26 @@ impl Qwen35Executor {
         self.mtp.is_some()
     }
 
+    /// 前缀缓存开关（运行期覆盖 `WEIN_RADIX` 的 open 期默认）。关掉后后续
+    /// 准入不做 match_prefix（无快照恢复 ⇒ 前向批形状可预测，便于逐位/逐
+    /// token 对拍：qs10/qs11 与性能探针用）
+    pub fn set_radix(&mut self, on: bool) {
+        self.radix_on = on;
+    }
+
+    /// 投机读数：(轮数, 提出的草稿总数, 接受总数, 退化次数)。接受率 =
+    /// accepted / drafts（草稿越多、越准，一步出 token 越多）
+    pub fn spec_stats(&self) -> (u64, u64, u64, u64) {
+        (self.spec_rounds, self.spec_drafts, self.spec_accepted, self.spec_fallbacks)
+    }
+
+    pub fn spec_stats_reset(&mut self) {
+        self.spec_rounds = 0;
+        self.spec_drafts = 0;
+        self.spec_accepted = 0;
+        self.spec_fallbacks = 0;
+    }
+
     /// 草稿链页归还（行清零；页回池）。链属请求态——请求退场/重放时调
     pub fn mtp_reset(&mut self) {
         for (_, blocks) in std::mem::take(&mut self.mtp_chains) {
@@ -1759,7 +1930,17 @@ impl Qwen35Executor {
     /// hidden 行号取自**上一步前向**（`last_hidden` 同尺）；同链项按 pos
     /// 升序给出即可（因果自注意不依赖批内序——scatter 先于 attn 落池）
     pub fn mtp_draft(&mut self, items: &[MtpItem]) -> Vec<u32> {
+        let pos: Vec<u32> = items.iter().map(|i| i.pos).collect();
+        self.mtp_draft_rope(items, &pos)
+    }
+
+    /// 同 `mtp_draft`，但 rope 位置单给：`MtpItem::pos` 管 KV 槽位/因果
+    /// （草稿循环用链内局部下标 0..k-1），`rope_pos[i]` 管旋转角（绝对位置
+    /// forwarded+i）。主模型前向里两者同尺，草稿链里必须分开——链 KV 是
+    /// 每轮重写的干净段（局部槽位），而 token 的真实位置是绝对的。
+    fn mtp_draft_rope(&mut self, items: &[MtpItem], rope_pos: &[u32]) -> Vec<u32> {
         let t = items.len();
+        assert_eq!(rope_pos.len(), t, "rope 位置表须与项数同长");
         assert!(t > 0, "mtp_draft：空批");
         assert!(t <= T_MAX, "MTP 批 {t} 超前向缓冲上限 {T_MAX}");
         let voc = self.cfg.vocab_size;
@@ -1788,9 +1969,10 @@ impl Qwen35Executor {
         let seqs: Vec<u32> = items.iter().map(|i| i.kv_page_row).collect();
         let hrows: Vec<u32> = items.iter().map(|i| i.h).collect();
         let (iq, ig) = qg_split_ids(t, self.cfg.num_heads as usize);
-        let (d_ids, d_pos, d_seqs, d_hrows, d_bt, d_iq, d_ig) = (
+        let (d_ids, d_pos, d_rope_pos, d_seqs, d_hrows, d_bt, d_iq, d_ig) = (
             gpu.alloc_from_slice(&ids),
             gpu.alloc_from_slice(&pos),
+            gpu.alloc_from_slice(rope_pos),
             gpu.alloc_from_slice(&seqs),
             gpu.alloc_from_slice(&hrows),
             gpu.alloc_from_slice(&self.mtp_bt),
@@ -1800,6 +1982,7 @@ impl Qwen35Executor {
         let inp = MtpIn {
             ids: &d_ids,
             pos: &d_pos,
+            rope_pos: &d_rope_pos,
             seqs: &d_seqs,
             hrows: &d_hrows,
             bt: &d_bt,
@@ -1872,8 +2055,8 @@ impl Qwen35Executor {
         tb.gemm.run_wt(&self.scr.n1, &a.v, &self.scr.vh, t32, he, h, stream);
         tb.rms_norm_zc.run(&self.scr.kh, &a.kn, &self.scr.kh, t32 * kvh, hd, eps, stream);
         let rd = self.cfg.rot_dim();
-        tb.rope_pt.run(&self.scr.qh, &self.cos, &self.sin, inp.pos, &self.scr.qh, rd, hd, qh_n, t32, stream);
-        tb.rope_pt.run(&self.scr.kh, &self.cos, &self.sin, inp.pos, &self.scr.kh, rd, hd, kvh, t32, stream);
+        tb.rope_pt.run(&self.scr.qh, &self.cos, &self.sin, inp.rope_pos, &self.scr.qh, rd, hd, qh_n, t32, stream);
+        tb.rope_pt.run(&self.scr.kh, &self.cos, &self.sin, inp.rope_pos, &self.scr.kh, rd, hd, kvh, t32, stream);
         tb.kv_scatter.run(
             &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
             &self.v_pool[w.kv], self.bpr as u32, BLOCK, he, t32, stream,
@@ -2139,7 +2322,17 @@ impl Executor for Qwen35Executor {
         self.reqs.insert(
             id,
             // state_row 默认 = 块表行（现有语义不变；投机链另从 arena 借行）
-            ReqState { seq, forwarded, row, state_row: row, blocks, shared, snaps: Vec::new() },
+            ReqState {
+                seq,
+                forwarded,
+                row,
+                state_row: row,
+                blocks,
+                shared,
+                snaps: Vec::new(),
+                spec_k: 0,
+                hid: None,
+            },
         );
         forwarded
     }
@@ -2157,6 +2350,16 @@ impl Executor for Qwen35Executor {
         }
         let mut batch: Vec<RowIn> = Vec::new();
         let mut samples: Vec<(ReqId, usize)> = Vec::new();
+        // 投机请求分流（纯 decode 且 spec_k > 0）：不走主批——链行是逐位置
+        // 落盘的独立段、且必须 eager（图档的 rid 与块表行同命名空间）。
+        // 主批只留 prefill 行 + spec_k=0 的普通 decode 行，两者照旧同批。
+        let spec_ids: Vec<ReqId> = plan
+            .decode
+            .iter()
+            .copied()
+            .filter(|id| !plan.prefill.iter().any(|&(p, _)| p == *id))
+            .filter(|id| self.reqs.get(id).is_some_and(|st| st.spec_k > 0 && st.forwarded < st.seq.len()))
+            .collect();
         // 1. prefill 段（追平步段尾即采样位）
         for &(id, n) in &plan.prefill {
             let Some(st) = self.reqs.get_mut(&id) else { continue };
@@ -2182,6 +2385,9 @@ impl Executor for Qwen35Executor {
             if plan.prefill.iter().any(|&(p, _)| p == id) {
                 continue;
             }
+            if spec_ids.contains(&id) {
+                continue; // 投机链走下方独立路径（草稿 + 验证）
+            }
             let Some(st) = self.reqs.get_mut(&id) else { continue };
             if st.forwarded < st.seq.len() {
                 let pos = st.forwarded;
@@ -2197,7 +2403,7 @@ impl Executor for Qwen35Executor {
                 samples.push((id, batch.len() - 1));
             }
         }
-        if batch.is_empty() {
+        if batch.is_empty() && spec_ids.is_empty() {
             return Vec::new();
         }
         // 3. 页保证（每请求最大 pos）——先于 scatter
@@ -2214,7 +2420,14 @@ impl Executor for Qwen35Executor {
         let rows: Vec<(u32, u32, u32, u32)> =
             batch.iter().map(|r| (r.row, r.state_row, r.tok, r.pos)).collect();
         let sample_rows: Vec<u32> = samples.iter().map(|s| s.1 as u32).collect();
-        let toks = self.forward_rows(&rows, &sample_rows, plan.prefill.is_empty());
+        // 含投机请求的步一律 eager：链行不进图（forward_graph 有 sr==bt 断言），
+        // 且图捕获的采样行表是纯 decode 桶形的纯函数，混进链批会错位
+        let pure_decode = plan.prefill.is_empty() && spec_ids.is_empty();
+        let toks = if batch.is_empty() {
+            Vec::new()
+        } else {
+            self.forward_rows(&rows, &sample_rows, pure_decode)
+        };
         // 边界快照：本步把行推过硬栅格边界时落一份位拷贝（radix 命中恢复
         // 点；每请求逐边界各借一槽、完成时随块移交）。流序：批
         // 量 memcpy 排在前向 kernel 之后，读到的是落定状态；全步段表攒齐
@@ -2261,6 +2474,13 @@ impl Executor for Qwen35Executor {
                 self.session.stream().memcpy_batch(&ops);
             }
         }
+        // hidden 落盘：投机请求在本批内时（prefill 末位 / 退化普通行），其
+        // 采样行的 hidden 就是位置 forwarded-1 的末层 hidden = 下一轮草稿起点
+        for (id, r) in &samples {
+            if self.reqs.get(id).is_some_and(|st| st.spec_k > 0) {
+                self.stash_hidden(*id, *r);
+            }
+        }
         let mut out = Vec::new();
         for ((id, _), tok) in samples.iter().zip(toks) {
             if let Some(st) = self.reqs.get_mut(id) {
@@ -2268,6 +2488,46 @@ impl Executor for Qwen35Executor {
             }
             out.push((*id, tok));
         }
+        // 4.5 投机：起草 k 个 → 一轮验证 → 1..=k+1 个 token 按序发射
+        let mut spec_out: Vec<(ReqId, u32)> = Vec::new();
+        for id in spec_ids {
+            let k = self.reqs.get(&id).map_or(0, |st| st.spec_k);
+            let drafts = self.spec_draft(id, k);
+            let Some(round) = self.spec_verify(id, &drafts) else {
+                // 分配不到连续 state 行（池满）→ 本步退化为普通 decode 行：
+                // 只喂 pending token、出一个 token。独立 eager 前向（批 1 行）
+                let Some(st) = self.reqs.get(&id) else { continue };
+                if st.forwarded >= st.seq.len() {
+                    continue;
+                }
+                let (bt, sr, tok, pos) =
+                    (st.row, st.state_row, st.seq[st.forwarded], st.forwarded as u32);
+                self.ensure_pages(id, pos as usize);
+                let one = self.forward_batch(&[(bt, sr, tok, pos)], &[0]);
+                if let Some(st) = self.reqs.get_mut(&id) {
+                    st.forwarded += 1;
+                }
+                self.stash_hidden(id, 0); // 本 token 位置的末层 hidden
+                if let Some(st) = self.reqs.get_mut(&id) {
+                    st.seq.push(one[0]);
+                }
+                self.spec_fallbacks += 1;
+                spec_out.push((id, one[0]));
+                continue;
+            };
+            // 读数（接受率账）：本轮草稿数 / 接受数
+            self.spec_rounds += 1;
+            self.spec_drafts += drafts.len() as u64;
+            self.spec_accepted += round.accepted as u64;
+            // 发射序：接受的草稿（位置 forwarded_old+1..）→ 奖励 token
+            // （target_tokens[accepted]，位置 forwarded_old+1+accepted）。
+            // 同一 ReqId 多个条目——引擎侧按序外吐（core.rs 的循环天然容忍）
+            for &tok in &round.draft_tokens {
+                spec_out.push((id, tok));
+            }
+            spec_out.push((id, round.target_tokens[round.accepted]));
+        }
+        out.extend(spec_out);
         out
     }
 

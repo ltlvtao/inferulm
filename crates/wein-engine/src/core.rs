@@ -271,7 +271,17 @@ impl EngineCore {
                 if !cfg.step_delay.is_zero() {
                     sleep(cfg.step_delay).await;
                 }
+                // 同一步内同一请求可发多个 token（投机解码：接受的草稿 + 奖励）。
+                // 调度器 plan() 每步只记 1 个；第 2 个起在此按真实发射补账
+                // （sched.on_emitted），额度耗尽/已终止则丢弃该 token——请求
+                // 随即以 Length 完成（执行器内部序列可能多推进，但已终结）。
+                let mut emitted: HashMap<ReqId, u32> = HashMap::new();
                 for (id, tok) in exec.step(&plan) {
+                    let n = emitted.entry(id).or_insert(0);
+                    if *n > 0 && (!senders.contains_key(&id) || !sched.on_emitted(id)) {
+                        continue; // 已停止（停止词/取消）或超额：丢弃不外吐
+                    }
+                    *n += 1;
                     // 停止词表命中：token 不外吐，请求以 Stop 终结（vLLM 语义）。
                     // 决策必须在发射处——调度器看到 token 时它已经出去了
                     let hit = stops.get(&id).is_some_and(|s| s.contains(&tok));
