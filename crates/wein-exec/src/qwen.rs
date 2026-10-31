@@ -49,10 +49,18 @@ use wein_sched::{ReqId, StepPlan};
 
 use crate::device::{pin, DeviceSession};
 
-/// 批前向 scratch 行数上限（对齐调度 token_budget=512）
+/// 批前向 scratch 行数上限（对齐调度 token_budget=512）。
+/// **不含 logits 表**：lm_head 只对需要出 token 的行做（`LG_CAP` 定尺），
+/// prefill chunk 的中间行不占 logits 显存、也不算 248K 词表投影——
+/// 抬 T_MAX 只需 scratch（[T,·] 那些）与 MAX_ROWS 的对账，见 `LG_CAP`
 const T_MAX: usize = 512;
 /// 块表/状态行数（串行并发上限；serve 接线时 max_running 须 ≤ 此值）
 const MAX_ROWS: usize = 128;
+/// logits 紧凑表行数：一步里**需要 logits 的行**（decode 行 + 每个 prefill
+/// span 的末行 + 投机链行）落进 `[LG_CAP, vocab]` 这张紧凑表。
+/// 定尺 = decode 桶上限 `MAX_ROWS`(128) 的两倍，给混合步的 prefill span 数
+/// 留足余量；与 `T_MAX` 解绑（prefill chunk 再长也不放大 logits 表）
+const LG_CAP: usize = 256;
 /// 序列长上限（paged_attn M0 单线程两遍扫的栈上分母数组；W2 flash 移除）
 const MAX_POS: usize = 256;
 /// 投机草稿的单轮上限：k 步草稿 + 1 个待喂位必须落在绝对位置上限内
@@ -277,7 +285,12 @@ struct ScrDev {
     act: DevBuf<'static>,    // [T,9216]
     m: DevBuf<'static>,      // [T,9216]
     d: DevBuf<'static>,      // [T,2560]
-    logits: DevBuf<'static>, // [T, vocab]
+    /// logits 紧凑表 [LG_CAP, vocab]（行 = 需要 logits 的行在 `lg_rows` 里的
+    /// 序号，不是批内行号——见 `LG_CAP`）。纯 decode/图档时恒等（行号即批号）
+    logits: DevBuf<'static>,
+    /// logits 的 gather 落点 [LG_CAP, 2560]：混合步先把要算的 n2 行拷进来，
+    /// lm_head 只对这个紧凑块做（m = 行数）。恒等步不用它
+    lg_in: DevBuf<'static>,
     am_scratch: DevBuf<'static>, // [T,512] u32
     am_out: DevBuf<'static>, // [T] u32
     // —— 设备端采样器（top-k/top-p）：逐行参数 + RNG 槽状态，全部常驻 ——
@@ -430,8 +443,11 @@ struct MixIn {
     ilv: DevBuf<'static>,
     /// 全块表镜像 [MAX_ROWS × bpr]（页保证先于上传）
     bt: DevBuf<'static>,
-    /// argmax 采样行表 [T_MAX]
+    /// argmax 采样行表 [T_MAX]（值 = logits 紧凑表的下标）
     samples: DevBuf<'static>,
+    /// logits 行表 [LG_CAP]：本步需要 logits 的批内行号（升序）——lm_head
+    /// 之前按它把 n2 的行 gather 进 `scr.lg_in`。段表推导，非采样行表
+    lg_rows: DevBuf<'static>,
     /// 设备端采样器的采样行表 [T_MAX]（只含非 greedy 行——每条按行下标）
     sm_rows: DevBuf<'static>,
 }
@@ -456,6 +472,17 @@ struct FwdIn<'a> {
     /// 验证链（逐位置落盘，见 `forward_batch_spec`）。常量缓冲由 exec 常驻
     /// （非投机全 0 / 链段全 1）——每步零分配、零上传
     specs: &'a DevBuf<'a>,
+    /// logits 行选择（`None` = 全行恒等：纯 decode / 图档 / 单行批）
+    lg: Option<LogitsSel<'a>>,
+}
+
+/// 一步里需要 logits 的批内行（升序紧凑表）：`dev` 是设备端行号表
+/// （lm_head 之前的 gather 源），`rows` 是同一张表的主机镜像（trace 落盘
+/// 时按它把紧凑行 scatter 回批行序）。两张表同序：紧凑下标 i ↔ 批内行 rows[i]
+#[derive(Clone, Copy)]
+struct LogitsSel<'a> {
+    dev: &'a DevBuf<'a>,
+    rows: &'a [u32],
 }
 
 // 独占设备句柄，exec 单线程驱动（§5）——同 DeviceSession 论证
@@ -650,6 +677,9 @@ pub struct Qwen35Executor {
     mtp_free: Vec<u32>,
     /// 上一步前向的批行数（last_hidden 的行数；mtp_draft 的 h 行上界）
     last_t: usize,
+    /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
+    /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
+    last_lg_rows: Vec<u32>,
     /// 24 个线性层状态池 [MAX_ROWS, 32,128,128] f32（层序）
     lin_state: Vec<DevBuf<'static>>,
     /// 24 个线性层 conv 状态池 [MAX_ROWS, 8192,3] bf16
@@ -916,7 +946,8 @@ impl Qwen35Executor {
             act: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
             m: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
             d: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            logits: pin!(gpu.alloc_bytes(bf(T_MAX * voc))),
+            logits: pin!(gpu.alloc_bytes(bf(LG_CAP * voc))),
+            lg_in: pin!(gpu.alloc_bytes(bf(LG_CAP * h))),
             am_scratch: pin!(gpu.alloc_bytes(T_MAX * 512 * 4)),
             am_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
             // 采样器逐行参数 + RNG 槽：**open 期一次分配**（图捕获区间内
@@ -965,6 +996,7 @@ impl Qwen35Executor {
             ilv: pin!(gpu.alloc_bytes(u32b(T_MAX))),
             bt: pin!(gpu.alloc_bytes(u32b(MAX_ROWS * bpr_of()))),
             samples: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            lg_rows: pin!(gpu.alloc_bytes(u32b(LG_CAP))),
             sm_rows: pin!(gpu.alloc_bytes(u32b(T_MAX))),
         };
         session.stream().sync(); // 状态池开局零化落定
@@ -1021,6 +1053,7 @@ impl Qwen35Executor {
             mtp_chains: HashMap::new(),
             mtp_free: (0..MTP_CHAINS as u32).rev().collect(),
             last_t: 0,
+            last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
             k_pool,
@@ -1150,6 +1183,9 @@ impl Qwen35Executor {
             // 图档恒 spec==0：图内 rid 与块表行同命名空间，投机链不进图
             // （spec_verify 直走 eager，见其注释）——常驻全 0 标志缓冲即可
             specs: &self.scr.specs_zero,
+            // 图档 = 纯 decode（t = 桶大小，每行都要 logits）：全行恒等，
+            // 图内 lm_head 的 m 仍是桶大小、拓扑与缓冲布局逐位不变
+            lg: None,
         };
         let voc = self.cfg.vocab_size as u32;
         let mut execs = Vec::with_capacity(buckets.len());
@@ -1259,8 +1295,56 @@ impl Qwen35Executor {
             return Vec::new();
         }
         self.forward_batch(&[(row, state_row, token, pos)], &[]);
-        let bits: Vec<u16> = self.scr.logits.read_to_vec();
+        self.logits_row(0)
+    }
+
+    /// 上一步前向里**批内第 `row` 行**的 logits（bf16 存储 → f32）。
+    /// 只有需要 logits 的行（decode 行 / prefill span 末行 / 链行——见
+    /// `LG_CAP`）算过，段中行返回空表。行号 → 紧凑表行号按上一步的行表
+    /// 反查（恒等步直接同号）
+    pub fn logits_row(&self, row: u32) -> Vec<f32> {
         let voc = self.cfg.vocab_size as usize;
+        let i = if self.last_lg_rows.is_empty() {
+            row as usize
+        } else {
+            match self.last_lg_rows.iter().position(|&r| r == row) {
+                Some(i) => i,
+                None => {
+                    eprintln!("[exec] logits_row({row})：该行本步未算 logits（段中行）");
+                    return Vec::new();
+                }
+            }
+        };
+        if i >= LG_CAP {
+            return Vec::new();
+        }
+        // 只搬这一行（紧凑表整读是 127MB，探针不付这个钱）
+        let one = self.session.gpu().alloc_bytes(voc * 2);
+        one.copy_range_on(0, &self.scr.logits, i * voc * 2, voc * 2, self.session.stream());
+        self.session.stream().sync();
+        let bits: Vec<u16> = one.read_to_vec();
+        bits[..voc].iter().map(|&b| reference::bf16_to_f32(b)).collect()
+    }
+
+    /// **旧全行算法的参考复算**（位级 A/B 面，`qs16` 用）：把上一步前向的
+    /// final-norm 输出按 **m = t 全行**重做一次 lm_head 投影，返回批内第
+    /// `row` 行的 logits。与 `logits_row` 唯一的口径差别是 gemm 的 m（旧
+    /// 算法 m = 批行数，紧凑表 m = 需 logits 的行数）——同一批 hidden 位、
+    /// 同一权重、同一 dtype，所以两侧的差异只可能来自 m 导致的 cublasLt
+    /// 选型（同一选型组内逐位相同，见 `qs16` 的断言）
+    pub fn logits_row_full_ref(&self, row: u32) -> Vec<f32> {
+        let (h, voc) = (self.cfg.hidden_size, self.cfg.vocab_size as usize);
+        let t = self.last_t as u32;
+        assert!(row < t, "logits_row_full_ref：行 {row} 超上一步批（t={t}）");
+        let gpu = self.session.gpu();
+        let stream = self.session.stream();
+        let full = gpu.alloc_bytes(t as usize * voc * 2);
+        self.session.table().gemm.run_wt(&self.scr.n2, &self.embed, &full, t, voc as u32, h, stream);
+        stream.sync();
+        let one = gpu.alloc_bytes(voc * 2);
+        one.copy_range_on(0, &full, row as usize * voc * 2, voc * 2, stream);
+        stream.sync();
+        let bits: Vec<u16> = one.read_to_vec();
         bits[..voc].iter().map(|&b| reference::bf16_to_f32(b)).collect()
     }
 
@@ -2392,8 +2476,37 @@ impl Qwen35Executor {
         }
         let n_rows = row_start.len() as u32;
         self.spec_chain_max = self.spec_chain_max.max(chains.len() as u32);
-
         let (stream, tb) = (self.session.stream(), self.session.table());
+        // ---- logits 行表：段表推导出的"需要出 token 的行"，升序紧凑 ----
+        // 普通段（spec==0）：段尾一行（decode 段 = 唯一行，prefill 段 = chunk 末位）
+        // 链段（spec==1）：整段都要（逐位置 argmax 是接受判定的前提）
+        // 采样行必须落在表内（下面断言）——表 ⊇ samples 是本步正确的合同
+        let mut lg_rows: Vec<u32> = Vec::with_capacity(n_rows as usize);
+        for (i, &st) in row_start.iter().enumerate() {
+            let end = st + row_count[i];
+            if span_spec[i] == 1 {
+                lg_rows.extend(st..end);
+            } else {
+                lg_rows.push(end - 1);
+            }
+        }
+        assert!(lg_rows.len() <= LG_CAP, "logits 行表 {} 超容量 {LG_CAP}", lg_rows.len());
+        // 恒等判定（行表 = [0,1,..,t)）：纯 decode 步与单行批走它——零 gather、
+        // lm_head 直接吃 n2、紧凑行号 = 批内行号，与改造前逐位同一发
+        let lg_ident = lg_rows.len() == t && lg_rows.iter().enumerate().all(|(i, &r)| r as usize == i);
+        // 批内行号 → 紧凑行号（非采样行 = u32::MAX 哨兵，采样行命中不了即违约）
+        let mut lg_pos: Vec<u32> = vec![u32::MAX; t];
+        for (i, &r) in lg_rows.iter().enumerate() {
+            lg_pos[r as usize] = i as u32;
+        }
+        let lg_dev: Option<&DevBuf> = if lg_ident { None } else { Some(&self.mix.lg_rows) };
+        // 读出接口口径（`logits_row`）：恒等步留空（行号即紧凑行号），
+        // 否则记下紧凑表 → 批内行号的映射
+        self.last_lg_rows.clear();
+        if !lg_ident {
+            self.last_lg_rows = lg_rows.clone();
+        }
+
         let prof_on = self.prof.borrow().is_some();
         let tw = Instant::now();
         let ids: Vec<u32> = rows.iter().map(|r| r.2).collect();
@@ -2428,6 +2541,10 @@ impl Qwen35Executor {
         mi.ilq.upload_prefix_on(&ids_lq, stream);
         mi.ilk.upload_prefix_on(&ids_lk, stream);
         mi.ilv.upload_prefix_on(&ids_lv, stream);
+        // logits 行表（仅非恒等步：恒等时 lm_head 直接吃 n2，行表用不上）
+        if !lg_ident {
+            mi.lg_rows.upload_prefix_on(&lg_rows, stream);
+        }
         // 逐 span 标志：全 0/全 1 走常驻常量，混合时拼一次 T_MAX 长的表覆写
         let all_zero = span_spec.iter().all(|&s| s == 0);
         let all_one = span_spec.iter().all(|&s| s == 1);
@@ -2457,6 +2574,7 @@ impl Qwen35Executor {
             ilk: &self.mix.ilk,
             ilv: &self.mix.ilv,
             specs: specs_buf,
+            lg: lg_dev.map(|dev| LogitsSel { dev, rows: &lg_rows }),
         };
         if prof_on {
             self.prof_upload_done(tu);
@@ -2478,15 +2596,24 @@ impl Qwen35Executor {
         }
         let s = samples.len() as u32;
         assert!((s as usize) <= t, "采样行数超批");
+        // 采样行（批内行号）→ logits 紧凑表下标；映射不上 = 段表漏了它的末行
+        let lg_samples: Vec<u32> = samples
+            .iter()
+            .map(|&r| {
+                let i = lg_pos[r as usize];
+                assert_ne!(i, u32::MAX, "采样行 {r} 不在 logits 行表内（段表违约）");
+                i
+            })
+            .collect();
         self.prof_mark("argmax");
-        self.mix.samples.upload_prefix_on(samples, stream);
+        self.mix.samples.upload_prefix_on(&lg_samples, stream);
         tb.argmax_rows.run(
             &self.scr.logits, &self.mix.samples, &self.scr.am_scratch, &self.scr.am_out,
             self.cfg.vocab_size as u32, s, stream,
         );
         // 采样行（temp > 0）另发 sample_rows；全 greedy 步**不发**（argmax
         // 结果原样用——接入前后的 greedy 逐位行为由此结构性不变）
-        let smp_sel = self.launch_sample_rows(rows, samples, smp, stream);
+        let smp_sel = self.launch_sample_rows(rows, samples, &lg_samples, smp, stream);
         self.prof_end();
         stream.sync();
         let tr = Instant::now();
@@ -2514,11 +2641,13 @@ impl Qwen35Executor {
     /// ——调用方在 `stream.sync()` 之后按它把 `sm_out` 覆盖进 argmax 结果；
     /// 全 greedy → `None`（零上传、零 kernel，逐位不变）。
     ///
-    /// RNG 槽 = 该请求的块表行（准入时零化、图内前进、退场即废）。
+    /// `samples` 是批内行号（RNG 槽取 `rows[samples[i]].0`），`lg_samples`
+    /// 是同序的 logits 紧凑表下标（kernel 的采样行表）——两张表同长同序
     fn launch_sample_rows(
         &self,
         rows: &[(u32, u32, u32, u32)],
         samples: &[u32],
+        lg_samples: &[u32],
         smp: &[SampleParams],
         stream: &Stream,
     ) -> Option<Vec<u32>> {
@@ -2534,7 +2663,7 @@ impl Qwen35Executor {
             return None;
         }
         let s = sel.len() as u32;
-        let idx: Vec<u32> = sel.iter().map(|x| samples[x.0 as usize]).collect();
+        let idx: Vec<u32> = sel.iter().map(|x| lg_samples[x.0 as usize]).collect();
         let temp: Vec<f32> = sel.iter().map(|x| x.1.temperature as f32).collect();
         let topk: Vec<u32> = sel.iter().map(|x| x.1.top_k).collect();
         let topp: Vec<f32> = sel.iter().map(|x| x.1.top_p as f32).collect();
@@ -2726,9 +2855,27 @@ impl Qwen35Executor {
         self.prof_mark("norm");
         tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
         self.prof_mark("logits");
-        tb.gemm.run_wt(&self.scr.n2, &self.embed, &self.scr.logits, t32, voc, h, stream);
+        // 只对**需要出 token 的行**做 248K 词表投影：混合/纯 prefill 步里
+        // 段中被丢掉的中间行（chunk 前 255 行）不参与 lm_head。行先按
+        // `lg_rows` gather 进 `lg_in`（复用 embed 的行拷贝 kernel，位拷贝），
+        // 再 gemm m = 行数；恒等步（纯 decode / 图档 / 单行批）零 gather，
+        // 直接吃 n2 前 t 行——旧拓扑逐位不变
+        let lg_n = match inp.lg {
+            None => t32,
+            Some(sel) => {
+                let n = sel.rows.len() as u32;
+                debug_assert!(
+                    n as usize <= t32 as usize && n as usize <= LG_CAP,
+                    "logits 行表越界（{n}）"
+                );
+                tb.embed.run(sel.dev, &self.scr.n2, &self.scr.lg_in, h, n, stream);
+                n
+            }
+        };
+        let lg_src = if inp.lg.is_some() { &self.scr.lg_in } else { &self.scr.n2 };
+        tb.gemm.run_wt(lg_src, &self.embed, &self.scr.logits, lg_n, voc, h, stream);
         if trace {
-            self.trace_logits(step, t32);
+            self.trace_logits(step, t32, inp.lg);
         }
     }
 
@@ -2927,6 +3074,12 @@ impl Qwen35Executor {
         assert_eq!(rope_pos.len(), t, "rope 位置表须与项数同长");
         assert!(t > 0, "mtp_draft：空批");
         assert!(t <= T_MAX, "MTP 批 {t} 超前向缓冲上限 {T_MAX}");
+        // 草稿层末尾也要写 logits 紧凑表（[LG_CAP, vocab]，行 = 项号）。
+        // 一项一链（≤ MTP_CHAINS），越界只可能是调用方违约——按"草稿作废"
+        // 退化（全 0 必被验证拒绝），不 panic 带走引擎任务
+        if t > LG_CAP {
+            return vec![0u32; t];
+        }
         let voc = self.cfg.vocab_size;
         assert!(self.mtp.is_some(), "mtp_draft：checkpoint 无 MTP 权重");
         // 逐项上限检查从 assert 改为**钳制 + debug_assert**：投机只是提示，
@@ -3107,17 +3260,29 @@ impl Qwen35Executor {
         std::fs::write(format!("{dir}/{tag}.f32"), bytes).expect("trace 写盘");
     }
 
-    /// logits 落盘（[t, vocab] f32；对拍终局用）
-    fn trace_logits(&self, step: u32, t: u32) {
+    /// logits 落盘（[t, vocab] f32；对拍终局用）。紧凑表只存了需要 logits
+    /// 的行——按 `lg` 的行表 scatter 回批行序，保持落盘布局与参照端同形
+    fn trace_logits(&self, step: u32, t: u32, lg: Option<LogitsSel>) {
         let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
         if self.graph.is_some() {
             return;
         }
         self.session.stream().sync();
         let voc = self.cfg.vocab_size as usize;
+        let t = t as usize;
         let bits: Vec<u16> = self.scr.logits.read_to_vec();
-        let vals: Vec<f32> =
-            bits[..t as usize * voc].iter().map(|&b| reference::bf16_to_f32(b)).collect();
+        // 紧凑行 i 的内容 → 批行 rows[i]（恒等步 = 行号即批号，直接截前 t 行）
+        let mut full = vec![0u16; t * voc];
+        match lg {
+            None => full.copy_from_slice(&bits[..t * voc]),
+            Some(sel) => {
+                for (i, &r) in sel.rows.iter().enumerate() {
+                    let d = r as usize * voc;
+                    full[d..d + voc].copy_from_slice(&bits[i * voc..(i + 1) * voc]);
+                }
+            }
+        }
+        let vals: Vec<f32> = full.iter().map(|&b| reference::bf16_to_f32(b)).collect();
         let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(format!("{dir}/s{step}-logits.f32"), bytes).expect("trace 写盘");
     }
@@ -3199,6 +3364,8 @@ impl Qwen35Executor {
             return Vec::new();
         }
         self.last_t = m;
+        // 图档 = 恒等 logits 行表（t = 桶大小，全行都算）：读出接口按行号直取
+        self.last_lg_rows.clear();
         // 本步是否有采样行（逐行参数表可能短于样本行——缺省 = greedy）
         let row_smp: Vec<SampleParams> =
             (0..m).map(|j| smp.get(j).copied().unwrap_or_default()).collect();

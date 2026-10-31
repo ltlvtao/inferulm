@@ -17,6 +17,8 @@
 //! - q10 · 行回收零化：回收行重用输出与全新行逐 token 相同
 //! - qs14 · 设备端采样复现性：同 prompt + 同 seed ⇒ 逐 token 相同；异 seed ⇒ 不同
 //! - qs15 · greedy 零影响：`set_sampling(greedy)` 下 24 token 与原 argmax 逐位相同
+//! - qs16 · logits 紧凑行表：decode / 混合（prefill span + decode）/ 纯 prefill
+//!   三条路与旧全行算法的取值一致性 + 段中行零账
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1536,4 +1538,113 @@ fn qs15_greedy_unchanged() {
     let (a, b) = (toks_of(&got, 1), toks_of(&got, 2));
     assert_eq!(&a[..N], &b[..N], "greedy 路径（含显式 set_sampling）须与原 argmax 逐位相同");
     eprintln!("qs15 greedy 零影响：24 token 逐位相同（seq = {:?}）", &a[..N]);
+}
+
+/// qs16 · logits 紧凑行表（"只算需要出 token 的行"）的位级验收。
+///
+/// 三条路各自断言，对照端是 `logits_row_full_ref`——**旧全行算法**：同一批
+/// final-norm 输出、同一权重，只把 lm_head 的 m 放回批行数 t 重算一遍。
+///
+/// 1. 纯 decode 步：行表 = `[0,1,..,t)`（恒等）⇒ 零 gather、m = t 不变
+///    ⇒ 与旧算法**逐位相同**（结构同一发）；
+/// 2. 混合步（2 条 prefill span + 1 个 decode 行，t=17）：行表 = `[7,15,16]`
+///    （两条 span 的末行 + decode 行），m = 3 vs 旧 17 ⇒ 同样**逐位相同**
+///    ——cublasLt 对 m ∈ [2,33] 取同一选型组（同组内逐行结果与 m 无关，
+///    `wein-kernel` 的 lm_head 形状探针实测：m=2..33 两两 0 差异）；
+/// 3. 纯 prefill chunk（32 行单 span）：行表 = `[31]`，m = 1 vs 旧 32 ⇒
+///    m=1 落在 cublasLt 的**另一选型组**（GEMV 形态），取值有舍入级漂移：
+///    断言 argmax（= 采样出的 token）相同、逐元素差 ≤ 2 bf16 ulp（按最大
+///    logit 量级取 ulp）——这层漂移是内核选型的，不是本改造引入的（同一
+///    改造前，混合批里每个不同 t 本就是一次独立选型）。
+///
+/// 另外断言**段中行零账**：chunk 前 31 行 / span 内非末行都取不到 logits
+/// （`logits_row` 返回空表）——这正是本次省下的算力。
+#[test]
+fn qs16_logits_rows_compact() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, and the river flows quietly through the ancient forest where birds sing their evening songs before night falls over the sleeping village below the quiet stars",
+    );
+    p.truncate(33);
+    assert_eq!(p.len(), 33, "截断后 33 token");
+    let mut q = p.clone();
+    q.truncate(9);
+    ex.admitted(1, &p);
+    ex.admitted(2, &q);
+    ex.admitted(3, &q);
+
+    // 位级比较小工具：同一行两侧的 f32 位（bf16 存储展开成 f32 后位模式唯一）
+    let n_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let max_abs = |a: &[f32], b: &[f32]| {
+        a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+    };
+    // bf16 在 |x| = scale 处的 1 ulp（7 位尾数）
+    let bf16_ulp = |scale: f32| (scale.abs().max(1e-4).log2().floor() - 7.0).exp2();
+
+    // ── ① 纯 prefill chunk：32 行单 span（无采样行 ⇒ 只出 logits 不采） ──
+    let out = ex.step(&StepPlan { prefill: vec![(1, 32)], decode: vec![], batch: vec![] });
+    assert!(out.is_empty(), "无采样行的追平段不产 token");
+    let got = ex.logits_row(31);
+    let want = ex.logits_row_full_ref(31);
+    let voc = got.len();
+    assert_eq!(voc, want.len(), "词表维度 = 旧全行算法的词表维度");
+    assert!(ex.logits_row(0).is_empty(), "chunk 段中行（行 0）不该算 logits");
+    assert!(ex.logits_row(15).is_empty(), "chunk 段中行（行 15）不该算 logits");
+    let (d1, m1) = (n_diff(&got, &want), max_abs(&got, &want));
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert_eq!(argmax(&got), argmax(&want), "段尾行 argmax 与旧全行算法一致（m 选型漂移不改决断）");
+    assert!(
+        m1 <= 2.0 * bf16_ulp(scale),
+        "段尾行逐元素差 {m1} 超 2 bf16 ulp（scale={scale}，ulp={}，{d1}/{voc} 不同）",
+        bf16_ulp(scale)
+    );
+    eprintln!("qs16 ① 纯 prefill：行表 [31]，{d1}/{voc} 元素不同（max|Δ|={m1}），argmax 一致");
+
+    // ── ② 混合步：req2/req3 各 8 行 prefill span + req1 一个 decode 行 ──
+    // 行序 = span 先行（0..8 req2、8..16 req3）+ decode 行（16 req1）；
+    // 采样行 = 两条 span 的末行 + decode 行 ⇒ 行表 [7,15,16]，m = 3
+    let out = ex.step(&StepPlan {
+        prefill: vec![(2, 8), (3, 8)],
+        decode: vec![1, 2, 3],
+        batch: vec![],
+    });
+    assert_eq!(out.len(), 3, "两条 span 尾 + 一个 decode 行各出一个 token");
+    for &row in &[7u32, 15, 16] {
+        let got = ex.logits_row(row);
+        assert_eq!(got.len(), voc, "混合步行 {row} 有全词表 logits");
+        let want = ex.logits_row_full_ref(row);
+        assert_eq!(
+            n_diff(&got, &want),
+            0,
+            "混合步行 {row}（m=3 vs 旧 m=17）须与旧全行算法逐位相同"
+        );
+        let t = out.iter().find(|(id, _)| match row {
+            7 => *id == 2,
+            15 => *id == 3,
+            _ => *id == 1,
+        });
+        let (id, t) = t.expect("每行都有采样 token");
+        assert_eq!(argmax(&got), *t, "行 {row}（请求 {id}）采样 token = 该行 argmax");
+    }
+    for &row in &[0u32, 8, 14] {
+        assert!(ex.logits_row(row).is_empty(), "混合步 span 内非末行（行 {row}）不该算 logits");
+    }
+    eprintln!("qs16 ② 混合步：行表 [7,15,16]，三行与旧全行算法逐位相同，段中行零账");
+
+    // ── ③ 纯 decode 步：行表恒等 [0,1,2] ⇒ 零 gather、m 与旧算法同 ──
+    let out = ex.step(&StepPlan { prefill: vec![], decode: vec![1, 2, 3], batch: vec![] });
+    assert_eq!(out.len(), 3, "纯 decode 每请求一个 token");
+    for (row, (id, t)) in out.iter().enumerate() {
+        let row = row as u32;
+        let got = ex.logits_row(row);
+        assert_eq!(got.len(), voc, "decode 行 {row} 有全词表 logits");
+        let want = ex.logits_row_full_ref(row);
+        assert_eq!(n_diff(&got, &want), 0, "decode 行 {row} 须与旧全行算法逐位相同（m 不变）");
+        assert_eq!(argmax(&got), *t, "decode 行 {row}（请求 {id}）token = argmax");
+    }
+    eprintln!("qs16 ③ 纯 decode：恒等行表、零 gather，三行与旧全行算法逐位相同");
 }
