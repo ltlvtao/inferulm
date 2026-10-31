@@ -45,8 +45,7 @@ pub fn toy_logits(prompt: &[u32], cfg: &ToyConfig) -> Vec<f32> {
                 let mut dot = 0f32;
                 for d in 0..hd {
                     dot = kref::bf16_to_f32(qr[base + d])
-                        * kref::bf16_to_f32(k_cache[j * ke + base + d])
-                        + dot;
+                        .mul_add(kref::bf16_to_f32(k_cache[j * ke + base + d]), dot);
                 }
                 *s = dot * scale;
             }
@@ -59,7 +58,7 @@ pub fn toy_logits(prompt: &[u32], cfg: &ToyConfig) -> Vec<f32> {
             for e in 0..hd {
                 let mut acc = 0f32;
                 for (j, &pj) in p.iter().enumerate() {
-                    acc = pj * kref::bf16_to_f32(v_cache[j * ke + base + e]) + acc;
+                    acc = pj.mul_add(kref::bf16_to_f32(v_cache[j * ke + base + e]), acc);
                 }
                 attn[base + e] = kref::f32_to_bf16(acc / denom);
             }

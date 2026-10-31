@@ -1,0 +1,22 @@
+{
+  "config": {
+    "concurrency": 100,
+    "num": 20000
+  },
+  "meta": {
+    "git_rev": "bb210ab",
+    "profile": "release",
+    "ts_unix": 1793438717
+  },
+  "mode": "flood GET /v1/models",
+  "result": {
+    "error_kinds": {},
+    "errors": 0,
+    "lat_p50_ms": 0.522229,
+    "lat_p99_ms": 1.864873,
+    "qps": 156614.21001603783,
+    "wait_p50_ms": 63.194074,
+    "wait_p99_ms": 124.082098,
+    "wall_s": 0.127702333
+  }
+}

@@ -202,8 +202,7 @@ impl QwenMirror {
                             let mut dot = 0.0f32;
                             for d in 0..hd {
                                 dot = kref::bf16_to_f32(q[qh * hd + d])
-                                    * kref::bf16_to_f32(self.k_cache[fi][kb + d])
-                                    + dot;
+                                    .mul_add(kref::bf16_to_f32(self.k_cache[fi][kb + d]), dot);
                             }
                             scores[j] = dot * q_scale;
                             if scores[j] > m {
@@ -219,7 +218,8 @@ impl QwenMirror {
                             let mut acc = 0.0f32;
                             for j in 0..=pos {
                                 let vb = j * kvh * hd + kh * hd;
-                                acc = scores[j] * kref::bf16_to_f32(self.v_cache[fi][vb + e]) + acc;
+                                acc = scores[j]
+                                    .mul_add(kref::bf16_to_f32(self.v_cache[fi][vb + e]), acc);
                             }
                             attn[qh * hd + e] = kref::f32_to_bf16(acc / den);
                         }

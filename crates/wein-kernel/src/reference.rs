@@ -5,7 +5,10 @@
 //! golden vector 框架的价值。cuda/asc 同名算子对拍同一套向量（§4）。
 //!
 //! 对齐纪律（两侧同守）：bf16→f32 精确（位左移）；乘/加/除/sqrt 全部
-//! 正确舍入原语（IEEE 单算），禁 rsqrt 类近似与 fma 收缩；行内顺序累加。
+//! 正确舍入原语（IEEE 单算 + `f32::mul_add` = 融合单次舍入），禁 rsqrt 类
+//! 近似；行内顺序累加。FMA 合同：kernel 侧 `fma()`（PTX `fma.rn.f32`）与本侧
+//! `f32::mul_add`（宿主 x86-64 经 glibc `fmaf`，IEEE 754 融合）同为**正确舍入
+//! 的融合结果** ⇒ 逐位相同（`k2` 断言 PTX 侧，`o*` 断言两侧同值）。
 
 /// bf16 → f32：精确（尾数位左移 16，无舍入）
 pub fn bf16_to_f32(h: u16) -> f32 {
@@ -40,7 +43,7 @@ pub fn rms_norm(x: &[u16], w: &[u16], rows: usize, hidden: usize, eps: f32) -> V
         let mut acc = 0.0f32;
         for i in 0..hidden {
             let v = bf16_to_f32(x[base + i]);
-            acc = v * v + acc; // 顺序累加，与 kernel 同向
+            acc = v.mul_add(v, acc); // 顺序累加，与 kernel 同向（融合单次舍入）
         }
         let inv = 1.0f32 / ((acc / hidden as f32 + eps).sqrt());
         for i in 0..hidden {
@@ -247,7 +250,7 @@ pub fn paged_attn(
                 for i in 0..head_dim {
                     let a = bf16_to_f32(q[qbase + i]);
                     let b = bf16_to_f32(k_cache[kbase + i]);
-                    dot = a * b + dot;
+                    dot = a.mul_add(b, dot);
                 }
                 sc[j] = dot * q_scale;
                 m = if sc[j] > m { sc[j] } else { m };
@@ -266,7 +269,7 @@ pub fn paged_attn(
                     let off = j % block_size;
                     let slot = block_table[s * bpr + blk] as usize * block_size + off;
                     let vbase = slot * he + kh * head_dim;
-                    acc = p[j] * bf16_to_f32(v_cache[vbase + e]) + acc;
+                    acc = p[j].mul_add(bf16_to_f32(v_cache[vbase + e]), acc);
                 }
                 out[(t * q_heads + qh) * head_dim + e] = f32_to_bf16(acc / denom);
             }
@@ -365,7 +368,7 @@ fn rms_block_sum(x: &[u16], base: usize, hidden: usize) -> f32 {
         let mut i = t;
         while i < hidden {
             let v = bf16_to_f32(x[base + i]);
-            acc = v * v + acc;
+            acc = v.mul_add(v, acc);
             i += bdim;
         }
         s[t] = acc;
@@ -611,13 +614,14 @@ pub fn deltanet(
                         for sl in 0..32 {
                             let mut p = 0.0f32;
                             for i in 0..4 {
-                                p = srow[sl * 4 + i] * (bf16_to_f32(k[qb + sl * 4 + i]) * invk) + p;
+                                p = srow[sl * 4 + i]
+                                    .mul_add(bf16_to_f32(k[qb + sl * 4 + i]) * invk, p);
                             }
                             kvm = p + kvm;
                         }
                     } else {
                         for j in 0..k_dim {
-                            kvm = srow[j] * (bf16_to_f32(k[qb + j]) * invk) + kvm;
+                            kvm = srow[j].mul_add(bf16_to_f32(k[qb + j]) * invk, kvm);
                         }
                     }
                     let vin = bf16_to_f32(v[(g * v_heads + h) * v_dim + vv]);
@@ -626,7 +630,7 @@ pub fn deltanet(
                         // 状态池 bf16：存储即收——o/下一 token 递推全吃收过的
                         // 同一值（kernel 同式：寄存器 f32 累加、落池收 bf16）
                         srow[j] = bf16_to_f32(f32_to_bf16(
-                            (bf16_to_f32(k[qb + j]) * invk) * delta + srow[j],
+                            (bf16_to_f32(k[qb + j]) * invk).mul_add(delta, srow[j]),
                         ));
                     }
                     let mut o = 0.0f32;
@@ -634,13 +638,14 @@ pub fn deltanet(
                         for sl in 0..32 {
                             let mut p = 0.0f32;
                             for i in 0..4 {
-                                p = srow[sl * 4 + i] * ((bf16_to_f32(q[qb + sl * 4 + i]) * invq) / kd_sqrt) + p;
+                                p = srow[sl * 4 + i]
+                                    .mul_add((bf16_to_f32(q[qb + sl * 4 + i]) * invq) / kd_sqrt, p);
                             }
                             o = p + o;
                         }
                     } else {
                         for j in 0..k_dim {
-                            o = srow[j] * ((bf16_to_f32(q[qb + j]) * invq) / kd_sqrt) + o;
+                            o = srow[j].mul_add((bf16_to_f32(q[qb + j]) * invq) / kd_sqrt, o);
                         }
                     }
                     out[(g * v_heads + h) * v_dim + vv] = f32_to_bf16(o);

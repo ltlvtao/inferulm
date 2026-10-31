@@ -85,16 +85,46 @@ fn k1_ptx_artifact_structure() {
 }
 
 /// k2 · intrinsic 降落（§13-2 ③）：线程索引 intrinsic 落到特殊寄存器
-/// （%tid.x / %ctaid.x），浮点算术落到 mul.rn.f32 / add.rn.f32（IEEE 正确
-/// 舍入、不收缩——逐位对齐的前提），且没有宿主调用 shim（no_std kernel 里
-/// 出现 call = 有东西没编译干净）。
+/// （%tid.x / %ctaid.x），浮点算术落到正确舍入的 PTX 原语，且没有宿主调用
+/// shim（no_std kernel 里出现 call = 有东西没编译干净）。
+///
+/// FMA 落地后的三段断言：
+/// ① **字面量不收缩**（原意保留）：`a*b + acc` 字面量与乘/除仍落
+///    mul.rn.f32 / add.rn.f32——收缩只发生在显式 `fma()`（`mul_add`），
+///    不是编译器自作主张；`bf16_dot` 就是那条活证据。
+/// ② **fma.rn.f32 存在**（全模块计数下界）。
+/// ③ **热路径真的吃了 fma**：逐 kernel 段内计数下界——只数全模块会被别的
+///    kernel 蒙混过关，这里按 `.visible .entry NAME(` 切段数。下界留一倍
+///    裕量（实测值见注释），形态回归（谁把 `fma()` 改回 `a*b+c`）必现形。
 #[test]
 fn k2_intrinsics_lowered_to_ptx() {
     let ptx = ptx_text();
     assert!(ptx.contains("%tid.x"), "thread_idx 未降落特殊寄存器");
     assert!(ptx.contains("%ctaid.x"), "block_idx 未降落特殊寄存器");
-    assert!(ptx.contains("mul.rn.f32"), "乘法未降落 mul.rn.f32");
-    assert!(ptx.contains("add.rn.f32"), "加法未降落 add.rn.f32");
+    assert!(ptx.contains("mul.rn.f32"), "乘法未降落 mul.rn.f32（字面量被收缩？）");
+    assert!(ptx.contains("add.rn.f32"), "加法未降落 add.rn.f32（字面量被收缩？）");
+    let n_fma = ptx.matches("fma.rn.f32").count();
+    assert!(n_fma >= 300, "fma.rn.f32 计数 {n_fma} < 300：热路径的 mul_add 没落成 fma");
+    // 逐 kernel 段：热路径的 fma 指令数下界（实测 38/55/2/646/9/1/1）
+    let seg = |name: &str| -> String {
+        let head = format!(".visible .entry {name}(");
+        let i = ptx.find(&head).unwrap_or_else(|| panic!("{name} 入口缺失"));
+        let rest = &ptx[i + head.len()..];
+        let end = rest.find(".visible .entry ").unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    for (name, floor, note) in [
+        ("paged_attn_tile", 12, "attn_dot + 4 维加权 V（jsplit 合并另计）"),
+        ("paged_attn", 20, "attn_dot + 加权 V（流式/直路）"),
+        ("attn_combine", 2, "jsplit 合并 l/acc"),
+        ("deltanet", 200, "kvm/o 折叠（kvm4*/dn_e2*/upd4* 各级 fma）"),
+        ("rms_norm", 4, "行平方和"),
+        ("rms_norm_zc", 1, "块归约平方和"),
+        ("rms_norm_gated", 1, "块归约平方和"),
+    ] {
+        let got = seg(name).matches("fma.rn.f32").count();
+        assert!(got >= floor, "{name} 段内 fma.rn.f32 = {got} < {floor}（{note} 未走 fma）");
+    }
     let host_calls: Vec<&str> = ptx
         .lines()
         .filter(|l| l.trim_start().starts_with("call"))

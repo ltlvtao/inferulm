@@ -17,6 +17,9 @@
 // sqrt/mul_add 等浮点方法在新 nightly 被移入 core_float_math（#137578）；
 // 正确舍入原语直接走 intrinsics——语义等同 sqrt.rn.f32（冒烟风险登记项）
 #![feature(core_intrinsics)]
+// `f32::mul_add` 在本 nightly 上的落脚是 `core::f32::math::mul_add`
+// （core_float_math #137578；见下方 fma()）
+#![feature(core_float_math)]
 // 状态池 bf16 后 4×bf16 走 u64 整载/整存（ld/st.global.b64——paged_attn
 // 同习语；portable_simd 的 f32x4 容器已随 f32 池退役）
 
@@ -47,6 +50,25 @@ pub fn f32_to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     let lsb = (bits >> 16) & 1;
     ((bits + 0x7fff + lsb) >> 16) as u16
+}
+
+/// 单次舍入融合乘加 `a·b + c`：落 **`fma.rn.f32`**（PTX 已验，k2 断言
+/// 热路径的计数下界）。点积/归约链由此每元素吃 1 条指令而非 mul+add 两条，
+/// 且只舍入一次（比两条原语**更精确**）。
+///
+/// 位级合同的形态变了，纪律没变：两侧必须同式同位。宿主侧
+/// （`reference.rs`，stable）用 `f32::mul_add`——同一前端（`intrinsics::fma`
+/// → LLVM `llvm.fma.f32`），宿主经 glibc `fmaf`（IEEE 754 融合，精确一次
+/// 舍入），GPU 经 nvptx 后端直落 `fma.rn.f32`；两者同为**正确舍入的融合
+/// 结果**，逐位相同 ⇒ kernel↔reference 仍可达位对齐。
+///
+/// 本 nightly 上 `f32::mul_add` 的自有方法面已迁到 `core::f32::math`
+/// （`core_float_math` #137578）——`core::intrinsics::fma` 是同一物（冒烟
+/// 双向验证：两写法产出的 PTX 逐字相同；`a·b + c` 字面量则产 16×mul +
+/// 16×add，无收缩）。
+#[inline(always)]
+fn fma(a: f32, b: f32, c: f32) -> f32 {
+    core::f32::math::mul_add(a, b, c)
 }
 
 /// |x|：位实现（清符号位）——语义与 std 的 abs 恒等（非 NaN 域），
@@ -201,11 +223,10 @@ pub unsafe extern "ptx-kernel" fn vec_add_f32(
 /// RNE 收尾），§13-2 ② "bf16 attention 逐位对齐"的冒烟化身——跨线程归约
 /// （shared memory）是 W2 的活，不影响数值对齐结论。
 ///
-/// 分离乘加而非 mul_add（冒烟决定：该 nightly 上 core 的 f32::mul_add 刚被
-/// 移入未稳定 core_float_math #137578——不为一个 fma 多背一个 feature 门）。
-/// mul.rn.f32 / add.rn.f32 都是 IEEE 正确舍入单算，逐位对齐可达性与 fma 相同
-/// （两侧同操作序列即同位）。W2 真 kernel 时再定 fma 策略
-/// （稳定化跟踪 / intrinsic / 内联 asm 三选一）。
+/// 分离乘加而非 mul_add（W2 FMA 落地前：该 nightly 上 core 的 f32::mul_add
+/// 曾在未稳定 core_float_math #137578 门后——现由 `fma()` 统一走这道门）。
+/// **本 kernel 故意保留 mul.rn.f32 + add.rn.f32 两条**：它是"字面量不收缩"
+/// 的活证据（k2 断言之一），热路径的点积全部走 `fma()`。
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn bf16_dot(
     x: *const u16,
@@ -233,8 +254,9 @@ pub unsafe extern "ptx-kernel" fn bf16_dot(
 /// M0 融合算子清单首个入表成员（§4）。
 ///
 /// 对齐纪律（与 reference.rs 同守，golden 对拍的可达性依据）：
-/// - 只用正确舍入原语：mul.rn / add.rn / div.rn / sqrt.rn——禁 rsqrt(MUFU)
-///   近似与 fma 收缩（两侧同为 IEEE 单算才可能位位相等）
+/// - 只用正确舍入原语：mul.rn / add.rn / div.rn / sqrt.rn / **fma.rn**——
+///   禁 rsqrt(MUFU) 近似；FMA 是单次舍入的正确舍入算子，两侧同式同位即
+///   可位位相等（`fma()` 的合同见文件头）
 /// - 行内顺序累加（i 递增），与参考实现逐步同序
 /// - 一行由单线程完整计算：launch 几何（row/blocked 档）不改变数值序
 #[no_mangle]
@@ -254,7 +276,7 @@ pub unsafe extern "ptx-kernel" fn rms_norm(
         let mut i = 0usize;
         while i < h {
             let v = bf16_to_f32(*x.add(base + i));
-            acc = v * v + acc;
+            acc = fma(v, v, acc);
             i += 1;
         }
         let denom = core::intrinsics::sqrt::<f32>(acc / hidden as f32 + eps);
@@ -522,7 +544,7 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
                 let mut jj = c0;
                 while jj <= c1 {
                     let vbase = slot_of(block_table, s, jj, bpr, bs) * he + kh * hd;
-                    acc = *sc.add(jj - c0) * bf16_to_f32(*v_cache.add(vbase + e)) + acc;
+                    acc = fma(*sc.add(jj - c0), bf16_to_f32(*v_cache.add(vbase + e)), acc);
                     jj += 1;
                 }
             }
@@ -582,7 +604,7 @@ pub unsafe extern "ptx-kernel" fn paged_attn(
         let mut j = 0usize;
         while j <= pos {
             let vbase = slot_of(block_table, s, j, bpr, bs) * he + kh * hd;
-            acc = *sc.add(j) * bf16_to_f32(*v_cache.add(vbase + ee)) + acc;
+            acc = fma(*sc.add(j), bf16_to_f32(*v_cache.add(vbase + ee)), acc);
             j += 1;
         }
         *out.add(qbase + ee) = f32_to_bf16(acc / denom);
@@ -602,7 +624,7 @@ unsafe fn attn_dot(qp: *const u16, kp: *const u16, hd: usize, vec4: bool) -> f32
             let ks = bf16x4(*(kp.add(d) as *const u64));
             let mut l = 0usize;
             while l < 4 {
-                dot = bf16_to_f32(qs[l]) * bf16_to_f32(ks[l]) + dot;
+                dot = fma(bf16_to_f32(qs[l]), bf16_to_f32(ks[l]), dot);
                 l += 1;
             }
             d += 4;
@@ -612,7 +634,7 @@ unsafe fn attn_dot(qp: *const u16, kp: *const u16, hd: usize, vec4: bool) -> f32
         while d < hd {
             let a = bf16_to_f32(*qp.add(d));
             let b = bf16_to_f32(*kp.add(d));
-            dot = a * b + dot;
+            dot = fma(a, b, dot);
             d += 1;
         }
     }
@@ -835,10 +857,10 @@ pub unsafe extern "ptx-kernel" fn paged_attn_tile(
                 let p = *pb.add((j - c0) * rows_nom + r);
                 let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
                 let vs = bf16x4(*(v_cache.add(vbase) as *const u64));
-                a0 = p * bf16_to_f32(vs[0]) + a0;
-                a1 = p * bf16_to_f32(vs[1]) + a1;
-                a2 = p * bf16_to_f32(vs[2]) + a2;
-                a3 = p * bf16_to_f32(vs[3]) + a3;
+                a0 = fma(p, bf16_to_f32(vs[0]), a0);
+                a1 = fma(p, bf16_to_f32(vs[1]), a1);
+                a2 = fma(p, bf16_to_f32(vs[2]), a2);
+                a3 = fma(p, bf16_to_f32(vs[3]), a3);
                 if lane == 0 {
                     den = p + den; // 分母一行一份（j 升序，跨 chunk 续）
                 }
@@ -916,8 +938,8 @@ pub unsafe extern "ptx-kernel" fn attn_combine(
         let ls = *base.add(s * 2 + 1);
         if ls > 0.0 {
             let e = expf(*base.add(s * 2) - m);
-            l = ls * e + l;
-            acc = *part_acc.add((r * js + s) * PART_HD_STRIDE + d) * e + acc;
+            l = fma(ls, e, l);
+            acc = fma(*part_acc.add((r * js + s) * PART_HD_STRIDE + d), e, acc);
         }
         s += 1;
     }
@@ -952,7 +974,7 @@ unsafe fn block_sum_strided(
         let mut i = t;
         while i < h {
             let v = bf16_to_f32(*x.add(base + i));
-            acc = v * v + acc;
+            acc = fma(v, v, acc);
             i += bdim;
         }
         *slot.add(t) = acc;
@@ -1182,10 +1204,10 @@ unsafe fn dn_row128(
     macro_rules! kvm4 {
         ($e:expr, $c:literal) => {{
             let (lo, hi) = ($e as u32, ($e >> 32) as u32);
-            kvm = (f32::from_bits(lo << 16) * decay) * (bf16_to_f32(*k.add(qb + $c * 4)) * invk) + kvm;
-            kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk) + kvm;
-            kvm = (f32::from_bits(hi << 16) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk) + kvm;
-            kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk) + kvm;
+            kvm = fma(f32::from_bits(lo << 16) * decay, bf16_to_f32(*k.add(qb + $c * 4)) * invk, kvm);
+            kvm = fma(f32::from_bits(lo & 0xffff_0000) * decay, bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk, kvm);
+            kvm = fma(f32::from_bits(hi << 16) * decay, bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk, kvm);
+            kvm = fma(f32::from_bits(hi & 0xffff_0000) * decay, bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk, kvm);
         }};
     }
     let w128 = (
@@ -1220,17 +1242,17 @@ unsafe fn dn_row128(
     macro_rules! upd4 {
         ($e:expr, $c:literal) => {{
             let (lo, hi) = ($e as u32, ($e >> 32) as u32);
-            let r0 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4)) * invk) * delta + (f32::from_bits(lo << 16) * decay));
-            let r1 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
-            let r2 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk) * delta + (f32::from_bits(hi << 16) * decay));
-            let r3 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+            let r0 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + $c * 4)) * invk, delta, f32::from_bits(lo << 16) * decay));
+            let r1 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + $c * 4 + 1)) * invk, delta, f32::from_bits(lo & 0xffff_0000) * decay));
+            let r2 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + $c * 4 + 2)) * invk, delta, f32::from_bits(hi << 16) * decay));
+            let r3 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + $c * 4 + 3)) * invk, delta, f32::from_bits(hi & 0xffff_0000) * decay));
             // lane0 ← r0>>16；lane1 已在位；lane2 ← r2<<16；lane3 ← r3<<32
             *(srow.add($c * 4) as *mut u64) =
                 (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
-            o = f32::from_bits(r0) * ((bf16_to_f32(*q.add(qb + $c * 4)) * invq) / kd_sqrt) + o;
-            o = f32::from_bits(r1) * ((bf16_to_f32(*q.add(qb + $c * 4 + 1)) * invq) / kd_sqrt) + o;
-            o = f32::from_bits(r2) * ((bf16_to_f32(*q.add(qb + $c * 4 + 2)) * invq) / kd_sqrt) + o;
-            o = f32::from_bits(r3) * ((bf16_to_f32(*q.add(qb + $c * 4 + 3)) * invq) / kd_sqrt) + o;
+            o = fma(f32::from_bits(r0), (bf16_to_f32(*q.add(qb + $c * 4)) * invq) / kd_sqrt, o);
+            o = fma(f32::from_bits(r1), (bf16_to_f32(*q.add(qb + $c * 4 + 1)) * invq) / kd_sqrt, o);
+            o = fma(f32::from_bits(r2), (bf16_to_f32(*q.add(qb + $c * 4 + 2)) * invq) / kd_sqrt, o);
+            o = fma(f32::from_bits(r3), (bf16_to_f32(*q.add(qb + $c * 4 + 3)) * invq) / kd_sqrt, o);
         }};
     }
     upd4!(w128.0, 0); upd4!(w128.1, 1); upd4!(w128.2, 2); upd4!(w128.3, 3);
@@ -1387,17 +1409,17 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                         let vin = bf16_to_f32(*v.add(obase + vrow + $b));
                         let delta = (vin - kvm) * beta;
                         let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
-                        let r0 = f32_to_bf16_hi((k0 * invk) * delta + (f32::from_bits(lo << 16) * decay));
-                        let r1 = f32_to_bf16_hi((k1 * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
-                        let r2 = f32_to_bf16_hi((k2 * invk) * delta + (f32::from_bits(hi << 16) * decay));
-                        let r3 = f32_to_bf16_hi((k3 * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                        let r0 = f32_to_bf16_hi(fma(k0 * invk, delta, f32::from_bits(lo << 16) * decay));
+                        let r1 = f32_to_bf16_hi(fma(k1 * invk, delta, f32::from_bits(lo & 0xffff_0000) * decay));
+                        let r2 = f32_to_bf16_hi(fma(k2 * invk, delta, f32::from_bits(hi << 16) * decay));
+                        let r3 = f32_to_bf16_hi(fma(k3 * invk, delta, f32::from_bits(hi & 0xffff_0000) * decay));
                         *($sw.add((vrow + $b) * kd + s * 4) as *mut u64) =
                             (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
                         let mut o = 0.0f32;
-                        o = f32::from_bits(r0) * ((q0 * invq) / kd_sqrt) + o;
-                        o = f32::from_bits(r1) * ((q1 * invq) / kd_sqrt) + o;
-                        o = f32::from_bits(r2) * ((q2 * invq) / kd_sqrt) + o;
-                        o = f32::from_bits(r3) * ((q3 * invq) / kd_sqrt) + o;
+                        o = fma(f32::from_bits(r0), (q0 * invq) / kd_sqrt, o);
+                        o = fma(f32::from_bits(r1), (q1 * invq) / kd_sqrt, o);
+                        o = fma(f32::from_bits(r2), (q2 * invq) / kd_sqrt, o);
+                        o = fma(f32::from_bits(r3), (q3 * invq) / kd_sqrt, o);
                         *oslot.add($b * 32 + s) = o;
                     }};
                 }
@@ -1405,10 +1427,10 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     ($ww:expr, $b:literal) => {{
                         let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
                         let mut kvm = 0.0f32;
-                        kvm = (f32::from_bits(lo << 16) * decay) * (k0 * invk) + kvm;
-                        kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (k1 * invk) + kvm;
-                        kvm = (f32::from_bits(hi << 16) * decay) * (k2 * invk) + kvm;
-                        kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (k3 * invk) + kvm;
+                        kvm = fma(f32::from_bits(lo << 16) * decay, k0 * invk, kvm);
+                        kvm = fma(f32::from_bits(lo & 0xffff_0000) * decay, k1 * invk, kvm);
+                        kvm = fma(f32::from_bits(hi << 16) * decay, k2 * invk, kvm);
+                        kvm = fma(f32::from_bits(hi & 0xffff_0000) * decay, k3 * invk, kvm);
                         *wslot.add($b * 32 + s) = kvm;
                     }};
                 }
@@ -1518,6 +1540,11 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             // 逐项序与滚动 `while u < 32` 完全一致（u 升序、acc = v + acc），
             // **位同**；拿掉的只是循环回边（滚动版里每次 LDG 都串在回边上、
             // 吃满一次 L1 时延——本刀 prefill delta 92.36→64.39ms 的主项）
+            //
+            // **FMA 在这里吃不到**：槽里的值是各 lane 已经乘好的部分和
+            // （`kvm4e!`/`dn_e2!` 里 fma 的第三操作数），本折叠是纯加法第二
+            // 级归约——没有乘子可融。产出前的那一次乘法（decay/`q·invq`）
+            // 已在第一级 fma 里融掉了。
             macro_rules! fold32 {
                 ($base:expr) => {{
                     let p = $base;
@@ -1567,15 +1594,15 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     let vin = bf16_to_f32(*v.add($vr));
                     let delta = (vin - kvm) * beta;
                     let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
-                    let r0 = f32_to_bf16_hi((k0 * invk) * delta + (f32::from_bits(lo << 16) * decay));
-                    let r1 = f32_to_bf16_hi((k1 * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
-                    let r2 = f32_to_bf16_hi((k2 * invk) * delta + (f32::from_bits(hi << 16) * decay));
-                    let r3 = f32_to_bf16_hi((k3 * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                    let r0 = f32_to_bf16_hi(fma(k0 * invk, delta, f32::from_bits(lo << 16) * decay));
+                    let r1 = f32_to_bf16_hi(fma(k1 * invk, delta, f32::from_bits(lo & 0xffff_0000) * decay));
+                    let r2 = f32_to_bf16_hi(fma(k2 * invk, delta, f32::from_bits(hi << 16) * decay));
+                    let r3 = f32_to_bf16_hi(fma(k3 * invk, delta, f32::from_bits(hi & 0xffff_0000) * decay));
                     let mut o = 0.0f32;
-                    o = f32::from_bits(r0) * ((q0 * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r1) * ((q1 * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r2) * ((q2 * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r3) * ((q3 * invq) / kd_sqrt) + o;
+                    o = fma(f32::from_bits(r0), (q0 * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r1), (q1 * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r2), (q2 * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r3), (q3 * invq) / kd_sqrt, o);
                     *oslot.add($b * 32 + s) = o;
                     // 新状态回寄存器：lane0 ← r0>>16；lane1 已在位；
                     // lane2 ← r2<<16；lane3 ← r3<<32（与原存储字逐位同）
@@ -1587,10 +1614,10 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                 ($ww:expr, $b:literal) => {{
                     let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
                     let mut kvm = 0.0f32;
-                    kvm = (f32::from_bits(lo << 16) * decay) * (k0 * invk) + kvm;
-                    kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (k1 * invk) + kvm;
-                    kvm = (f32::from_bits(hi << 16) * decay) * (k2 * invk) + kvm;
-                    kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (k3 * invk) + kvm;
+                    kvm = fma(f32::from_bits(lo << 16) * decay, k0 * invk, kvm);
+                    kvm = fma(f32::from_bits(lo & 0xffff_0000) * decay, k1 * invk, kvm);
+                    kvm = fma(f32::from_bits(hi << 16) * decay, k2 * invk, kvm);
+                    kvm = fma(f32::from_bits(hi & 0xffff_0000) * decay, k3 * invk, kvm);
                     *wslot.add($b * 32 + s) = kvm;
                 }};
             }
@@ -1745,16 +1772,16 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                 while j < kd {
                     let w = *(srow.add(j) as *const u64);
                     let (lo, hi) = (w as u32, (w >> 32) as u32);
-                    kvm = (f32::from_bits(lo << 16) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
-                    kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + j + 1)) * invk) + kvm;
-                    kvm = (f32::from_bits(hi << 16) * decay) * (bf16_to_f32(*k.add(qb + j + 2)) * invk) + kvm;
-                    kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (bf16_to_f32(*k.add(qb + j + 3)) * invk) + kvm;
+                    kvm = fma(f32::from_bits(lo << 16) * decay, bf16_to_f32(*k.add(qb + j)) * invk, kvm);
+                    kvm = fma(f32::from_bits(lo & 0xffff_0000) * decay, bf16_to_f32(*k.add(qb + j + 1)) * invk, kvm);
+                    kvm = fma(f32::from_bits(hi << 16) * decay, bf16_to_f32(*k.add(qb + j + 2)) * invk, kvm);
+                    kvm = fma(f32::from_bits(hi & 0xffff_0000) * decay, bf16_to_f32(*k.add(qb + j + 3)) * invk, kvm);
                     j += 4;
                 }
             } else {
                 let mut j = 0usize;
                 while j < kd {
-                    kvm = (bf16_to_f32(*srow.add(j)) * decay) * (bf16_to_f32(*k.add(qb + j)) * invk) + kvm;
+                    kvm = fma(bf16_to_f32(*srow.add(j)) * decay, bf16_to_f32(*k.add(qb + j)) * invk, kvm);
                     j += 1;
                 }
             }
@@ -1766,25 +1793,25 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                 while j < kd {
                     let w = *(srow.add(j) as *const u64);
                     let (lo, hi) = (w as u32, (w >> 32) as u32);
-                    let r0 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j)) * invk) * delta + (f32::from_bits(lo << 16) * decay));
-                    let r1 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 1)) * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
-                    let r2 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 2)) * invk) * delta + (f32::from_bits(hi << 16) * decay));
-                    let r3 = f32_to_bf16_hi((bf16_to_f32(*k.add(qb + j + 3)) * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                    let r0 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + j)) * invk, delta, f32::from_bits(lo << 16) * decay));
+                    let r1 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + j + 1)) * invk, delta, f32::from_bits(lo & 0xffff_0000) * decay));
+                    let r2 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + j + 2)) * invk, delta, f32::from_bits(hi << 16) * decay));
+                    let r3 = f32_to_bf16_hi(fma(bf16_to_f32(*k.add(qb + j + 3)) * invk, delta, f32::from_bits(hi & 0xffff_0000) * decay));
                     // lane0 ← r0>>16；lane1 已在位；lane2 ← r2<<16；lane3 ← r3<<32
                     *(srow.add(j) as *mut u64) =
                         (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
-                    o = f32::from_bits(r0) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r1) * ((bf16_to_f32(*q.add(qb + j + 1)) * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r2) * ((bf16_to_f32(*q.add(qb + j + 2)) * invq) / kd_sqrt) + o;
-                    o = f32::from_bits(r3) * ((bf16_to_f32(*q.add(qb + j + 3)) * invq) / kd_sqrt) + o;
+                    o = fma(f32::from_bits(r0), (bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r1), (bf16_to_f32(*q.add(qb + j + 1)) * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r2), (bf16_to_f32(*q.add(qb + j + 2)) * invq) / kd_sqrt, o);
+                    o = fma(f32::from_bits(r3), (bf16_to_f32(*q.add(qb + j + 3)) * invq) / kd_sqrt, o);
                     j += 4;
                 }
             } else {
                 let mut j = 0usize;
                 while j < kd {
-                    let s2 = f32_to_bf16((bf16_to_f32(*k.add(qb + j)) * invk) * delta + (bf16_to_f32(*srow.add(j)) * decay));
+                    let s2 = f32_to_bf16(fma(bf16_to_f32(*k.add(qb + j)) * invk, delta, bf16_to_f32(*srow.add(j)) * decay));
                     *srow.add(j) = s2;
-                    o = bf16_to_f32(s2) * ((bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt) + o;
+                    o = fma(bf16_to_f32(s2), (bf16_to_f32(*q.add(qb + j)) * invq) / kd_sqrt, o);
                     j += 1;
                 }
             }
