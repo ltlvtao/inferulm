@@ -123,7 +123,10 @@ fn validate_common(
     stop: &Option<Value>,
     max_tokens: Option<u32>,
 ) -> Result<ValidatedGen, Response> {
-    let temperature = temperature.unwrap_or(1.0);
+    // 缺省 **greedy**（temperature = 0）：请求里显式给 temperature > 0 才按
+    // 分布采样（设备端 top-k ≤ 64 的 top-p 采样器）。确定性是既有的服务
+    // 合同（q11/q12 与 CLI 的续写可复现），故不跟 OpenAI 的 1.0 缺省
+    let temperature = temperature.unwrap_or(0.0);
     if !(0.0..=2.0).contains(&temperature) {
         return Err(openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "temperature must be between 0 and 2"));
     }

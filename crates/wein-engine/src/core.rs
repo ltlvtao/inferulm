@@ -23,7 +23,9 @@ use wein_sched::{
 };
 
 use crate::handle::EngineHandle;
-use crate::protocol::{EngineCommand, EngineEvent, EngineRequest, FinishReason, RequestId};
+use crate::protocol::{
+    EngineCommand, EngineEvent, EngineRequest, FinishReason, RequestId, SampleParams,
+};
 
 pub struct CoreConfig {
     pub sched: SchedConfig,
@@ -148,6 +150,18 @@ pub trait Executor: Send {
     /// 返回值 = 执行器已就绪的 token 数（前缀缓存命中恢复的部分），
     /// engine 会把它回填进调度债（sched.prefix_hit）——无缓存执行器返回 0
     fn admitted(&mut self, _id: ReqId, _prompt: &[u32]) -> usize { 0 }
+    /// 采样参数下发给执行器（提交时一次；执行器可在此做设备侧/静态校验）。
+    ///
+    /// Err = 该配置**设备侧不可满足**——engine 不把它送进调度器，直接以
+    /// `Finished(Aborted)` 终结（等价 serve 侧的 400：客户端拿到明确终结事件，
+    /// 不会跑出一个语义错误的序列）。当前唯一的拒绝项是"全词表采样"
+    /// （`top_k = 0`，见 `SampleParams`）：设备端采样器只有 top-k（k ≤ 64）
+    /// 路径，248K 项降序全排序不可接受。
+    ///
+    /// 默认实现吞掉参数（脚本件/替身无采样概念，既有 parity 不变）
+    fn set_sampling(&mut self, _id: ReqId, _p: SampleParams) -> Result<(), String> {
+        Ok(())
+    }
     /// 抢占通知：调度器会以 recompute 语义重放（forwarded 清零）——
     /// 执行器须把自己的前向游标一并归零，否则重放位置错位（x6 验收钉死）
     fn preempted(&mut self, _id: ReqId) {}
@@ -370,11 +384,27 @@ impl EngineCore {
                     id, prompt_token_ids, max_tokens, sampling, respond_to,
                 } = req;
                 senders.insert(id, respond_to);
+                // 采样参数（须在 stop_token_ids 被 move 之前取）
+                let sp = sampling.sample_params();
                 if !sampling.stop_token_ids.is_empty() {
                     stops.insert(id, sampling.stop_token_ids);
                 }
                 if let Some(tx) = senders.get(&id) {
                     let _ = tx.send(EngineEvent::Accepted);
+                }
+                // 采样参数先过执行器校验（设备侧能力边界：top_k ≤ 64 的
+                // top-k/top-p；全词表 top_k=0 不可满足）。不可满足 → 不进
+                // 调度器、不建行，直接终结（serve 侧表现为 Aborted/400）：
+                // 让它跑起来再中途出错会把错序列吐给客户端
+                if let Err(e) = exec.set_sampling(id, sp) {
+                    eprintln!("[engine] 采样参数不可满足 id={id}：{e}");
+                    sched.cancel(id);
+                    stats.cancelled.fetch_add(1, Ordering::Relaxed);
+                    if let Some(tx) = senders.remove(&id) {
+                        let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
+                    }
+                    stops.remove(&id);
+                    return;
                 }
                 // prompt 暂存：建行推迟到调度准入（pump 的 Admitted 臂）——
                 // 空 prompt 的 BOS 语义由执行器在 admitted 决定

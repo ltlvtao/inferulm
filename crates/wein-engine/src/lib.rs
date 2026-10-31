@@ -12,4 +12,6 @@ mod protocol;
 pub use core::{CoreConfig, EngineCore, EngineStats, Executor, ScriptedExecutor};
 pub use handle::{EngineHandle, EventStream};
 pub use mock::{MockEngine, MockScript, MockState};
-pub use protocol::{EngineCommand, EngineEvent, EngineRequest, FinishReason, RequestId, SamplingParams};
+pub use protocol::{
+    EngineCommand, EngineEvent, EngineRequest, FinishReason, RequestId, SampleParams, SamplingParams,
+};

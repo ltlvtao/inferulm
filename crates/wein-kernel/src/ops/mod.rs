@@ -57,6 +57,7 @@ pub struct OpTable<'a> {
     pub deltanet: DeltanetCuda<'a>,
     pub rms_norm_gated: RmsNormGatedCuda<'a>,
     pub argmax_rows: ArgmaxRowsCuda<'a>,
+    pub sample_rows: SampleRowsCuda<'a>,
 }
 
 impl OpTable<'_> {
@@ -141,6 +142,11 @@ impl OpTable<'_> {
             scratch: gpu.alloc_bytes(REDUCE_ROWS_CAP * 256 * 4),
         };
         let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
+        let sample_rows = SampleRowsCuda {
+            gpu,
+            f: m.func("sample_rows"),
+            scratch: gpu.alloc_bytes(SAMPLE_ROWS_CAP * SAMPLE_SLOT * 4),
+        };
         // 标准算子走厂商库（§4）：库缺 = 声明式降级，不带病运行
         let gemm = GemmLt { lt: Box::new(
             crate::cuda::BlasLt::open_tuned(gpu, tune_m).map_err(|e| vec![Degrade {
@@ -151,7 +157,7 @@ impl OpTable<'_> {
         )};
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
             rms_norm_zc, rope_pt, sigmul, conv1d_dw, conv_state_roll, deltanet, rms_norm_gated,
-            argmax_rows })
+            argmax_rows, sample_rows })
     }
 }
 
@@ -572,6 +578,80 @@ impl ArgmaxRowsOp for ArgmaxRowsCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "argmax_rows/cuda"
+    }
+}
+
+/// 设备端采样（top-k / top-p）：逐行 temp/top_k/top_p/seed + 设备 RNG 状态。
+/// temp ≤ 0 走 kernel 内的 argmax 分支（与 `argmax_rows` 同算法同位，位同）；
+/// top_k ≤ 0（全词表）**不在设备侧支持**——248K 项全排序不可接受（top-p
+/// 需要降序全序），主机侧在 `set_sampling`/`step` 就拒，kernel 落错误标记
+/// 0xFFFFFFFF 兜底，绝不静默退化成"取前 64"。
+pub trait SampleRowsOp {
+    /// x: [row_total, n] bf16；rows: [s] 采样行号；slots: [s] RNG 槽（= 请求行号）；
+    /// temp/top_k/top_p/seed: [s]；rng: [槽数] u64（0 = 未初始化，由 seed 派生）；
+    /// out: [s]（0xFFFFFFFF = 参数非法）
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        rows: &DevBuf,
+        slots: &DevBuf,
+        temp: &DevBuf,
+        top_k: &DevBuf,
+        top_p: &DevBuf,
+        seed: &DevBuf,
+        rng: &DevBuf,
+        out: &DevBuf,
+        n: u32,
+        s: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+/// 采样器 scratch 行容量：= exec 的 logits 行上限（T_MAX=512）× 每行槽字数
+/// （34MB：block=1024 lane × 8 键 u64 池 = 64KB/行；open 期一次分配，捕获期零分配）
+const SAMPLE_ROWS_CAP: usize = 512;
+/// 每行 scratch 字数——与 kernels/ 的 `SMP_SLOT` 一一对应（改动须两侧同改）
+const SAMPLE_SLOT: usize = 4352;
+/// block 宽度——与 kernels/ 的 `SMP_T` 一一对应（= 每行一级归约的 lane 数）
+const SAMPLE_T: u32 = 256;
+
+pub struct SampleRowsCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+    scratch: DevBuf<'a>,
+}
+
+impl SampleRowsOp for SampleRowsCuda<'_> {
+    fn run(
+        &self,
+        x: &DevBuf,
+        rows: &DevBuf,
+        slots: &DevBuf,
+        temp: &DevBuf,
+        top_k: &DevBuf,
+        top_p: &DevBuf,
+        seed: &DevBuf,
+        rng: &DevBuf,
+        out: &DevBuf,
+        n: u32,
+        s: u32,
+        stream: &Stream,
+    ) {
+        let need = s as usize * SAMPLE_SLOT * 4;
+        assert!(
+            need <= self.scratch.bytes(),
+            "sample_rows s={s} 超 scratch 容量 {SAMPLE_ROWS_CAP} 行（{need} > {} 字节）",
+            self.scratch.bytes()
+        );
+        let args = crate::kernel_args![
+            *x, *rows, *slots, *temp, *top_k, *top_p, *seed, *rng, self.scratch, *out, n, s
+        ];
+        self.gpu.launch(&self.f, s, SAMPLE_T, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "sample_rows/cuda"
     }
 }
 

@@ -1367,3 +1367,418 @@ pub unsafe extern "ptx-kernel" fn argmax_rows(
         *out.add(blk) = bi;
     }
 }
+
+// ───────────────────── I2 设备端采样器（top-k / top-p） ─────────────────────
+// argmax_rows 只给 greedy；采样（temperature/top_p）此前在 serve 侧校验后
+// 丢弃。这里把它放回设备：一步一次 launch 覆盖整批采样行，参数与 RNG 状态
+// 全在设备缓冲里（图内只读写缓冲，捕获期零 host 分配/同步）。
+//
+// 语义顺序（与 reference::sample_rows 逐字镜像）：
+//   ① temp ≤ 0 → 等价 argmax（argmax_rows 同算法同归约序，位同合同）；
+//   ② v = logits · (1/temp)（一次倒数 + 乘；参考镜像同式同序）；
+//   ③ 线程内 top-8 梯子（无分支 compare-exchange，u64 全序键）+ block 内
+//      **排名选择**（每线程给自己 8 个候选算 rank = #{池中比它大的}）→ 全局
+//      top-k 降序表（k ≤ 64）；
+//   ④ 在 top-k 集合上 softmax（f32、键降序累加）→ 累加概率 ≥ top_p 即止
+//      （至少保留 1 个）；
+//   ⑤ 按归一概率采样（PCG-XSH-RR 64/32，状态存设备缓冲、图内前进）。
+//
+// 复杂度账（n=248320、s 行、block=SMP_T=256 lane）：
+//   - ③ 一级：每线程 n/256 ≈ 970 个元素 = 242 次 u64 整载（一次 4 个 bf16，
+//     2 路展开 ⇒ 121 次迭代）+ 每元素 ~58 条 ALU（键构造 10 + 8 级
+//     compare-exchange 48，其中 u64 比较/选择各 2 条 32 位指令）；
+//     ⇒ 单块 ≈ 0.13~0.14ms（**单块 = 单 SM，扫描是延迟/发射受限的**，与
+//     greedy 的同规模扫描同量级——k9b 实测 greedy 0.13ms）；
+//   - ③ 二级：池 = 256 lane × 8 键 = 16KB，每线程单遍广播读 2048 个 u64 +
+//     命中过阈值的候选再比 8 次 ⇒ 实测 ≤ 10µs/块（k9d 阶段探针：一级
+//     0.248ms、+二级 0.248ms、+softmax 采样 0.249ms，后两段在噪声内）；
+//   - ④⑤ 顺序段：≤ 64 项串行，忽略不计；
+//   - 实测（k9，n=248320，含 H2D 小表上传）：t=1/16/100 → 0.260/0.275/0.262
+//     ms/发，同 kernel 的 greedy 基线 0.13~0.14ms ⇒ **采样增量 0.117~0.131ms
+//     < 0.2ms 预算**；块数与 t 无关（每行一块并行，128 SM 下 t≤100 全并行）。
+//   - 线程数扫描（说明瓶颈归属）：T=256 → 0.24ms，T=512 → 0.45ms，
+//     T=1024 → 1.33ms。扫描步数减半但总 ALU 不变，反而因 u64 键的 2 寄存器
+//     压力 + 单块 warp 数上升拖慢 ⇒ **保持 256 lane**（也保住聚合访存的
+//     256B/warp 合并）。想再快只能把一行拆给多块（两级 kernel），
+//     当前步时 (<0.3ms) 不值得。
+//
+// 为什么不支持 top_k ≤ 0（全词表）：top-p 需要对全词表降序累加，等价于
+// 248K 项全排序（≥4 倍词表流量的排序网络 + 无 .shared 只能走 global
+// scratch），单行就要 MB 级 scratch、单步毫秒级——不值当，且会静默改变
+// 采样分布。主机侧直接拒（见 exec 的 set_sampling/step），设备侧这里落
+// 0xFFFFFFFF 错误标记做兜底，绝不静默退化成"取前 64"。
+
+/// 采样器 scratch 每行槽位（u32 字数；与 wein-kernel/src/ops 的
+/// `SAMPLE_SLOT` 常量一一对应——改动需两侧同改）
+/// 布局：[0, SMP_POOL_W) 池 = lane 的 8 个 u64 键（lane*16 字）；
+/// SMP_SEL 选中表（按排名落位）64 个 u64 = 128 字；SMP_PROB 概率 64 字
+pub const SMP_T: usize = 256;
+const SMP_LADDER: usize = 8;
+const SMP_POOL_W: usize = SMP_T * SMP_LADDER * 2; // 池（u64 键）字数
+const SMP_SEL: usize = SMP_POOL_W + 64; // 选中表 64 个 u64 = 128 字
+const SMP_PROB: usize = SMP_SEL + 64 * 2; // 概率 64
+pub const SMP_SLOT: usize = SMP_PROB + 64;
+
+/// 采样器 RNG 派生：splitmix64 终混 | 1（状态 0 保留为"未初始化"哨兵，
+/// 与 reference::rng_seed 逐字同式）
+#[inline(always)]
+fn rng_seed(seed: u64) -> u64 {
+    let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    (x ^ (x >> 31)) | 1
+}
+
+/// PCG-XSH-RR 64/32 一步：推进 u64 LCG 状态、回 32 位输出。
+/// 纯整数运算 ⇒ CPU 镜像逐位同（reference::rng_next）
+#[inline(always)]
+fn rng_next(st: &mut u64) -> u32 {
+    let old = *st;
+    *st = old.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let x = (((old >> 18) ^ old) >> 27) as u32;
+    let rot = (old >> 59) as u32;
+    (x >> rot) | (x << ((32 - rot) & 31))
+}
+
+/// [0,1) 均匀 f32：取输出低 24 位（f32 尾数域精确表示，无舍入）
+#[inline(always)]
+fn rng_f32(st: &mut u64) -> f32 {
+    (rng_next(st) >> 8) as f32 * (1.0 / 16777216.0)
+}
+
+/// 采样键：`(单调化 f32 位 << 32) | (0xFFFFFFFF - 下标)`。
+/// 单调化对有限浮点是保序双射（正值翻最高位、负值按位取反），±0 由
+/// `+ 0.0` 规范化，NaN 归到 -inf（与 argmax_rows 的浮点比较同语义：永不
+/// 入选）。于是"值降序、同值下标升序"的全序塌成一次 u64 比较。
+#[inline(always)]
+fn smp_key(h: u16, idx: u32, inv_t: f32) -> u64 {
+    let mut v = bf16_to_f32(h) * inv_t + 0.0;
+    if v != v {
+        v = f32::NEG_INFINITY;
+    }
+    let b = v.to_bits();
+    let flip = (((b as i32) >> 31) as u32) | 0x8000_0000;
+    (((b ^ flip) as u64) << 32) | (0xffff_ffff - idx) as u64
+}
+
+/// 键 → f32 值（smp_key 的逆映射）
+#[inline(always)]
+fn smp_val(k: u64) -> f32 {
+    let m = (k >> 32) as u32;
+    // 逆映射看**映射后**的最高位：1 ⇒ 原值非负（曾翻 0x8000_0000）；
+    // 0 ⇒ 原值为负（曾按位取反）。两者不可混用（写反会把负 logits 的概率
+    // 曲线整体颠倒——k8 的卡方立刻炸到 1e6）。
+    let b = if (m >> 31) != 0 { m ^ 0x8000_0000 } else { !m };
+    f32::from_bits(b)
+}
+
+/// 键 → 原 logits 下标
+#[inline(always)]
+fn smp_idx(k: u64) -> u32 {
+    0xffff_ffff - (k as u32)
+}
+
+/// 设备端采样（top-k / top-p）。block=256、grid=s（一行一块）。
+/// - x: [row_total, n] bf16 logits；rows: [s] 采样行号
+/// - slots: [s] RNG 槽号（= 请求行号，状态跨步常驻）；rng: [槽数] u64
+/// - temp/top_k/top_p/seed: [s] 逐行参数（主机每步覆写设备缓冲）
+/// - scratch: [s, SMP_SLOT] u32；out: [s]（0xFFFFFFFF = 参数非法兜底）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn sample_rows(
+    x: *const u16,
+    rows: *const u32,
+    slots: *const u32,
+    temp: *const f32,
+    top_k: *const u32,
+    top_p: *const f32,
+    seed: *const u64,
+    rng: *mut u64,
+    scratch: *mut u32,
+    out: *mut u32,
+    n: u32,
+    s: u32,
+) {
+    let blk = _block_idx_x() as usize;
+    if blk >= s as usize {
+        return;
+    }
+    let lane = _thread_idx_x() as usize; // < SMP_T
+    let nn = n as usize;
+    let base = *rows.add(blk) as usize * nn;
+    let t = *temp.add(blk);
+    let sb = scratch.add(blk * SMP_SLOT);
+
+    // ── ① greedy（temp ≤ 0，含 NaN）：与 argmax_rows 同算法同归约序 ──
+    if !(t > 0.0) {
+        let mut bv = f32::NEG_INFINITY;
+        let mut bi = 0xffff_ffffu32;
+        let mut i = lane;
+        while i < nn {
+            let v = bf16_to_f32(*x.add(base + i));
+            if v > bv || (v == bv && (i as u32) < bi) {
+                bv = v;
+                bi = i as u32;
+            }
+            i += SMP_T;
+        }
+        *sb.add(lane * 2) = bv.to_bits();
+        *sb.add(lane * 2 + 1) = bi;
+        _syncthreads();
+        if lane == 0 {
+            let mut bv = f32::NEG_INFINITY;
+            let mut bi = 0xffff_ffffu32;
+            let mut l = 0usize;
+            while l < SMP_T {
+                let v = f32::from_bits(*sb.add(l * 2));
+                let idx = *sb.add(l * 2 + 1);
+                if v > bv || (v == bv && idx < bi) {
+                    bv = v;
+                    bi = idx;
+                }
+                l += 1;
+            }
+            *out.add(blk) = bi;
+        }
+        return;
+    }
+
+    // ── 参数解码（主机已校验；这里只做设备侧兜底）──
+    let kk = {
+        let k = *top_k.add(blk) as usize;
+        if k == 0 {
+            // 全词表 top-p/k 不支持（248K 全排序不可接受，见文件头注释）
+            if lane == 0 {
+                *out.add(blk) = 0xffff_ffff;
+            }
+            return;
+        }
+        if k > 64 {
+            64
+        } else {
+            k
+        }
+    };
+    let pp = {
+        let p = *top_p.add(blk);
+        if p > 0.0 && p < 1.0 {
+            p
+        } else {
+            1.0
+        }
+    };
+
+    // ── ③ 一级归约：线程内 top-8 梯子（**无分支 + u64 全序键**）──
+    // 键 = (单调化 f32 位 << 32) | (0xFFFFFFFF - 下标)：与参考镜像的
+    // "值降序、同值下标升序"是同一个全序（单调化对有限值是保序双射，±0 由
+    // `+ 0.0` 规范化），但比较从"值比较 + 相等 + 下标比较"塌成一条 ISETP。
+    // 插入用 8 级 compare-exchange（每元素固定 24 条 ALU，**零分支/零 BSSY**）：
+    // 分支版（`if 命中 { 7 级冒泡 }`）在 warp 级几乎每个元素都会"至少一个
+    // lane 命中"（p ≈ 1-(1-8/k)^32，k 是已处理量），发散开销远高于固定的
+    // 24 条——实测 0.30ms → 见 k9d/k9。
+    let mut k0 = 0u64;
+    let mut k1 = 0u64;
+    let mut k2 = 0u64;
+    let mut k3 = 0u64;
+    let mut k4 = 0u64;
+    let mut k5 = 0u64;
+    let mut k6 = 0u64;
+    let mut k7 = 0u64;
+    macro_rules! cx {
+        ($v:ident, $x:ident) => {{
+            let g = $x > $v;
+            let t = $v;
+            $v = if g { $x } else { t };
+            $x = if g { t } else { $x };
+        }};
+    }
+    macro_rules! ins_key {
+        ($key:expr) => {{
+            let mut x = $key;
+            cx!(k0, x);
+            cx!(k1, x);
+            cx!(k2, x);
+            cx!(k3, x);
+            cx!(k4, x);
+            cx!(k5, x);
+            cx!(k6, x);
+            cx!(k7, x);
+        }};
+    }
+    // ② 温度缩放用**一次倒数 + 乘**（不是逐元素除）：div.rn.f32 是一条
+    // ~15 指令的 Newton 序列；1/t 只算一次（temp=1 时倒数精确 = 1.0 ⇒ 免费）。
+    let inv_t = 1.0f32 / t;
+    macro_rules! ins4 {
+        ($w:expr, $i0:expr) => {{
+            let w = $w;
+            let b = $i0 as u32;
+            ins_key!(smp_key((w & 0xffff) as u16, b, inv_t));
+            ins_key!(smp_key(((w >> 16) & 0xffff) as u16, b + 1, inv_t));
+            ins_key!(smp_key(((w >> 32) & 0xffff) as u16, b + 2, inv_t));
+            ins_key!(smp_key((w >> 48) as u16, b + 3, inv_t));
+        }};
+    }
+    // 装载：一个 u64 装 4 个连续 bf16（lane 拥有 [4·lane, 4·lane+4) 起、步长
+    // 1024 的组），2 路展开 ⇒ 每线程 n/(256·8) ≈ 121 次装载。所有权划分与
+    // 参考镜像的"单遍全局 top-k"不同，但仍是全词表的一个划分、每 lane 仍是
+    // 约 n/256 个元素 ⇒ 一级归约的正确性论证（每 lane 至多贡献 8 个全局
+    // top-k）不变；全序比较与处理次序无关。未对齐（base % 4 ≠ 0）走同一
+    // 划分的标量尾循环，结果逐位一致。
+    let step = SMP_T * 4;
+    let mut i = lane * 4;
+    if base % 4 == 0 {
+        while i + step + 3 < nn {
+            let w0 = *(x.add(base + i) as *const u64);
+            let w1 = *(x.add(base + i + step) as *const u64);
+            ins4!(w0, i);
+            ins4!(w1, i + step);
+            i += 2 * step;
+        }
+        while i + 3 < nn {
+            let w = *(x.add(base + i) as *const u64);
+            ins4!(w, i);
+            i += step;
+        }
+    }
+    // 尾部（含未对齐兜底）：与上面同一个组划分，逐元素补
+    while i < nn {
+        ins_key!(smp_key(*x.add(base + i), i as u32, inv_t));
+        if i + 1 < nn {
+            ins_key!(smp_key(*x.add(base + i + 1), (i + 1) as u32, inv_t));
+        }
+        if i + 2 < nn {
+            ins_key!(smp_key(*x.add(base + i + 2), (i + 2) as u32, inv_t));
+        }
+        if i + 3 < nn {
+            ins_key!(smp_key(*x.add(base + i + 3), (i + 3) as u32, inv_t));
+        }
+        i += step;
+    }
+    // 梯子写回池（每 lane 8 个 u64 键，一次性写）：二级归约要跨 lane 读
+    let pool = sb.add(lane * SMP_LADDER * 2) as *mut u64;
+    *pool.add(0) = k0;
+    *pool.add(1) = k1;
+    *pool.add(2) = k2;
+    *pool.add(3) = k3;
+    *pool.add(4) = k4;
+    *pool.add(5) = k5;
+    *pool.add(6) = k6;
+    *pool.add(7) = k7;
+    _syncthreads();
+
+    // ── ③ 二级归约：排名选择（池 = 256 lane × 8 个 u64 键 = 16KB）。每线程把
+    //    自己 8 个候选放寄存器，**单遍扫全池**给它们攒排名：rank(c) = #{y : y > c}
+    //    （全序严格 ⇒ 排名两两不同）。rank < 64 的候选直接落到 SEL[rank]——
+    //    天然有序，正是 top-p 要的降序。池长 2048 次广播读（所有线程同时读
+    //    同一槽，L1 广播）+ 8×2048 次比较 ≈ 10~20µs/块。对照：lane0 串行
+    //    锦标赛 64 轮 × 256 槽 = 0.87ms（k9b 实测），差 ~50×——并发归约不能
+    //    靠"逐轮抽取"。
+    let cv = [k0, k1, k2, k3, k4, k5, k6, k7];
+    let mut rk = [0u32; SMP_LADDER];
+    let selp = sb.add(SMP_SEL) as *mut u64;
+    macro_rules! rk_one {
+        ($y:expr) => {{
+            let y = $y;
+            if y > k7 {
+                let mut k = 0usize;
+                while k < SMP_LADDER {
+                    if y > cv[k] {
+                        rk[k] += 1;
+                    }
+                    k += 1;
+                }
+            }
+        }};
+    }
+    let pooln = SMP_T * SMP_LADDER; // 池内 u64 字数
+    let poolq = sb as *const u64; // 行槽基址（SMP_SLOT·4B 恒 8 对齐）
+    let mut g = 0usize;
+    while g + 8 <= pooln {
+        let q0 = *poolq.add(g);
+        let q1 = *poolq.add(g + 1);
+        let q2 = *poolq.add(g + 2);
+        let q3 = *poolq.add(g + 3);
+        let q4 = *poolq.add(g + 4);
+        let q5 = *poolq.add(g + 5);
+        let q6 = *poolq.add(g + 6);
+        let q7 = *poolq.add(g + 7);
+        rk_one!(q0);
+        rk_one!(q1);
+        rk_one!(q2);
+        rk_one!(q3);
+        rk_one!(q4);
+        rk_one!(q5);
+        rk_one!(q6);
+        rk_one!(q7);
+        g += 8;
+    }
+    while g < pooln {
+        rk_one!(*poolq.add(g));
+        g += 1;
+    }
+    let mut k = 0usize;
+    while k < SMP_LADDER {
+        if rk[k] < 64 {
+            *selp.add(rk[k] as usize) = cv[k];
+        }
+        k += 1;
+    }
+    _syncthreads();
+    _syncthreads();
+    if lane != 0 {
+        return;
+    }
+    // 有效项 = SEL 前 kk 槽里的真实候选（0 = 未填充哨兵，只会在候选不足时出现）
+    let mut got = 0usize;
+    while got < kk {
+        if *selp.add(got) == 0 {
+            break;
+        }
+        got += 1;
+    }
+    if got == 0 {
+        *out.add(blk) = 0xffff_ffff; // 理论不可达（n ≥ 1）
+        return;
+    }
+    // ── ④ softmax + top-p 截断（f32、键降序；至少保留 1 个）──
+    let m = smp_val(*selp);
+    let mut denom = 0.0f32;
+    let mut pj = 0usize;
+    while pj < got {
+        let e = expf(smp_val(*selp.add(pj)) - m);
+        *sb.add(SMP_PROB + pj) = e.to_bits();
+        denom = e + denom;
+        pj += 1;
+    }
+    let mut c = 0.0f32;
+    let mut keep = 1usize;
+    let mut pj = 0usize;
+    while pj < got {
+        c = f32::from_bits(*sb.add(SMP_PROB + pj)) / denom + c;
+        keep = pj + 1;
+        if c >= pp {
+            break;
+        }
+        pj += 1;
+    }
+    // ── ⑤ 采样：PCG 状态常驻设备缓冲，图内前进（0 = 未初始化 → seed 派生）──
+    let slot = *slots.add(blk) as usize;
+    let mut st = *rng.add(slot);
+    if st == 0 {
+        st = rng_seed(*seed.add(blk));
+    }
+    let u = rng_f32(&mut st);
+    *rng.add(slot) = st;
+    let mut acc = 0.0f32;
+    let mut pick = keep - 1;
+    let mut pj = 0usize;
+    while pj < keep {
+        acc = f32::from_bits(*sb.add(SMP_PROB + pj)) / denom + acc;
+        if u < acc {
+            pick = pj;
+            break;
+        }
+        pj += 1;
+    }
+    *out.add(blk) = smp_idx(*selp.add(pick));
+}
+

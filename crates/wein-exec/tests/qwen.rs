@@ -15,10 +15,14 @@
 //! - q8 · 状态隔离：交错请求互不污染（linear/conv/KV 状态按行分账）
 //! - q9 · 步时延金丝雀：批 4 纯 decode 中位步时延（权重全量读/步的账）
 //! - q10 · 行回收零化：回收行重用输出与全新行逐 token 相同
+//! - qs14 · 设备端采样复现性：同 prompt + 同 seed ⇒ 逐 token 相同；异 seed ⇒ 不同
+//! - qs15 · greedy 零影响：`set_sampling(greedy)` 下 24 token 与原 argmax 逐位相同
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use wein_engine::{CoreConfig, EngineCore, EngineEvent, Executor, FinishReason, SamplingParams};
+use wein_engine::{
+    CoreConfig, EngineCore, EngineEvent, Executor, FinishReason, SampleParams, SamplingParams,
+};
 use wein_exec::qwen_ref::QwenMirror;
 use wein_exec::{argmax, MtpItem, Qwen35Executor};
 use wein_model::{model_dir, HfTokenizer};
@@ -1389,4 +1393,147 @@ fn qs13_spec_row_swap_multiround() {
     let (_, _, _, next_row, flen) = ex.spec_row_stats();
     assert_eq!(flen, next_row as usize, "退场后所有行须回到空闲表（实得 {flen}/{next_row}）");
     assert_row_accounting(&ex, &[]);
+}
+
+// ── qs14/qs15：设备端采样（top-k/top-p）接入 —— 复现性与 greedy 零影响 ──
+
+/// qs14 · 采样复现性：**同 prompt + 同 seed 的两个请求逐 token 相同**，
+/// 不同 seed 则不同。
+///
+/// 四个请求同批推进（同一 GEMM 调用、同一批形状），故 logits 逐位一致——
+/// 剩下唯一能影响结果的输入就是 RNG 流。RNG 状态在设备缓冲（槽 = 请求块表
+/// 行，准入时零化），图内前进、主机不碰；`seed` 缺省时由全局递增计数器派生。
+/// 采样参数 `top_k = 64`（设备端最宽支持集）、`top_p = 1`（不截断）：
+/// 这是纯温度采样，24 个 token 撞车的概率可忽略。
+#[test]
+fn qs14_sampling_seed_reproducible() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains",
+    );
+    p.truncate(24);
+    let l = p.len();
+    const N: usize = 24;
+
+    let samp = |seed: u64| SampleParams {
+        temperature: 1.0,
+        top_k: 64,
+        top_p: 1.0,
+        seed: Some(seed),
+    };
+    // 采样参数在**准入之前**下发（engine 提交路径的顺序：Submit 时校验、
+    // 准入时搬进请求态）
+    for (id, seed) in [(1u64, 777u64), (2, 777), (3, 888), (4, 999)] {
+        ex.set_sampling(id, samp(seed)).expect("合法采样参数须被接受");
+    }
+    // 边界：全词表（top_k=0）必须**明确报错**而不是静默退化
+    let bad = SampleParams { temperature: 1.0, top_k: 0, top_p: 0.9, seed: None };
+    let err = ex.set_sampling(9, bad).expect_err("top_k=0 须被拒绝");
+    assert!(err.contains("全词表"), "错误文案须点明全词表：{err}");
+    eprintln!("qs14 拒绝全词表采样：{err}");
+
+    for id in 1u64..=4 {
+        ex.admitted(id, &p);
+    }
+    let out = ex.step(&StepPlan {
+        prefill: vec![(1, l), (2, l), (3, l), (4, l)],
+        decode: vec![1, 2, 3, 4],
+        batch: vec![],
+    });
+    let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+    collect(&out, &mut got);
+    assert_eq!(out.len(), 4, "同批 4 个请求各出 1 token（实得 {}）", out.len());
+
+    while (1u64..=4).any(|id| toks_of(&got, id).len() < N) {
+        let out = ex.step(&StepPlan { prefill: vec![], decode: vec![1, 2, 3, 4], batch: vec![] });
+        collect(&out, &mut got);
+    }
+    let (a, b, c, d) = (toks_of(&got, 1), toks_of(&got, 2), toks_of(&got, 3), toks_of(&got, 4));
+    assert_eq!(&a[..N], &b[..N], "同 seed（777）同 logits ⇒ 序列须逐位相同");
+    assert_ne!(&a[..N], &c[..N], "不同 seed（888）序列须不同");
+    assert_ne!(&a[..N], &d[..N], "不同 seed（999）序列须不同");
+    // RNG 槽 ≠ 流的身份：槽 1 与槽 2 各自独立前进，互不影响
+    eprintln!(
+        "qs14 采样复现：同 seed 24 token 逐位相同；seed777/888/999 差异 {} / {} 项\n  seq777 = {:?}",
+        (0..N).filter(|&i| a[i] != c[i]).count(),
+        (0..N).filter(|&i| a[i] != d[i]).count(),
+        &a[..N]
+    );
+
+    // 第二轮：全部退场后重新准入 —— 行/RNG 槽**被上一批用脏了**（四个槽
+    // 分别推进过 777/777/888/999）。准入时零化 RNG 槽 + 同 seed 派生 ⇒ 同批
+    // 四个同 seed 请求的序列必须彼此逐位相同。这道用例专门钉"复用行不继承
+    // 旧 RNG 位置"（不零化的话四个槽停在不同的前进位置，序列会散开）
+    ex.retain(&[]);
+    for id in 1u64..=4 {
+        ex.set_sampling(id, samp(777)).expect("重下发");
+        ex.admitted(id, &p);
+    }
+    let mut got2: Vec<(u64, Vec<u32>)> = Vec::new();
+    collect(
+        &ex.step(&StepPlan {
+            prefill: vec![(1, l), (2, l), (3, l), (4, l)],
+            decode: vec![1, 2, 3, 4],
+            batch: vec![],
+        }),
+        &mut got2,
+    );
+    while (1u64..=4).any(|id| toks_of(&got2, id).len() < N) {
+        let out = ex.step(&StepPlan { prefill: vec![], decode: vec![1, 2, 3, 4], batch: vec![] });
+        collect(&out, &mut got2);
+    }
+    let s1 = toks_of(&got2, 1);
+    for id in 2u64..=4 {
+        assert_eq!(
+            &s1[..N],
+            &toks_of(&got2, id)[..N],
+            "行回收（RNG 槽用脏）后重新准入：同 seed 的请求 {id} 须与请求 1 逐位相同"
+        );
+    }
+    eprintln!("qs14 行回收后重跑：4 个同 seed 请求 24 token 彼此逐位相同（RNG 槽准入零化）");
+}
+
+/// qs15 · greedy 零影响：`set_sampling(greedy)` 与"根本不下发采样参数"
+/// 的 24 token **逐位相同**——接入设备端采样不得改动 argmax 路径一个 bit。
+///
+/// 两个请求同批推进（同一 GEMM 调用），逐 token 比对；断言也覆盖"greedy
+/// 不下发参数"与"greedy 显式下发"两条路径的结构等价。这是 qs10 的
+/// 24-token 纯 decode 序列在接入后的回归钉子。
+#[test]
+fn qs15_greedy_unchanged() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains and the river flows quietly through the ancient forest",
+    );
+    p.truncate(24);
+    let l = p.len();
+    const N: usize = 24;
+
+    ex.admitted(1, &p);
+    ex.admitted(2, &p);
+    // 请求 1：完全不下发（历史路径）；请求 2：显式 greedy（temp = 0）
+    ex.set_sampling(2, SampleParams::greedy()).expect("greedy 须被接受");
+    assert!(ex.sampling_of(2).expect("请求 2 已准入").is_greedy(), "greedy 语义须可回读");
+    ex.set_sampling(2, SampleParams { temperature: -1.0, top_k: 3, top_p: 0.5, seed: Some(5) })
+        .expect("temp < 0 也按 greedy 处理");
+
+    let out = ex.step(&StepPlan { prefill: vec![(1, l), (2, l)], decode: vec![1, 2], batch: vec![] });
+    let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+    collect(&out, &mut got);
+    while toks_of(&got, 1).len() < N || toks_of(&got, 2).len() < N {
+        let out = ex.step(&StepPlan { prefill: vec![], decode: vec![1, 2], batch: vec![] });
+        collect(&out, &mut got);
+    }
+    let (a, b) = (toks_of(&got, 1), toks_of(&got, 2));
+    assert_eq!(&a[..N], &b[..N], "greedy 路径（含显式 set_sampling）须与原 argmax 逐位相同");
+    eprintln!("qs15 greedy 零影响：24 token 逐位相同（seq = {:?}）", &a[..N]);
 }

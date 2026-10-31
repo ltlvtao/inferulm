@@ -694,6 +694,150 @@ pub fn argmax_rows(x: &[u16], rows: &[u32], n: usize) -> Vec<u32> {
         .collect()
 }
 
+/// 逐行采样参数（与 kernels::sample_rows 的参数字段一一对应）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleParam {
+    /// ≤ 0 → 等价 argmax（greedy）
+    pub temp: f32,
+    /// 1..=64；0 = 全词表（设备侧不支持 → 0xFFFFFFFF 错误标记）
+    pub top_k: u32,
+    /// (0,1] 之外按 1.0 处理
+    pub top_p: f32,
+    pub seed: u64,
+}
+
+impl Default for SampleParam {
+    fn default() -> Self {
+        // 默认 greedy：temp=0 走 argmax 分支
+        Self { temp: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+    }
+}
+
+/// 采样器 RNG 派生（与 kernels::rng_seed 逐字同式）：splitmix64 终混 | 1，
+/// 状态 0 保留为"未初始化，由 seed 派生"哨兵
+pub fn rng_seed(seed: u64) -> u64 {
+    let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    (x ^ (x >> 31)) | 1
+}
+
+/// PCG-XSH-RR 64/32 一步（纯整数——两侧逐位同）
+pub fn rng_next(st: &mut u64) -> u32 {
+    let old = *st;
+    *st = old.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let x = (((old >> 18) ^ old) >> 27) as u32;
+    let rot = (old >> 59) as u32;
+    (x >> rot) | (x << ((32 - rot) & 31))
+}
+
+/// [0,1) 均匀 f32（取输出低 24 位——尾数域精确）
+pub fn rng_f32(st: &mut u64) -> f32 {
+    (rng_next(st) >> 8) as f32 * (1.0 / 16777216.0)
+}
+
+/// 行采样参考（top-k / top-p）：与 kernels::sample_rows 同序同式——
+/// ① temp ≤ 0 → argmax_rows（复用同一实现，位同合同由此结构性成立）；
+/// ② v = logits/temp；③ 全序 (值大, 下标小) 取 top-k（k 夹到 ≤64，0 → 错误
+/// 标记）；④ top-k 上 softmax（值降序累加）+ top-p 截断（至少 1 个）；
+/// ⑤ PCG 采样。`rng` 是槽状态缓冲（与设备同语义：0 = 未初始化）。
+///
+/// 设备是一级线程梯子 + 二级锦标赛（每 lane 至多贡献 8 项），参考是单遍
+/// O(n·k) 插入——只有在"某 lane 独占 >8 个全局 top-k"时两者才可能不同
+/// （248K/256 lane 下概率 <1e-16；测试用例的 n 均远小于 256，逐 lane 只有
+/// 一项，结构上恒同）
+pub fn sample_rows(
+    x: &[u16],
+    rows: &[u32],
+    n: usize,
+    params: &[SampleParam],
+    slots: &[u32],
+    rng: &mut [u64],
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (blk, &r) in rows.iter().enumerate() {
+        let t = params[blk].temp;
+        if !(t > 0.0) {
+            out.push(argmax_rows(x, &[r], n)[0]);
+            continue;
+        }
+        let k = params[blk].top_k as usize;
+        if k == 0 {
+            out.push(0xffff_ffff);
+            continue;
+        }
+        let k = k.min(64);
+        let pp = {
+            let p = params[blk].top_p;
+            if p > 0.0 && p < 1.0 {
+                p
+            } else {
+                1.0
+            }
+        };
+        let base = r as usize * n;
+        // ② 温度缩放：一次倒数 + 乘（设备同式，逐位对齐；除法不参与）
+        let inv_t = 1.0f32 / t;
+        // ③ 降序 top-k（插入排序；全序 (值大, 下标小)）
+        let mut sel: Vec<(f32, u32)> = Vec::with_capacity(k);
+        for i in 0..n {
+            let v = bf16_to_f32(x[base + i]) * inv_t;
+            let ii = i as u32;
+            let pos = sel
+                .iter()
+                .position(|&(sv, si)| v > sv || (v == sv && ii < si))
+                .unwrap_or(sel.len());
+            if pos < k {
+                sel.insert(pos, (v, ii));
+                if sel.len() > k {
+                    sel.pop();
+                }
+            }
+        }
+        if sel.is_empty() {
+            out.push(0xffff_ffff);
+            continue;
+        }
+        // ④ softmax（值降序累加）+ top-p
+        let m = sel[0].0;
+        let mut probs: Vec<f32> = Vec::with_capacity(sel.len());
+        let mut denom = 0.0f32;
+        for &(v, _) in &sel {
+            let e = expf(v - m);
+            probs.push(e);
+            denom = e + denom;
+        }
+        let mut c = 0.0f32;
+        let mut keep = 1usize;
+        for (j, &pj) in probs.iter().enumerate() {
+            c = pj / denom + c;
+            keep = j + 1;
+            if c >= pp {
+                break;
+            }
+        }
+        // ⑤ 采样
+        let slot = slots[blk] as usize;
+        let mut st = rng[slot];
+        if st == 0 {
+            st = rng_seed(params[blk].seed);
+        }
+        let u = rng_f32(&mut st);
+        rng[slot] = st;
+        let mut acc = 0.0f32;
+        let mut pick = keep - 1;
+        for (j, &pj) in probs.iter().take(keep).enumerate() {
+            acc = pj / denom + acc;
+            if u < acc {
+                pick = j;
+                break;
+            }
+        }
+        out.push(sel[pick].1);
+    }
+    out
+}
+
 /// GEMM 参考的 weight-transposed 形态（gemm_wt 对拍基准）：C[m,n] =
 /// A[m,k]·Wᵀ，W 按存储 [n,k] 直读——f64 累加（厂商库容差模式，g7）
 pub fn gemm_wt(a: &[u16], w: &[u16], m: usize, n: usize, k: usize) -> Vec<f64> {

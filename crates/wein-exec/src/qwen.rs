@@ -34,12 +34,12 @@ use std::time::{Duration, Instant};
 /// 对拍钩子的 run_forward 调用计数（s1=预填批，s2..=解码步）
 static TRACE_STEP: AtomicU32 = AtomicU32::new(0);
 
-use wein_engine::Executor;
+use wein_engine::{Executor, SampleParams};
 use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
     AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetOp, EmbedOp, GemmOp, KvScatterOp,
-    MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SigmulOp, SiluOp,
+    MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluOp,
 };
 use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
@@ -275,6 +275,22 @@ struct ScrDev {
     logits: DevBuf<'static>, // [T, vocab]
     am_scratch: DevBuf<'static>, // [T,512] u32
     am_out: DevBuf<'static>, // [T] u32
+    // —— 设备端采样器（top-k/top-p）：逐行参数 + RNG 槽状态，全部常驻 ——
+    /// 逐行温度 [T_MAX] f32（0 = greedy → kernel 内走 argmax 分支）
+    sm_temp: DevBuf<'static>,
+    /// 逐行 top-k [T_MAX] u32（1..=64；0 = 全词表，主机已拒）
+    sm_topk: DevBuf<'static>,
+    /// 逐行 top-p [T_MAX] f32（(0,1]；(0,1) 之外按 1.0）
+    sm_topp: DevBuf<'static>,
+    /// 逐行种子 [T_MAX] u64（RNG 槽未初始化时由它派生流）
+    sm_seed: DevBuf<'static>,
+    /// 逐行 RNG 槽号 [T_MAX] u32（= 请求块表行；槽独占整条请求生命期）
+    sm_slots: DevBuf<'static>,
+    /// RNG 槽状态 [MAX_ROWS] u64：**图内读写**（图尾 sample_rows 前进它），
+    /// 0 = 未初始化哨兵 → 由 seed 派生；准入新请求时按行零化（同 seed 可复现）
+    sm_rng: DevBuf<'static>,
+    /// 采样输出 [T_MAX] u32（0xFFFFFFFF = 参数非法兜底，正常不可达）
+    sm_out: DevBuf<'static>,
     /// 逐 span 投机标志的常量缓冲（长度 T_MAX，覆盖任何 n_rows ≤ T_MAX）：
     /// 非投机路径全 0、投机链段全 1。**不每步分配/上传**——kernel 只按
     /// 段号取 `specs[r]`，常量内容一次写定（open 期 zero/upload）
@@ -337,6 +353,10 @@ struct ReqState {
     /// 起点 h_p。由产生该位置的 forward 现场落盘（prefill 步/普通步/spec_verify
     /// 的落定行）——主 scratch 的行空间逐级覆写，必须单独存
     hid: Option<DevBuf<'static>>,
+    /// 设备端采样参数（默认 = greedy：temp ≤ 0 走原 argmax，不进采样 kernel）。
+    /// seed 在 `set_sampling` 时定死（None → 全局递增计数器派生），同 seed
+    /// 同 logits ⇒ 同 token 序列（qs14）
+    smp: SampleParams,
 }
 
 /// FULL_DECODE 图档（§7；机制由 w 系在 toy 钉死，此处为 32 层真模型装配）。
@@ -367,8 +387,13 @@ struct QGraphMode {
     fx_ilk: DevBuf<'static>,
     fx_ilv: DevBuf<'static>,
     execs: Vec<GraphExec<'static>>,
+    /// 采样版图（图尾 = argmax + sample_rows）：只在"本步有非 greedy 行"时
+    /// 回放。greedy 步仍回放 `execs`——原图拓扑逐位不变，也零额外开销
+    execs_smp: Vec<GraphExec<'static>>,
     /// 图路径前向计数（qg 系验收：证路径确实被走到）
     replays: u64,
+    /// 其中走采样版图的次数（采样图确实被选中/复用的证据）
+    smp_replays: u64,
 }
 
 /// eager 混合批的常驻输入表（T_MAX 容量；每步只上传用到的前缀）。
@@ -402,6 +427,8 @@ struct MixIn {
     bt: DevBuf<'static>,
     /// argmax 采样行表 [T_MAX]
     samples: DevBuf<'static>,
+    /// 设备端采样器的采样行表 [T_MAX]（只含非 greedy 行——每条按行下标）
+    sm_rows: DevBuf<'static>,
 }
 
 /// 前向输入束——eager 临时缓冲与图档常驻缓冲同构喂法（run_forward 共用）
@@ -683,6 +710,12 @@ pub struct Qwen35Executor {
     spec_ms_draft: f64,
     spec_ms_forward: f64,
     spec_ms_finish: f64,
+    /// 逐请求采样参数（提交时下发，准入时搬进 `ReqState`；退场即清）。
+    /// 默认不在表里 = greedy（历史逐位行为）
+    sample_cfg: HashMap<ReqId, SampleParams>,
+    /// seed 缺省时的派生计数器（单调递增）：不同请求互不相关，同请求的
+    /// seed 一旦定死就不再变（同 seed ⇒ 同序列）
+    seed_seq: u64,
     session: DeviceSession,
 }
 
@@ -877,6 +910,16 @@ impl Qwen35Executor {
             logits: pin!(gpu.alloc_bytes(bf(T_MAX * voc))),
             am_scratch: pin!(gpu.alloc_bytes(T_MAX * 512 * 4)),
             am_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            // 采样器逐行参数 + RNG 槽：**open 期一次分配**（图捕获区间内
+            // 不许分配——gr5 守卫会 panic）。初值全 greedy（temp=0），
+            // 图捕获就是"全 greedy 版"采样图，回放前主机覆写参数
+            sm_temp: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_topk: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_topp: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_seed: pin!(gpu.alloc_bytes(T_MAX * 8)),
+            sm_slots: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_rng: pin!(gpu.alloc_bytes(MAX_ROWS * 8)),
+            sm_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
             specs_zero: pin!(gpu.alloc_bytes(T_MAX * 4)),
             specs_one: pin!(gpu.alloc_bytes(T_MAX * 4)),
             specs_mix: pin!(gpu.alloc_bytes(T_MAX * 4)),
@@ -884,6 +927,17 @@ impl Qwen35Executor {
         // 逐 span 标志常量：一次写定（非投机 = 全 0；投机链段 = 全 1）
         scr.specs_zero.zero_on(session.stream());
         scr.specs_one.upload_on(&vec![1u32; T_MAX], session.stream());
+        // 采样器开局态：temp=0（greedy）、top_k=64、top_p=1、槽号 0、种子 0、
+        // RNG 槽全 0（= 未初始化哨兵 → 由图尾 kernel 用 seed 派生）。图捕获
+        // 期不写这些缓冲（回放前主机才覆写），这里只是给"无采样步"一个
+        // 确定初值：temp=0 ⇒ 图尾采样节点等价 argmax，且**不碰 RNG**
+        scr.sm_temp.zero_on(session.stream());
+        scr.sm_topk.upload_on(&vec![64u32; T_MAX], session.stream());
+        scr.sm_topp.upload_on(&vec![1.0f32; T_MAX], session.stream());
+        scr.sm_seed.zero_on(session.stream());
+        scr.sm_slots.zero_on(session.stream());
+        scr.sm_rng.zero_on(session.stream());
+        scr.sm_out.zero_on(session.stream());
         // eager 混合批常驻输入表（open 期一次分配；运行期只前缀覆写）
         let nqh = cfg.num_heads as usize;
         let mix = MixIn {
@@ -902,6 +956,7 @@ impl Qwen35Executor {
             ilv: pin!(gpu.alloc_bytes(u32b(T_MAX))),
             bt: pin!(gpu.alloc_bytes(u32b(MAX_ROWS * bpr_of()))),
             samples: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            sm_rows: pin!(gpu.alloc_bytes(u32b(T_MAX))),
         };
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
@@ -998,6 +1053,9 @@ impl Qwen35Executor {
             spec_ms_draft: 0.0,
             spec_ms_forward: 0.0,
             spec_ms_finish: 0.0,
+            // 采样参数表默认空 = 全 greedy；派生种子从 1 起（0 留作"未设"）
+            sample_cfg: HashMap::new(),
+            seed_seq: 1,
             session,
         })
     }
@@ -1085,6 +1143,7 @@ impl Qwen35Executor {
         };
         let voc = self.cfg.vocab_size as u32;
         let mut execs = Vec::with_capacity(buckets.len());
+        let mut execs_smp = Vec::with_capacity(buckets.len());
         for &b in &buckets {
             // 预热：同形状直发一次（cuBLASLt heuristic/PTX 模块落缓存——gr4）
             self.run_forward(b, b, &inp);
@@ -1097,6 +1156,32 @@ impl Qwen35Executor {
             );
             let exec: GraphExec<'static> = pin!(stream.end_capture().instantiate());
             execs.push(exec);
+            // 采样版图：同一条前向 + argmax + 图内 sample_rows（RNG 状态常驻
+            // 设备缓冲、图内前进；参数缓冲的初值全 greedy ⇒ 捕获期就是一次
+            // 等价 argmax 的采样，回放前主机整桶覆写参数）。
+            // 捕获区间内零分配/零同步（gr5 守卫）——sample_rows 只是一次
+            // launch，参数/scratch/输出缓冲全部 open 期就位
+            stream.begin_capture();
+            self.run_forward(b, b, &inp);
+            self.session.table().argmax_rows.run(
+                &self.scr.logits, &fx_rows, &self.scr.am_scratch, &self.scr.am_out, voc, b, stream,
+            );
+            self.session.table().sample_rows.run(
+                &self.scr.logits,
+                &fx_rows,
+                &self.scr.sm_slots,
+                &self.scr.sm_temp,
+                &self.scr.sm_topk,
+                &self.scr.sm_topp,
+                &self.scr.sm_seed,
+                &self.scr.sm_rng,
+                &self.scr.sm_out,
+                voc,
+                b,
+                stream,
+            );
+            let exec_smp: GraphExec<'static> = pin!(stream.end_capture().instantiate());
+            execs_smp.push(exec_smp);
         }
         stream.sync();
         self.graph = Some(QGraphMode {
@@ -1118,7 +1203,9 @@ impl Qwen35Executor {
             fx_ilk,
             fx_ilv,
             execs,
+            execs_smp,
             replays: 0,
+            smp_replays: 0,
         });
         Ok(())
     }
@@ -1142,6 +1229,11 @@ impl Qwen35Executor {
     /// 图回放步数（qg 系验收：证图路径确实被走到；NONE 档恒 0）
     pub fn graph_replays(&self) -> u64 {
         self.graph.as_ref().map(|g| g.replays).unwrap_or(0)
+    }
+
+    /// 其中走**采样版图**（图尾含 sample_rows）的回放次数——greedy 步不进它
+    pub fn graph_smp_replays(&self) -> u64 {
+        self.graph.as_ref().map(|g| g.smp_replays).unwrap_or(0)
     }
 
     /// 单 token 前向探针（不动 forwarded——q5 逐步对拍用）：返回该位全词表
@@ -1203,7 +1295,7 @@ impl Qwen35Executor {
             let next = {
                 self.reqs.get_mut(&1).unwrap().forwarded += 1;
                 self.ensure_pages(1, pos);
-                self.forward_rows(&[(row, srow, tok_in, pos as u32)], &[0], true)[0]
+                self.forward_rows(&[(row, srow, tok_in, pos as u32)], &[0], true, &[])[0]
             };
             out.push(next);
             self.reqs.get_mut(&1).unwrap().seq.push(next);
@@ -1285,7 +1377,7 @@ impl Qwen35Executor {
         let mut rows: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut samples: Vec<u32> = Vec::new();
         let segs = self.spec_chain_fill(&mut jobs, &mut rows, &mut samples);
-        let target = self.forward_batch_mixed(&rows, &samples, &segs);
+        let target = self.forward_batch_mixed(&rows, &samples, &segs, &[]);
         let rounds = self.spec_finish(jobs, &target);
         let mut it = rounds.into_iter();
         items
@@ -1601,6 +1693,12 @@ impl Qwen35Executor {
         let k = k.min(SPEC_K_MAX);
         let h = self.cfg.hidden_size as usize;
         if !self.reqs.contains_key(&id) {
+            return;
+        }
+        // 采样与投机互斥：链验证逐位置断言 greedy（`spec_verify`），采样行
+        // 进链会让"草稿接受"判定失真。非 greedy 请求开投机 = 无操作
+        // （`set_sampling` 侧对反向顺序报错，两侧都挡住）
+        if k > 0 && self.reqs.get(&id).is_some_and(|st| !st.smp.is_greedy()) {
             return;
         }
         if k == 0 {
@@ -2150,7 +2248,7 @@ impl Qwen35Executor {
     /// 批前向（eager）：rows = (块表行, 状态行, token, pos)——块表行管 KV 页，
     /// 状态行管 deltanet/conv 状态池（两者默认同值，投机链下分离）
     fn forward_batch(&mut self, rows: &[(u32, u32, u32, u32)], samples: &[u32]) -> Vec<u32> {
-        self.forward_batch_mixed(rows, samples, &[])
+        self.forward_batch_mixed(rows, samples, &[], &[])
     }
 
     /// 混合批前向（**一次 launch 覆盖普通行 + 任意条投机验证链**）：
@@ -2171,6 +2269,7 @@ impl Qwen35Executor {
         rows: &[(u32, u32, u32, u32)],
         samples: &[u32],
         chains: &[ChainSeg],
+        smp: &[SampleParams],
     ) -> Vec<u32> {
         // context 线程局部：engine 任务可在 worker 间迁移，进设备路径先绑
         self.session.gpu().bind_thread();
@@ -2328,15 +2427,83 @@ impl Qwen35Executor {
             &self.scr.logits, &self.mix.samples, &self.scr.am_scratch, &self.scr.am_out,
             self.cfg.vocab_size as u32, s, stream,
         );
+        // 采样行（temp > 0）另发 sample_rows；全 greedy 步**不发**（argmax
+        // 结果原样用——接入前后的 greedy 逐位行为由此结构性不变）
+        let smp_sel = self.launch_sample_rows(rows, samples, smp, stream);
         self.prof_end();
         stream.sync();
         let tr = Instant::now();
-        let out: Vec<u32> = self.scr.am_out.read_to_vec();
+        let mut out: Vec<u32> = self.scr.am_out.read_to_vec();
+        if let Some(sel) = &smp_sel {
+            // 采样行覆盖 argmax 位（顺序 = `samples` 序，恒等映射）
+            let sm: Vec<u32> = self.scr.sm_out.read_to_vec();
+            for (j, &si) in sel.iter().enumerate() {
+                assert_ne!(
+                    sm[j], 0xffff_ffff,
+                    "sample_rows 参数非法（top_k=0 / 候选为空）——set_sampling 应已拒绝"
+                );
+                out[si as usize] = sm[j];
+            }
+        }
         if prof_on {
             self.prof_note_readback(tr);
             self.prof_finalize(tw);
         }
         out[..s as usize].to_vec()
+    }
+
+    /// 设备端采样尾巴（eager）：把非 greedy 采样行的参数/种子/RNG 槽逐行
+    /// 前缀上传后发一次 `sample_rows`。返回 `Some(选中行在 samples 里的下标)`
+    /// ——调用方在 `stream.sync()` 之后按它把 `sm_out` 覆盖进 argmax 结果；
+    /// 全 greedy → `None`（零上传、零 kernel，逐位不变）。
+    ///
+    /// RNG 槽 = 该请求的块表行（准入时零化、图内前进、退场即废）。
+    fn launch_sample_rows(
+        &self,
+        rows: &[(u32, u32, u32, u32)],
+        samples: &[u32],
+        smp: &[SampleParams],
+        stream: &Stream,
+    ) -> Option<Vec<u32>> {
+        let mut sel: Vec<(u32, SampleParams, u32)> = Vec::new();
+        for (i, &r) in samples.iter().enumerate() {
+            let p = smp.get(i).copied().unwrap_or_default();
+            if p.is_greedy() {
+                continue;
+            }
+            sel.push((i as u32, p, rows[r as usize].0));
+        }
+        if sel.is_empty() {
+            return None;
+        }
+        let s = sel.len() as u32;
+        let idx: Vec<u32> = sel.iter().map(|x| samples[x.0 as usize]).collect();
+        let temp: Vec<f32> = sel.iter().map(|x| x.1.temperature as f32).collect();
+        let topk: Vec<u32> = sel.iter().map(|x| x.1.top_k).collect();
+        let topp: Vec<f32> = sel.iter().map(|x| x.1.top_p as f32).collect();
+        let seed: Vec<u64> = sel.iter().map(|x| x.1.seed.unwrap_or(0)).collect();
+        let slots: Vec<u32> = sel.iter().map(|x| x.2).collect();
+        self.mix.sm_rows.upload_prefix_on(&idx, stream);
+        self.scr.sm_temp.upload_prefix_on(&temp, stream);
+        self.scr.sm_topk.upload_prefix_on(&topk, stream);
+        self.scr.sm_topp.upload_prefix_on(&topp, stream);
+        self.scr.sm_seed.upload_prefix_on(&seed, stream);
+        self.scr.sm_slots.upload_prefix_on(&slots, stream);
+        self.session.table().sample_rows.run(
+            &self.scr.logits,
+            &self.mix.sm_rows,
+            &self.scr.sm_slots,
+            &self.scr.sm_temp,
+            &self.scr.sm_topk,
+            &self.scr.sm_topp,
+            &self.scr.sm_seed,
+            &self.scr.sm_rng,
+            &self.scr.sm_out,
+            self.cfg.vocab_size as u32,
+            s,
+            stream,
+        );
+        Some(sel.into_iter().map(|x| x.0).collect())
     }
 
     /// 前向 kernel 序（embed → 32 层 → final norm + logits；不含采样/
@@ -2537,6 +2704,75 @@ impl Qwen35Executor {
     /// token 对拍：qs10/qs11 与性能探针用）
     pub fn set_radix(&mut self, on: bool) {
         self.radix_on = on;
+    }
+
+    /// 采样参数校验 + 归一化（engine 提交路径与直连调用共用，纯函数）。
+    ///
+    /// - greedy（`temp ≤ 0` / NaN）→ 原样返回：top_k/top_p/seed 都不参与
+    ///   （图尾走原 `argmax_rows`，**不进采样 kernel**——逐位合同不变）
+    /// - `temperature` 非有限（+inf）→ Err（除以 inf 会把分布抹平成均匀，
+    ///   静默接受等于给出一个用户没要求的分布）
+    /// - `top_k = 0`（全词表）→ Err，**绝不静默退化成"取前 64"**：
+    ///   设备端只有 top-k 路径，248K 词表要做 top-p 就得全序（等价全排序），
+    ///   单请求单步的排序开销 >= 全词表扫描 × log，不可接受。`top_k=0 且
+    ///   top_p<1`（"全词表 top-p"）是同一个坑的另一张皮，一并拒。
+    /// - `top_k` 夹到 ≤ 64（kernel 的块内梯子深度上限）；`top_p` 落在
+    ///   [0,1] 之外/0 → 1.0（与 kernel 兜底同语义：全保留）
+    fn normalize_sampling(mut p: SampleParams) -> Result<SampleParams, String> {
+        if p.is_greedy() {
+            p.seed = None;
+            return Ok(p);
+        }
+        if !p.temperature.is_finite() {
+            return Err(format!("temperature 须为有限正数（实得 {}）", p.temperature));
+        }
+        if p.top_k == 0 {
+            return Err(format!(
+                "设备端采样器不支持全词表采样（top_k=0，top_p={}）：248K 词表全排序不可接受\
+                 （top-p 需对全词表降序累加）；请给 1..=64 的 top_k",
+                p.top_p
+            ));
+        }
+        p.top_k = p.top_k.min(64);
+        if !(p.top_p > 0.0 && p.top_p <= 1.0) {
+            p.top_p = 1.0;
+        }
+        Ok(p)
+    }
+
+    /// 采样参数下发（`Executor::set_sampling` 的真身；提交时一次）。
+    ///
+    /// 入库两处：`sample_cfg`（准入前下发 ⇒ 建行时取用）与已建行的
+    /// `ReqState::smp`（准入后改参直接生效）。改参/换 seed 会**归零该请求的
+    /// RNG 槽**——新流只由新 seed 决定，不继承旧位置（同 seed ⇒ 同序列）。
+    pub fn set_sampling(&mut self, id: ReqId, p: SampleParams) -> Result<(), String> {
+        let mut p = Self::normalize_sampling(p)?;
+        if p.seed.is_none() {
+            p.seed = Some(self.seed_seq);
+            self.seed_seq += 1;
+        }
+        if let Some(st) = self.reqs.get_mut(&id) {
+            if !p.is_greedy() && st.spec_k > 0 {
+                // 投机链验证是逐位置 argmax（`spec_verify` 的接受判定），
+                // 采样行混进链=接受语义失效。拒绝而不是偷偷关掉投机
+                return Err(format!(
+                    "请求 {id} 在跑投机草稿链（spec_k={}）——采样与链验证互斥，先 set_spec(id, 0)",
+                    st.spec_k
+                ));
+            }
+            st.smp = p;
+            if !p.is_greedy() {
+                let row = st.row as usize;
+                self.scr.sm_rng.zero_range_on(row * 8, 8, &self.session.stream());
+            }
+        }
+        self.sample_cfg.insert(id, p);
+        Ok(())
+    }
+
+    /// 请求当前的采样参数（测试/探针；未下发 = greedy）
+    pub fn sampling_of(&self, id: ReqId) -> Option<SampleParams> {
+        self.reqs.get(&id).map(|st| st.smp).or_else(|| self.sample_cfg.get(&id).copied())
     }
 
     /// 投机读数：(轮数, 提出的草稿总数, 接受总数, 退化次数)。接受率 =
@@ -2825,15 +3061,21 @@ impl Qwen35Executor {
     /// 步前向统一入口：pure_decode（每行独立请求的 1-token 步，采样行
     /// = 全部行）且桶覆盖 → 图回放；否则 eager 直发。混合步/prefill 永远
     /// eager（图只在纯 decode 档——批形状固定，§4 入图安全规则）
-    fn forward_rows(&mut self, rows: &[(u32, u32, u32, u32)], samples: &[u32], pure_decode: bool) -> Vec<u32> {
+    fn forward_rows(
+        &mut self,
+        rows: &[(u32, u32, u32, u32)],
+        samples: &[u32],
+        pure_decode: bool,
+        smp: &[SampleParams],
+    ) -> Vec<u32> {
         // 护栏（同 `step` 的 pure_decode 判定）：带分离 state 行的批不许进图档
         let pure_decode = pure_decode && rows.iter().all(|r| r.1 == r.0);
         if pure_decode && !rows.is_empty() && samples.len() == rows.len() {
             if let Some(bi) = self.bucket_for(rows.len()) {
-                return self.forward_graph(bi, rows);
+                return self.forward_graph(bi, rows, smp);
             }
         }
-        self.forward_batch(rows, samples)
+        self.forward_batch_mixed(rows, samples, &[], smp)
     }
 
     /// ≥m 的最小桶下标；超最大桶 → None（回落 eager）
@@ -2849,7 +3091,18 @@ impl Qwen35Executor {
     /// seq=sink——KV/递推垃圾只落 sink 专属页与状态行）。数据五缓冲按
     /// b_max 整段覆写，一次 graph launch 重放全 kernel 序（含图尾 argmax），
     /// 只回读前 m 个采样 u32
-    fn forward_graph(&mut self, b_idx: usize, rows: &[(u32, u32, u32, u32)]) -> Vec<u32> {
+    ///
+    /// **采样步选另一张图**：图尾有两个版本——`execs`（只 argmax，greedy 的
+    /// 原图，逐位/零额外开销不变）与 `execs_smp`（argmax + 图内 sample_rows）。
+    /// 本步有任一非 greedy 行 → 回放后者并**整桶**覆写逐行参数（尾部 = greedy
+    /// 填充：sink 行绝不偷用别的请求的 RNG 槽）；全 greedy → 回放前者，
+    /// 一次上传都不多、一次回读都不多。
+    fn forward_graph(
+        &mut self,
+        b_idx: usize,
+        rows: &[(u32, u32, u32, u32)],
+        smp: &[SampleParams],
+    ) -> Vec<u32> {
         self.session.gpu().bind_thread();
         let (b, cap, m, sink) = {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
@@ -2860,6 +3113,10 @@ impl Qwen35Executor {
         for &(_, _, _, pos) in rows {
             assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
         }
+        // 本步是否有采样行（逐行参数表可能短于样本行——缺省 = greedy）
+        let row_smp: Vec<SampleParams> =
+            (0..m).map(|j| smp.get(j).copied().unwrap_or_default()).collect();
+        let any_smp = row_smp.iter().any(|p| !p.is_greedy());
         // host 组装：b_max 全量（默认值 = sink 吸收行），前 m 行写真数据
         let mut ids = vec![0u32; cap];
         let mut pos = vec![0u32; cap];
@@ -2876,7 +3133,29 @@ impl Qwen35Executor {
             seqs[j] = bt;
             rid[j] = sr;
         }
+        // 采样参数整桶覆写（尾部 greedy：temp=0 的 sink 行不进 RNG、不采样）
         let stream = self.session.stream();
+        if any_smp {
+            let mut st = vec![0f32; cap];
+            let mut sk = vec![64u32; cap];
+            let mut sp = vec![1f32; cap];
+            let mut sd = vec![0u64; cap];
+            let mut ss = vec![sink; cap];
+            for j in 0..m {
+                let p = row_smp[j];
+                st[j] = p.temperature as f32; // greedy 已由 is_greedy 归零语义覆盖
+                sk[j] = p.top_k.clamp(1, 64);
+                sp[j] = if p.top_p > 0.0 && p.top_p <= 1.0 { p.top_p as f32 } else { 1.0 };
+                sd[j] = p.seed.unwrap_or(0);
+                ss[j] = rows[j].0; // RNG 槽 = 请求块表行
+            }
+            // 前缀 = 整个桶（cap 项）；缓冲尾部（> cap）kernel 不读（s = b）
+            self.scr.sm_temp.upload_prefix_on(&st, stream);
+            self.scr.sm_topk.upload_prefix_on(&sk, stream);
+            self.scr.sm_topp.upload_prefix_on(&sp, stream);
+            self.scr.sm_seed.upload_prefix_on(&sd, stream);
+            self.scr.sm_slots.upload_prefix_on(&ss, stream);
+        }
         {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
             g.in_ids.upload_on(&ids, stream);
@@ -2885,11 +3164,34 @@ impl Qwen35Executor {
             g.in_rid.upload_on(&rid, stream);
             // 页保证已先于本调用完成（step/generate 合同）——bt_host 是最新账
             g.in_bt.upload_on(&self.bt_host, stream);
-            g.execs[b_idx].launch(stream);
+            if any_smp {
+                g.execs_smp[b_idx].launch(stream);
+            } else {
+                g.execs[b_idx].launch(stream);
+            }
         }
         stream.sync();
-        self.graph.as_mut().unwrap().replays += 1;
-        let out: Vec<u32> = self.scr.am_out.read_to_vec();
+        {
+            let g = self.graph.as_mut().unwrap();
+            g.replays += 1;
+            if any_smp {
+                g.smp_replays += 1;
+            }
+        }
+        let mut out: Vec<u32> = self.scr.am_out.read_to_vec();
+        if any_smp {
+            // 采样行覆盖：greedy 行仍用 am_out（图尾 argmax 的输出逐位不变）
+            let sm: Vec<u32> = self.scr.sm_out.read_to_vec();
+            for j in 0..m {
+                if !row_smp[j].is_greedy() {
+                    assert_ne!(
+                        sm[j], 0xffff_ffff,
+                        "sample_rows 参数非法（top_k=0 / 候选为空）——set_sampling 应已拒绝"
+                    );
+                    out[j] = sm[j];
+                }
+            }
+        }
         out[..m].to_vec()
     }
 }
@@ -2922,6 +3224,12 @@ fn conv_row_bytes(cfg: &Qwen35Config) -> usize {
 impl Executor for Qwen35Executor {
     fn row_capacity(&self) -> usize {
         self.row_capacity as usize
+    }
+
+    /// 采样参数下发（见 `Qwen35Executor::set_sampling`）：Err = 设备侧不可
+    /// 满足（全词表 top_k=0 / 与投机链冲突），engine 直接终结该请求
+    fn set_sampling(&mut self, id: ReqId, p: SampleParams) -> Result<(), String> {
+        Qwen35Executor::set_sampling(self, id, p)
     }
 
     /// 块边界（= 快照检查点/前缀共享粒度）。radix 关时上报 1：调度账与
@@ -3009,6 +3317,11 @@ impl Executor for Qwen35Executor {
             );
         }
         let forwarded = shared * BLOCK as usize;
+        // 采样 RNG 槽（= 请求行）回到"未初始化"：新请求的随机流只由 seed 决定，
+        // 不继承上一个占用该行的请求的 RNG 位置（同 seed ⇒ 同序列的前提，
+        // qs14 钉死）。抢占重准入不走这里（prompt 已消费），流得以续接
+        self.scr.sm_rng.zero_range_on(row as usize * 8, 8, &self.session.stream());
+        let smp = self.sample_cfg.get(&id).copied().unwrap_or_default();
         self.reqs.insert(
             id,
             // state_row 默认 = 块表行（现有语义不变；投机链另从 arena 借行）
@@ -3029,6 +3342,7 @@ impl Executor for Qwen35Executor {
                 spec_off_tries: 0,
                 mtp_chain: None,
                 hid: None,
+                smp,
             },
         );
         forwarded
@@ -3089,9 +3403,9 @@ impl Executor for Qwen35Executor {
             .copied()
             .filter(|id| !plan.prefill.iter().any(|&(p, _)| p == *id))
             .filter(|id| {
-                self.reqs
-                    .get(id)
-                    .is_some_and(|st| st.spec_k > 0 && st.forwarded < st.seq.len())
+                self.reqs.get(id).is_some_and(|st| {
+                    st.spec_k > 0 && st.forwarded < st.seq.len() && st.smp.is_greedy()
+                })
             })
             .map(|id| (id, self.reqs[&id].spec_k))
             .collect();
@@ -3189,7 +3503,15 @@ impl Executor for Qwen35Executor {
         let mut rows: Vec<(u32, u32, u32, u32)> =
             batch.iter().map(|r| (r.row, r.state_row, r.tok, r.pos)).collect();
         let mut sample_rows: Vec<u32> = samples.iter().map(|s| s.1 as u32).collect();
+        // 采样参数与 `sample_rows` 一一对齐（greedy 请求 = 默认值 → 不发 kernel）
+        let mut smp: Vec<SampleParams> = samples
+            .iter()
+            .map(|(id, _)| self.reqs.get(id).map(|st| st.smp).unwrap_or_default())
+            .collect();
         let segs = self.spec_chain_fill(&mut jobs, &mut rows, &mut sample_rows);
+        // 链行（投机验证）一律 greedy：逐位置 argmax 是接受判定的前提
+        // （`set_spec`/`set_sampling` 两侧已挡非 greedy 请求进链）
+        smp.resize(sample_rows.len(), SampleParams::greedy());
         // 含投机链的步一律 eager：链行不进图（forward_graph 有 sr==bt 断言），
         // 且图捕获的采样行表是纯 decode 桶形的纯函数，混进链批会错位。
         // 链全退化 / 无候选的步仍是纯 decode → 走图档。
@@ -3205,9 +3527,9 @@ impl Executor for Qwen35Executor {
         let toks = if rows.is_empty() {
             Vec::new()
         } else if pure_decode {
-            self.forward_rows(&rows, &sample_rows, true)
+            self.forward_rows(&rows, &sample_rows, true, &smp)
         } else {
-            self.forward_batch_mixed(&rows, &sample_rows, &segs)
+            self.forward_batch_mixed(&rows, &sample_rows, &segs, &smp)
         };
         if !jobs.is_empty() {
             self.spec_ms_forward += prof_ms(t_fwd.elapsed());
@@ -3303,6 +3625,7 @@ impl Executor for Qwen35Executor {
         gone.sort_unstable();
         for id in gone {
             self.mtp_release(id); // 草稿链槽 + 链 KV 归还（在移除请求态之前）
+            self.sample_cfg.remove(&id); // 采样参数随请求退场（行可能被复用）
             if let Some(st) = self.reqs.remove(&id) {
                 // 前缀缓存移交：本请求写过的完整私有块串挂 radix（所有权
                 // 转移，rc 不变）；沿途边界快照随块挂（槽内容 = 该块末的
