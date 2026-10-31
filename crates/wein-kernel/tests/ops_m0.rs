@@ -26,7 +26,7 @@
 //! W2 flash 分块 / 多头并行时 golden 不变，重对拍即可。
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
-    AddOp, EmbedOp, GemmOp, KvScatterOp, MulOp, OpTable, PagedAttnOp, RopeOp,
+    AddOp, EmbedOp, GemmOp, KvScatterOp, MulOp, OpTable, PagedAttnCuda, PagedAttnOp, RopeOp,
     RmsNormOp, SiluOp, W8A8QuantOp,
 };
 use wein_kernel::reference;
@@ -722,5 +722,259 @@ fn o29_paged_attn_long_seq_timing() {
         let floor_us = (bytes / 1.0e12 * 1.0e6) as f32; // @1TB/s
         eprintln!("o29 paged_attn pos={pos}：{per:.3} ms/launch（10 拍均值；8.2KB/token 地板 {floor_us:.0}µs，{:.1}× 地板）",
             per * 1e3 / floor_us);
+    }
+}
+
+// ── 长序列 attention 分块档（W2 flash 分块：block = (kv 头, token 片, j 分片)）──
+//
+// 旧直路几何 block=(t, q 头)：每个 (token, q 头) 各自把整段 KV 读一遍 ⇒
+// KV 读量 = t × q_heads × L；分块档按 kv 头分组，一块内一次读 KV 供
+// 同组 q 头 × token 片复用（靠 L2 常驻，本仓库无 smem）⇒ 读量 ≈
+// (t/ntok) × kv_heads × L。每输出行的 j 仍全局升序累加、算术式不变。
+
+/// 一档工作点的公共装配：返回 (期望, 直路输出, 分块档输出, 几何)
+#[allow(clippy::type_complexity)]
+fn tile_case(
+    gpu: &Gpu,
+    t: &OpTable<'_>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    tokens: usize,
+    pos: usize,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>, (usize, usize, usize, usize, usize, usize)) {
+    let stream = gpu.stream();
+    let block_size = 16usize;
+    let geom = PagedAttnCuda::tile_geom(
+        q_heads as u32, kv_heads as u32, head_dim as u32, tokens as u32,
+    );
+    let bpr = (pos + 1).div_ceil(block_size);
+    let nseq = 2usize; // 两行序列共页表（页 id 顺排）——既压内存又保留间接寻址
+    let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+    let seq_ids: Vec<u32> = (0..tokens).map(|r| (r % nseq) as u32).collect();
+    let positions = vec![pos as u32; tokens];
+    let he = kv_heads * head_dim;
+    let slots = nseq * bpr * block_size;
+    let k_cache = vec_bf16(0x51ab, slots * he, 1.0);
+    let v_cache = vec_bf16(0x62cd, slots * he, 1.0);
+    let qn = tokens * q_heads * head_dim;
+    let q = vec_bf16(0x73ef, qn, 2.0);
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let expect = reference::paged_attn(
+        &q, &k_cache, &v_cache, &block_table, &seq_ids, &positions, q_scale, bpr, block_size,
+        q_heads, kv_heads, head_dim,
+    );
+    let dq = gpu.alloc_from_slice(&q);
+    let (dkc, dvc) = (gpu.alloc_from_slice(&k_cache), gpu.alloc_from_slice(&v_cache));
+    let (dbt, dsi, dpo) = (
+        gpu.alloc_from_slice(&block_table),
+        gpu.alloc_from_slice(&seq_ids),
+        gpu.alloc_from_slice(&positions),
+    );
+    let dout = gpu.alloc_bytes(qn * 2);
+    t.paged_attn.run(
+        &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, block_size as u32,
+        q_heads as u32, kv_heads as u32, head_dim as u32, tokens as u32, &stream,
+    );
+    stream.sync();
+    let old: Vec<u16> = dout.read_to_vec();
+    // 污化：新几何必须真正写出（防"没写也算同"）
+    let poison = vec![0x7f7fu16; qn];
+    dout.upload_on(&poison, &stream);
+    t.paged_attn.run_tile(
+        &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, block_size as u32,
+        q_heads as u32, kv_heads as u32, head_dim as u32, tokens as u32, &stream,
+    );
+    stream.sync();
+    let tile: Vec<u16> = dout.read_to_vec();
+    assert_ne!(tile, poison, "分块档未写输出（{q_heads}qh/{kv_heads}kvh/hd{head_dim} t={tokens} pos={pos}）");
+    drop((dq, dkc, dvc, dbt, dsi, dpo));
+    let d_oe = old.iter().zip(expect.iter()).filter(|(a, b)| a != b).count();
+    let d_te = tile.iter().zip(expect.iter()).filter(|(a, b)| a != b).count();
+    let d_to = tile.iter().zip(old.iter()).filter(|(a, b)| a != b).count();
+    let row_n = q_heads * head_dim;
+    let row_diff: Vec<bool> = (0..tokens)
+        .map(|r| tile[r * row_n..(r + 1) * row_n] != old[r * row_n..(r + 1) * row_n])
+        .collect();
+    eprintln!(
+        "  dbg {q_heads}/{kv_heads}/{head_dim} t={tokens} pos={pos}: 旧vs参考 {d_oe}，\
+         新vs参考 {d_te}，新vs旧 {d_to}（共 {}）；错行 {:?}",
+        expect.len(),
+        row_diff.iter().take(20).map(|&b| b as u8).collect::<Vec<_>>()
+    );
+    (expect, old, tile, geom)
+}
+
+/// o30 · 分块档 **jsplit=1 位级档**：单分片时 out 由 tile kernel 直落，
+/// 每行 j 升序、m 纯比较、p=expf、den/acc 单链累加 ⇒ 与直路/参考逐位同。
+/// 覆盖 Qwen3.5-4B full 层形 (16,4,256) 与旧 o24/o29 形 (32,16,128)，
+/// pos=300/1000/4000（均 > ATTN_SLOT_CAP 256，即真实长序列工作区）
+#[test]
+fn o30_paged_attn_tile_bitwise() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let cases = [
+        (16usize, 4usize, 256usize, 64usize, 300usize),
+        (16, 4, 256, 64, 1000),
+        (32, 16, 128, 32, 1000),
+        (32, 16, 128, 32, 4000),
+    ];
+    for (qh, kvh, hd, tokens, pos) in cases {
+        let (expect, old, tile, (ntok, nv, rows, bdim, ntile, jsplit)) =
+            tile_case(&gpu, &t, qh, kvh, hd, tokens, pos);
+        assert_eq!(jsplit, 1, "o30 钉位级档：{qh}/{kvh}/{hd}×{tokens} 落 jsplit={jsplit}");
+        let tag = format!("{qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos}");
+        assert_bits(&format!("分块档 vs 参考（{tag}）"), &tile, &expect);
+        assert_bits(&format!("分块档 vs 直路（{tag}）"), &tile, &old);
+        eprintln!(
+            "o30 {tag}：位级同（jsplit=1，ntok={ntok} nv={nv} rows={rows} bdim={bdim} \
+             ntile={ntile}，块数={}）",
+            kvh * ntile
+        );
+    }
+}
+
+/// o31 · 分块档 **jsplit>1 容差档**（decode 形：块数不足按 j 切）：各分片
+/// 独立算局部 (m,l,acc)，`attn_combine` 按分片升序合并 ⇒ 结合律与单遍不同。
+/// 判据同 o25：Frobenius 相对能量 rel2 + 峰值归一 max|Δ|/max|y|
+#[test]
+fn o31_paged_attn_tile_split_tolerance() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let cases = [
+        (16usize, 4usize, 256usize, 1usize, 3071usize),
+        (16, 4, 256, 2, 1000),
+        (32, 16, 128, 1, 4095),
+        (32, 16, 128, 1, 8191),
+    ];
+    for (qh, kvh, hd, tokens, pos) in cases {
+        let (expect, old, tile, (_ntok, _nv, rows, bdim, ntile, jsplit)) =
+            tile_case(&gpu, &t, qh, kvh, hd, tokens, pos);
+        assert!(jsplit > 1, "o31 钉容差档：{qh}/{kvh}/{hd}×{tokens} 落 jsplit={jsplit}");
+        // 归一化账：rel2（能量占比）+ 峰值归一 + 位差计数
+        let (mut sse, mut sy, mut max_d, mut max_y) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&a, &b) in tile.iter().zip(expect.iter()) {
+            let (x, y) = (
+                reference::bf16_to_f32(a) as f64,
+                reference::bf16_to_f32(b) as f64,
+            );
+            sse += (x - y) * (x - y);
+            sy += y * y;
+            max_d = max_d.max((x - y).abs());
+            max_y = max_y.max(y.abs());
+        }
+        let (rel2, maxn) = ((sse / sy).sqrt(), max_d / max_y);
+        let diff = tile.iter().zip(expect.iter()).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "o31 {qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos}：jsplit={jsplit}（块数={}）\
+             rel2 {rel2:.3e} / 峰值归一 {maxn:.3e}（{diff}/{} 位不同；rows={rows} bdim={bdim}）",
+            kvh * ntile * jsplit, tile.len()
+        );
+        // 门 = 实测 × ≥20 裕量（实测 rel2 ≤7.9e-5 / 峰值 ≤2.9e-3，多数档 0 位差
+        // ——decode 单行 softmax 只差分片求和的结合律，误差 ≈ bf16 末位 1 个量子；
+        // 门取 2e-3/1e-2 是为抓"几何错/分片合并错"这类形态回归，不是位级合同）
+        assert!(rel2 <= 2.0e-3, "o31 rel2 越门：{rel2:.3e} > 2.0e-3（{qh}/{kvh}/{hd} pos={pos}）");
+        assert!(maxn <= 1.0e-2, "o31 峰值归一越门：{maxn:.3e} > 1.0e-2（{qh}/{kvh}/{hd} pos={pos}）");
+        // 与直路也应同量级（两路都近似参考，但不得差出形态错）
+        let (mut sse2, mut sy2) = (0.0f64, 0.0f64);
+        for (&a, &b) in tile.iter().zip(old.iter()) {
+            let (x, y) = (
+                reference::bf16_to_f32(a) as f64,
+                reference::bf16_to_f32(b) as f64,
+            );
+            sse2 += (x - y) * (x - y);
+            sy2 += y * y;
+        }
+        let rel2_old = (sse2 / sy2).sqrt();
+        assert!(rel2_old <= 2.0e-3, "o31 分块档 vs 直路 rel2 越门：{rel2_old:.3e}");
+    }
+}
+
+/// o32 · 分块档长序列单发耗时金丝雀（decode 形，1 token，Qwen3.5-4B full
+/// 层形 16 q / 4 kv / hd 256）：KV 读量从 t×q_heads×L 降到 (t/ntok)×kv_heads×L
+/// ——本档按 j 分片换并行度，单块读量 = (L/jsplit)×hd×4B。
+/// 门 = 实测 × ~2.2 裕量（防"每 (t,q 头) 各自整段扫 KV"形态回归）
+#[test]
+fn o32_paged_attn_tile_long_seq_timing() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    let (q_heads, kv_heads, head_dim, block_size, tokens) =
+        (16usize, 4usize, 256usize, 16usize, 1usize);
+    let he = kv_heads * head_dim;
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let qn = tokens * q_heads * head_dim;
+    let dq = gpu.alloc_from_slice(&vec_bf16(0x7a11, qn, 2.0));
+    let dout = gpu.alloc_bytes(qn * 2);
+    for &pos in &[1023usize, 3071, 8191] {
+        let bpr = (pos + 1).div_ceil(block_size);
+        let slots = bpr * block_size;
+        let block_table: Vec<u32> = (0..bpr as u32).collect();
+        let seq_ids = vec![0u32; tokens];
+        let positions = vec![pos as u32; tokens];
+        let (dkc, dvc) = (
+            gpu.alloc_from_slice(&vec_bf16(0x7b33, slots * he, 1.0)),
+            gpu.alloc_from_slice(&vec_bf16(0x7c55, slots * he, 1.0)),
+        );
+        let (dbt, dsi, dpo) = (
+            gpu.alloc_from_slice(&block_table),
+            gpu.alloc_from_slice(&seq_ids),
+            gpu.alloc_from_slice(&positions),
+        );
+        let (ntok, _nv, _rows, _bdim, ntile, jsplit) = PagedAttnCuda::tile_geom(
+            q_heads as u32, kv_heads as u32, head_dim as u32, tokens as u32,
+        );
+        let old_run = || {
+            t.paged_attn.run(
+                &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+                block_size as u32, q_heads as u32, kv_heads as u32, head_dim as u32,
+                tokens as u32, &stream,
+            );
+        };
+        let new_run = || {
+            t.paged_attn.run_tile(
+                &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+                block_size as u32, q_heads as u32, kv_heads as u32, head_dim as u32,
+                tokens as u32, &stream,
+            );
+        };
+        let mut per = [0f32; 2];
+        for (i, run) in [&old_run as &dyn Fn(), &new_run].into_iter().enumerate() {
+            for _ in 0..3 {
+                run();
+            }
+            stream.sync();
+            let (e0, e1) = (gpu.event(), gpu.event());
+            e0.record_on(&stream);
+            for _ in 0..10 {
+                run();
+            }
+            e1.record_on(&stream);
+            stream.sync();
+            per[i] = e1.elapsed_ms(&e0) / 10.0;
+        }
+        // KV 读量（K+V，按各自几何）：旧 = 每 (t,q 头) 各读自己 kv 头的全长
+        // ⇒ q_heads×L×hd×4B；新 = 块数 × (L/jsplit)×hd×4B = kv_heads×ntile×L×hd×4B；
+        // 地板 = 每层每个 kv 头一份全长 kv_heads×L×hd×4B
+        let _ = he;
+        let l = (pos + 1) as f64 * head_dim as f64 * 2.0 * 2.0; // 一个 kv 头的 K+V
+        let nblk = kv_heads * ntile * jsplit;
+        let old_bytes = l * q_heads as f64;
+        let new_bytes = nblk as f64 * l / jsplit as f64;
+        let kv_bytes = l * kv_heads as f64;
+        let floor_ms = (kv_bytes / 1.0e12 * 1.0e6) as f32;
+        eprintln!(
+            "o32 pos={pos}：直路 {:.3} ms / 分块档 {:.3} ms（{:.1}×）；KV 读量 {:.1}MB → \
+             {:.1}MB（地板 {:.1}MB，{:.1}×）；ntok={ntok} ntile={ntile} jsplit={jsplit} \
+             nblk={nblk}（地板 {floor_ms:.0}µs @1TB/s）",
+            per[0], per[1], per[0] / per[1],
+            old_bytes / 1e6, new_bytes / 1e6, kv_bytes / 1e6, new_bytes / kv_bytes,
+        );
+        let gate = per[0] * 0.75; // 分块档须至少快 1.3×
+        assert!(per[1] < gate, "分块档 pos={pos} {:.3}ms 未跑赢直路 {:.3}ms 的 1.33×", per[1], per[0]);
+        drop((dkc, dvc, dbt, dsi, dpo));
     }
 }

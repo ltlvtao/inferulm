@@ -35,6 +35,10 @@ macro_rules! impl_as_kernel_arg {
 }
 impl_as_kernel_arg!(u8, u16, u32, u64, usize, i32, i64, f32, f64, bool);
 
+/// launch 参数向量。**合同：每个实参必须是活过 `launch` 的 place**（局部变量、
+/// 字段、`&T` 解引用）——宏取的是实参的地址，`x as u32`、`f(a)` 这类临时值在
+/// `let args = …;` 语句结束即失效，驱动读到的是被复用/覆盖的栈槽（表现为
+/// 非法地址或参数值错乱）。需要算表达式时先绑局部变量。
 #[macro_export]
 macro_rules! kernel_args {
     ($($arg:expr),* $(,)?) => {

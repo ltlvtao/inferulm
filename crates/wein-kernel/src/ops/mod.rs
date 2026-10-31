@@ -118,6 +118,11 @@ impl OpTable<'_> {
             f: m.func("paged_attn"),
             scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * (ATTN_SLOT_CAP + 2) * 4),
             slot_cap: ATTN_SLOT_CAP as u32,
+            ft: m.func("paged_attn_tile"),
+            fc: m.func("attn_combine"),
+            tscratch: gpu.alloc_bytes(ATTN_TILE_BLOCK_CAP * ATTN_TILE_SLOTS * 4),
+            pacc: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
+            pml: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * 2 * 4),
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -911,6 +916,16 @@ pub struct PagedAttnCuda<'a> {
     /// 每块分值槽宽（kernel 的 `slot_cap`）：pos+1 ≤ 此值走直路（四相位），
     /// 超出走位级同的流式路——容量只影响 scratch 用量，不再是序列长上限
     slot_cap: u32,
+    /// 长序列分块档（`paged_attn_tile` + `attn_combine`）：按 (kv 头,
+    /// token 片, j 分片) 组织，一块内 `ntok×group` 个 q 行共享同一段 KV。
+    /// 默认路径（ctx ≤ 256）不碰它——见 `run_tile`
+    ft: Func,
+    fc: Func,
+    /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
+    tscratch: DevBuf<'a>,
+    /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
+    pacc: DevBuf<'a>,
+    pml: DevBuf<'a>,
 }
 
 /// attn 块数容量上限：T_MAX(512) × q_heads(32)——超容显式 assert
@@ -918,13 +933,141 @@ const ATTN_BLOCK_CAP: usize = 16384;
 /// 分值槽宽（每块 f32 槽数）：256 保 M0 默认路径逐字节不变；更长的位置
 /// 由流式路承担。抬到 `max_pos` 可让长上下文也走直路（scratch = 块数 ×
 /// (cap+2) × 4B：cap=4096 时 ≈ 256MB——默认不付这份显存）
-const ATTN_SLOT_CAP: usize = 256;
+pub const ATTN_SLOT_CAP: usize = 256;
+
+// ── 分块档（长序列）容量 ──
+/// 块数上限：kv 头 × token 片 × j 分片。两档都放得下：Qwen3.5-4B 形
+/// (4 kv × 128 片 × 1) = 512；(32q/16kv/128) 形的 256-token chunk 是
+/// 16 × 64 = 1024。scratch = 1024 × ATTN_TILE_SLOTS × 4B ≈ 21MB（一次分配）
+const ATTN_TILE_BLOCK_CAP: usize = 1024;
+/// 一块内 q 行数上限 = ntok × group（映射用：bdim = rows × hd/4 ≤ 1024）
+const ATTN_TILE_ROWS_CAP: usize = 16;
+/// p 暂存的 j chunk 宽（每 chunk 一次屏障）
+const ATTN_TILE_CHUNK: usize = 256;
+/// 每块 scratch 槽数上限：max 归约(bdim≤1024) + p(chunk×rows≤4096) +
+/// den(rows≤16) + 槽位表(nt≤4 × chunk≤1024)
+const ATTN_TILE_SLOTS: usize = 1024
+    + ATTN_TILE_CHUNK * ATTN_TILE_ROWS_CAP
+    + ATTN_TILE_ROWS_CAP
+    + 4 * ATTN_TILE_CHUNK;
+/// j 分片数上限（decode 形：批小、块不够用时按 j 切片换并行度）
+pub const ATTN_TILE_SPLIT_CAP: usize = 16;
+/// 分片档的 q 行容量（jsplit>1 只在小批发生：rows = tokens×q_heads ≤ 1024）
+const ATTN_TILE_PART_ROWS: usize = 1024;
+/// 分片档 head_dim 容量（偏结果表按它定尺）
+const ATTN_TILE_HD_CAP: usize = 256;
+/// 分块档最小并行目标：块数低于它就往上加 j 分片
+const ATTN_TILE_TARGET_BLOCKS: usize = 128;
+/// 分块档线程上限：kernel 80 regs/线程 ⇒ 1024 线程（80×1024 > 64K 寄存器）
+/// 直接 "too many resources"；512 线程（40960 regs）安全
+const ATTN_TILE_BDIM_CAP: usize = 512;
 
 impl PagedAttnCuda<'_> {
+    /// 测试用：偏结果表设备指针（pacc, pml, tscratch）
+    pub fn part_ptrs(&self) -> (u64, u64, u64) {
+        (self.pacc.device_ptr(), self.pml.device_ptr(), self.tscratch.device_ptr())
+    }
+
     /// 分值槽宽覆盖（测试/容量档口用；只能缩小——分配按 ATTN_SLOT_CAP 一次）
     pub fn set_slot_cap(&mut self, cap: usize) {
         assert!(cap + 2 <= ATTN_SLOT_CAP + 2, "slot_cap {cap} 超分配容量 {ATTN_SLOT_CAP}");
         self.slot_cap = cap as u32;
+    }
+
+    /// 分块档几何裁决（纯函数：测试与 exec 共用同一份算式，附图性质）
+    /// 返回 (ntok, nv, rows_nom, bdim, ntile, jsplit)。
+    pub fn tile_geom(q_heads: u32, kv_heads: u32, head_dim: u32, tokens: u32)
+        -> (usize, usize, usize, usize, usize, usize)
+    {
+        let group = (q_heads / kv_heads) as usize;
+        let hd = head_dim as usize;
+        let nv = hd / 4; // 4 维/线程（u64 载 4×bf16）
+        // token 片：最多 4 个 token，且 rows = ntok×group ≤ ROWS_CAP，
+        // 线程数 rows×hd/4 ≤ BDIM_CAP（寄存器上限，见常量注释）
+        let mut ntok = 4.min(tokens as usize).max(1);
+        while ntok > 1
+            && (ntok * group > ATTN_TILE_ROWS_CAP || ntok * group * nv > ATTN_TILE_BDIM_CAP)
+        {
+            ntok -= 1;
+        }
+        let rows_nom = ntok * group;
+        let bdim = rows_nom * nv;
+        let ntile = (tokens as usize + ntok - 1) / ntok;
+        // j 分片：块数不足时按 j 切（decode 形）；prefill 形落 jsplit=1（位级同）
+        let base = kv_heads as usize * ntile;
+        let mut jsplit = 1usize;
+        while jsplit * base < ATTN_TILE_TARGET_BLOCKS && jsplit < ATTN_TILE_SPLIT_CAP {
+            jsplit += 1;
+        }
+        (ntok, nv, rows_nom, bdim, ntile, jsplit)
+    }
+
+    /// 长序列分块档：block = (kv 头, token 片, j 分片)。
+    /// 与 `run` 的 ABI 同出参（out 同形），调用方无需知道几何。
+    /// jsplit=1 → 直接落 out（与 `run` **逐位相同**）；jsplit>1 → 偏结果 +
+    /// `attn_combine` 合并（容差档：分段求和改结合律）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_tile: tokens=0");
+        assert!(head_dim % 4 == 0 && head_dim >= 4, "分块档要求 head_dim % 4 == 0");
+        assert!(head_dim as usize <= ATTN_TILE_HD_CAP, "head_dim 超分块档表容量");
+        // j 跨步 = nv = head_dim/4 必须整除 chunk：否则 chunk 升序 ≠ 全局 j 升序
+        assert!(
+            ATTN_TILE_CHUNK % (head_dim as usize / 4) == 0,
+            "chunk 宽须是 head_dim/4 的整数倍（j 升序拼接的前提）"
+        );
+        let (ntok, _nv, rows_nom, bdim, ntile, jsplit) =
+            Self::tile_geom(q_heads, kv_heads, head_dim, tokens);
+        assert!(
+            bdim <= ATTN_TILE_BDIM_CAP && bdim % 32 == 0,
+            "分块档线程数 {bdim} 非法（须 ≤{ATTN_TILE_BDIM_CAP} 且 32 的倍数；rows={rows_nom}×hd/4）"
+        );
+        let nblk = kv_heads as usize * ntile * jsplit;
+        assert!(
+            nblk <= ATTN_TILE_BLOCK_CAP,
+            "分块档块数 {nblk} 超 scratch 容量 {ATTN_TILE_BLOCK_CAP}"
+        );
+        if jsplit > 1 {
+            let nrows = tokens as usize * q_heads as usize;
+            assert!(
+                nrows <= ATTN_TILE_PART_ROWS,
+                "分片档行数 {nrows} 超偏结果表容量 {ATTN_TILE_PART_ROWS}"
+            );
+        }
+        // 注意：`kernel_args!` 取的是实参的**地址**，实参必须是活过 launch 的
+        // place（局部变量/字段）——`jsplit as u32` 这类临时值在语句结束即失效，
+        // launch 时读到的是被覆盖的栈槽（非法地址的老来源）。先落局部变量。
+        let (ntok_u, js_u, chunk_u) = (ntok as u32, jsplit as u32, ATTN_TILE_CHUNK as u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc, self.pml, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, ntok_u, js_u, chunk_u, self.tscratch
+        ];
+        self.gpu.launch(&self.ft, nblk as u32, bdim as u32, &args, stream);
+        if jsplit > 1 {
+            let (nrows, hd_u) = (tokens * q_heads, head_dim);
+            let args = crate::kernel_args![
+                self.pacc, self.pml, *out, nrows, js_u, hd_u
+            ];
+            self.gpu.launch(&self.fc, nrows, 256, &args, stream);
+        }
     }
 }
 

@@ -677,6 +677,10 @@ pub struct Qwen35Executor {
     mtp_free: Vec<u32>,
     /// 上一步前向的批行数（last_hidden 的行数；mtp_draft 的 h 行上界）
     last_t: usize,
+    /// 长上下文 attention 分块档开关（见 `paged_attn_tile`）：只在 ctx 上限
+    /// 超过旧路分值槽宽（`ATTN_SLOT_CAP=256`）时启用——默认 ctx-256 路径
+    /// 一发不变。`WEIN_ATTN_TILE=0` 强制走旧路（对拍用）
+    attn_tile: bool,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -1057,6 +1061,8 @@ impl Qwen35Executor {
             mtp_chains: HashMap::new(),
             mtp_free: (0..MTP_CHAINS as u32).rev().collect(),
             last_t: 0,
+            attn_tile: ctx::max_pos() > wein_kernel::ops::ATTN_SLOT_CAP
+                && std::env::var("WEIN_ATTN_TILE").map(|v| v != "0").unwrap_or(true),
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -2765,11 +2771,19 @@ impl Qwen35Executor {
                         &self.v_pool[full_i], self.bpr as u32, ctx::block(), he, t32, stream,
                     );
                     self.prof_mark("attn");
-                    tb.paged_attn.run(
-                        &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt, inp.seqs,
-                        inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh,
-                        hd, t32, stream,
-                    );
+                    if self.attn_tile {
+                        tb.paged_attn.run_tile(
+                            &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt,
+                            inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32,
+                            ctx::block(), qh_n, kvh, hd, t32, stream,
+                        );
+                    } else {
+                        tb.paged_attn.run(
+                            &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt,
+                            inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32,
+                            ctx::block(), qh_n, kvh, hd, t32, stream,
+                        );
+                    }
                     self.prof_mark("eltw");
                     tb.sigmul.run(
                         &self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream,
@@ -3214,10 +3228,19 @@ impl Qwen35Executor {
             &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
             &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
         );
-        tb.paged_attn.run(
-            &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
-            &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32, stream,
-        );
+        if self.attn_tile {
+            tb.paged_attn.run_tile(
+                &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
+                &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
+                stream,
+            );
+        } else {
+            tb.paged_attn.run(
+                &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
+                &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
+                stream,
+            );
+        }
         tb.sigmul.run(&self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream);
         tb.gemm.run_wt(&self.scr.agated, &a.o, &self.scr.o, t32, h, qh_n * hd, stream);
 

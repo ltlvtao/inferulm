@@ -74,10 +74,13 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry argmax_rows("), "argmax_rows 入口缺失/被改名");
     // 设备端采样器（需求刀 1）
     assert!(ptx.contains(".entry sample_rows("), "sample_rows 入口缺失/被改名");
+    // 长序列分块 attention（KV 复用几何）两入口
+    assert!(ptx.contains(".entry paged_attn_tile("), "paged_attn_tile 入口缺失/被改名");
+    assert!(ptx.contains(".entry attn_combine("), "attn_combine 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        20,
-        "导出 kernel 数应为 20（多了说明编译单元混入了别的入口）"
+        22,
+        "导出 kernel 数应为 22（多了说明编译单元混入了别的入口）"
     );
 }
 

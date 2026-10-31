@@ -82,15 +82,18 @@ fn main() {
     let t2 = run_turn(&mut ex, 2, &prompt, gen, chunk);
     let t3 = run_turn(&mut ex, 3, &prompt, gen, chunk2);
 
-    println!("\n| 轮 | chunk | 前缀命中 | prefill 步数 | TTFT ms | 生成 {:?} 均值 ms |", gen);
+    println!("\n| 轮 | chunk | 前缀命中 | prefill 步数 | TTFT ms | 生成 {:?} 均值 ms | ITL p50 ms |",
+        gen);
     for (i, t) in [&t1, &t2, &t3].iter().enumerate() {
         let c = if i == 2 { chunk2 } else { chunk };
         let g = if t.gen_ms.is_empty() { 0.0 } else { t.gen_ms.iter().sum::<f64>() / t.gen_ms.len() as f64 };
-        println!("| {} | {} | {} | {} | {:.1} | {:.2} |", i + 1, c, t.hit, t.steps, t.ttft_ms, g);
+        println!("| {} | {} | {} | {} | {:.1} | {:.2} | {:.2} |",
+            i + 1, c, t.hit, t.steps, t.ttft_ms, g, p50(&t.gen_ms));
     }
-    println!("\n① tokens: {:?}", &t1.tokens[..t1.tokens.len().min(16)]);
-    println!("② tokens: {:?}", &t2.tokens[..t2.tokens.len().min(16)]);
-    println!("③ tokens: {:?}", &t3.tokens[..t3.tokens.len().min(16)]);
+    // 全长打印（不同进程间逐 token 对拍：贪心序列一致性是用户可见的正确性）
+    println!("\n① tokens({}): {:?}", t1.tokens.len(), t1.tokens);
+    println!("② tokens({}): {:?}", t2.tokens.len(), t2.tokens);
+    println!("③ tokens({}): {:?}", t3.tokens.len(), t3.tokens);
     println!(
         "一致性：② ≡ ① {}（radix 命中恢复位同）／③ ≡ ① {}（分段粒度无关）",
         t2.tokens == t1.tokens,
@@ -99,6 +102,16 @@ fn main() {
     if t2.tokens != t1.tokens || t3.tokens != t1.tokens {
         std::process::exit(1);
     }
+}
+
+/// 单请求 decode ITL 的 p50（长上下文基线列：毫秒）
+fn p50(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s[s.len() / 2]
 }
 
 fn run_turn(ex: &mut Qwen35Executor, id: u64, prompt: &[u32], gen: usize, chunk: usize) -> Turn {

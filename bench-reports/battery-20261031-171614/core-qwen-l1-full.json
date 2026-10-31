@@ -1,0 +1,40 @@
+{
+  "config": {
+    "concurrency": 100,
+    "max_tokens": 32,
+    "num": 500,
+    "repeat": 1
+  },
+  "meta": {
+    "git_rev": "3deb9d7",
+    "profile": "release",
+    "ts_unix": 1793438187
+  },
+  "mode": "streaming chat/completions",
+  "result": {
+    "aggregate_tps": 3527.087837071793,
+    "errors": 0.0,
+    "itl_mean_ms": 25.869741153548564,
+    "itl_p50_ms": 24.356489,
+    "itl_p99_ms": 48.109315,
+    "total_tokens": 16000.0,
+    "ttft_p50_ms": 67.113422,
+    "ttft_p90_ms": 128.080779,
+    "ttft_p99_ms": 266.004186,
+    "wall_s": 4.536320256
+  },
+  "runs": [
+    {
+      "aggregate_tps": 3527.087837071793,
+      "errors": 0,
+      "itl_mean_ms": 25.869741153548564,
+      "itl_p50_ms": 24.356489,
+      "itl_p99_ms": 48.109315,
+      "total_tokens": 16000,
+      "ttft_p50_ms": 67.113422,
+      "ttft_p90_ms": 128.080779,
+      "ttft_p99_ms": 266.004186,
+      "wall_s": 4.536320256
+    }
+  ]
+}

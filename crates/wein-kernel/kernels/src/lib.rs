@@ -625,6 +625,305 @@ unsafe fn bf16x4(v: u64) -> [u16; 4] {
     [(v & 0xffff) as u16, ((v >> 16) & 0xffff) as u16, ((v >> 32) & 0xffff) as u16, (v >> 48) as u16]
 }
 
+// ───────────────── 长序列分块 attention（按 KV 复用组织） ─────────────────
+// 为什么换几何：旧形态 block=(t, q_head)——每个 q 行把整段 KV 各读一遍，
+// GQA 下同一个 kv 头的 K/V 被 `group` 个 q 头各读一遍，prefill 时更被 t 个
+// token 各读一遍 ⇒ KV 实际读量 = t·q_heads·L（L=序列长）。本几何
+// block=(kv 头, token 片, j 分片)，一块内 R=ntok·group 个 q 行共享同一段
+// KV ⇒ 读量 ≈ (t/ntok)·kv_heads·L = 旧形态 /(ntok·group)。本仓库无 smem/
+// 无 shfl（nvptx 三断），跨块复用只能靠 L2（72MB）：一个 kv 头一层 8k 的
+// KV 全长 8MB，常驻无压力。
+//
+// 位级合同：**jsplit=1 时与直路/流式路逐位相同**——每个输出元素的算术式
+// 与累加序一字不改：
+// · 分值 = `attn_dot`（同一函数、d 升序、u64 载 4×bf16）× q_scale
+// · m = 全域 max（纯比较，与序无关 ⇒ 与旧路同值）
+// · p = `expf(score − m)`
+// · 分母 `den = p_j + den`（j 升序，跨 chunk 拼接 = 全局 j 升序）
+// · 加权 V `acc = p_j·v_e + acc`（j 升序，每维单线程单链）
+// · 出 = `f32_to_bf16(acc / den)`
+// jsplit>1（decode 形：批太小、块不够用）时按 j 分段求偏 (m_s, l_s, acc_s)
+// 再由 `attn_combine` 合并——分段求和改变结合律 ⇒ 该档是**容差档**
+// （测试 o31 钉 rel2 + 峰值归一；o30 钉 jsplit=1 的位级）。
+//
+// 线程映射（单相，两遍共用）：nv = bdim/rows_nom 线程/行，线程 τ →
+// r = τ/nv（行）、lane = τ%nv（维起点 = lane·4，以及 j 起点 = j0+lane）。
+// 每线程 4 维累加器（u64 载 4×bf16 V）、j 跨步 nv。
+/// 分块档槽位表填充：本 chunk 每个 j 的 paged KV 槽位只查一次，写进
+/// `sb[u·cc + (j−c0)]`（u = token 的片内序号）。块内所有 q 行/线程共享。
+#[inline(always)]
+unsafe fn tile_fill_slots(
+    sb: *mut f32,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    t0: usize,
+    tn: usize,
+    c0: usize,
+    cc: usize,
+    bpr: usize,
+    bs: usize,
+    tau: usize,
+    bdim: usize,
+) {
+    let nent = tn * cc;
+    let mut e = tau;
+    while e < nent {
+        let u = udiv(e, cc);
+        let j = c0 + urem(e, cc);
+        let s = *seq_ids.add(t0 + u) as usize;
+        *sb.add(e) = slot_of(block_table, s, j, bpr, bs) as f32;
+        e += bdim;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn paged_attn_tile(
+    q: *const u16,
+    k_cache: *const u16,
+    v_cache: *const u16,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    scratch: *mut f32,
+) {
+    let hd = head_dim as usize;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let ng = udiv(qh_n, kv_n); // GQA group（q 头/kv 头）
+    let nt = ntok as usize;
+    let js = jsplit as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = udiv(rest, js);
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows_nom = nt * ng; // 命名行数（映射用，末片有空行）
+    let nv = udiv(bdim, rows_nom);
+    let r = udiv(tau, nv);
+    let lane = urem(tau, nv);
+    let rows = tn * ng; // 实际行数
+    let vr = r < rows;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+    // 本块的 j 轴：片内 token 位置的最大值定分段长（末片 token 少但仍共享）
+    let mut pmax = 0usize;
+    let mut u = 0usize;
+    while u < tn {
+        let p = *positions.add(t0 + u) as usize;
+        pmax = if p > pmax { p } else { pmax };
+        u += 1;
+    }
+    let lspan = udiv(pmax + js, js); // ceil((pmax+1)/js)
+    let jmax = pmax + 1;
+    let j0 = sp * lspan;
+    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    let rglob = if vr { (t0 + udiv(r, ng)) * qh_n + kh * ng + urem(r, ng) } else { 0 };
+    // 空分片：落 l=0（combine 跳过），保证 part 表被完整覆盖
+    if j0 >= j1 {
+        if vr && lane == 0 {
+            *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
+            *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
+        }
+        return;
+    }
+    // 块私有 scratch（与 host `ops::ATTN_TILE_SLOTS` 同式同值：max 归约
+    // 1024 + p 暂存 chunk×rows + den 槽 rows + 槽位表 4×chunk）——块间并发，
+    // 不偏移就是全体块共写同一片槽（o30 逮到的错形态）
+    let scratch = scratch.add(blk * TILE_SLOT);
+    let scm = scratch; // [bdim] 行内 max 归约
+    let pb = scratch.add(bdim); // [chunk × rows_nom] p 暂存
+    let cap = chunk as usize;
+    // 槽位表 [nt × chunk]：一 chunk 内每个 j 的 block_table 查表只做一次，块内
+    // 全体行共享。否则 B2 里每个线程的每个 j 都要一次「bt → V」两级依赖载入，
+    // 那是分块档实测的唯一瓶颈（读量已降到 1/8，却被延迟吃回去）。
+    let sb = pb.add(cap * rows_nom + rows_nom); // den 槽（rows_nom）之后
+    let tt = udiv(r, ng); // 行所属 token 的片内序号
+    let gq = urem(r, ng);
+    let sr = if vr { *seq_ids.add(t0 + tt) as usize } else { 0 };
+    let pr = if vr { *positions.add(t0 + tt) as usize } else { 0 };
+    let qbase = if vr { ((t0 + tt) * qh_n + kh * ng + gq) * hd } else { 0 };
+    let qp = q.add(qbase);
+    let vec4 = hd % 4 == 0;
+
+    // ① 遍 1：分值极值（纯比较——值与序无关）。按 chunk 走（步长 nv 与
+    // chunk 宽同余 ⇒ chunk 升序 = 全局 j 升序），每 chunk 复用一次槽位表。
+    let mut m = f32::NEG_INFINITY;
+    let mut c0 = j0;
+    while c0 < j1 {
+        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+        let cc = c1 - c0 + 1;
+        _syncthreads(); // 读侧屏障（表要重填）
+        tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
+        _syncthreads();
+        if vr {
+            let mut j = c0 + lane;
+            while j <= c1 && j <= pr {
+                let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
+                let v = attn_dot(qp, k_cache.add(kbase), hd, vec4) * q_scale;
+                m = if v > m { v } else { m };
+                j += nv;
+            }
+        }
+        c0 = c1 + 1;
+    }
+    if vr {
+        *scm.add(tau) = m;
+    }
+    _syncthreads();
+    let mut mm = f32::NEG_INFINITY;
+    if vr {
+        let mut v2 = 0usize;
+        while v2 < nv {
+            let x = *scm.add(r * nv + v2);
+            mm = if x > mm { x } else { mm };
+            v2 += 1;
+        }
+    }
+
+    // ② 遍 2：chunk 升序复算 p → 分母/加权 V（j 升序累加，跨 chunk 续）
+    let d0 = lane * 4; // 本线程 4 个输出维
+    let mut a0 = 0.0f32;
+    let mut a1 = 0.0f32;
+    let mut a2 = 0.0f32;
+    let mut a3 = 0.0f32;
+    let mut den = 0.0f32;
+    let mut c0 = j0;
+    while c0 < j1 {
+        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+        let jr = if pr < c1 { pr } else { c1 }; // 本行该 chunk 的有效末位
+        let cc = c1 - c0 + 1;
+        _syncthreads();
+        tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
+        _syncthreads();
+        // B1：本 chunk 的 p → pb[(j−c0)·rows_nom + r]
+        if vr {
+            let mut j = c0 + lane;
+            while j <= jr {
+                let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
+                let sc = attn_dot(qp, k_cache.add(kbase), hd, vec4) * q_scale;
+                *pb.add((j - c0) * rows_nom + r) = expf(sc - mm);
+                j += nv;
+            }
+        }
+        _syncthreads();
+        // B2：加权 V —— 线程认领 4 维（u64 载 4×bf16），j 升序；地址只查表
+        if vr {
+            let mut j = c0;
+            while j <= jr {
+                let p = *pb.add((j - c0) * rows_nom + r);
+                let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
+                let vs = bf16x4(*(v_cache.add(vbase) as *const u64));
+                a0 = p * bf16_to_f32(vs[0]) + a0;
+                a1 = p * bf16_to_f32(vs[1]) + a1;
+                a2 = p * bf16_to_f32(vs[2]) + a2;
+                a3 = p * bf16_to_f32(vs[3]) + a3;
+                if lane == 0 {
+                    den = p + den; // 分母一行一份（j 升序，跨 chunk 续）
+                }
+                j += 1;
+            }
+        }
+        c0 = c1 + 1;
+    }
+
+    // ③ 落结果
+    if vr && lane == 0 {
+        *scm.add(r) = den;
+    }
+    _syncthreads();
+    if vr {
+        let d = *scm.add(r);
+        if js == 1 {
+            *out.add(qbase + d0) = f32_to_bf16(a0 / d);
+            *out.add(qbase + d0 + 1) = f32_to_bf16(a1 / d);
+            *out.add(qbase + d0 + 2) = f32_to_bf16(a2 / d);
+            *out.add(qbase + d0 + 3) = f32_to_bf16(a3 / d);
+        } else {
+            let base = rglob * js + sp;
+            *part_ml.add(base * 2) = mm;
+            *part_ml.add(base * 2 + 1) = d;
+            let pb0 = part_acc.add(base * PART_HD_STRIDE + d0);
+            *pb0 = a0;
+            *pb0.add(1) = a1;
+            *pb0.add(2) = a2;
+            *pb0.add(3) = a3;
+        }
+    }
+}
+
+/// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值
+const TILE_SLOT: usize = 1024 + 256 * 16 + 16 + 4 * 256;
+
+/// 偏结果表的行距（head_dim 方向容量）：与 host 侧 `ops::ATTN_TILE_HD_CAP`
+/// 同值——表按 `[rows, split, PART_HD_STRIDE]` 预分配，head_dim 更小时尾部不用。
+const PART_HD_STRIDE: usize = 256;
+
+/// j 分片合并：偏 (m_s, l_s, acc_s) → 输出。s 升序累加（确定性）。
+/// 只有一分片非空时与直路**逐位相同**：l = l_s·expf(0) = l_s、
+/// acc = acc_s·expf(0) = acc_s（expf(0) 精确为 1，乘 1 精确）；
+/// 加 0.0 精确不改值 ⇒ `acc/l` 与原式同。空分片（l=0）直接跳过。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn attn_combine(
+    part_acc: *const f32,
+    part_ml: *const f32,
+    out: *mut u16,
+    nrows: u32,
+    jsplit: u32,
+    head_dim: u32,
+) {
+    let hd = head_dim as usize;
+    let js = jsplit as usize;
+    let i = tid() as usize;
+    if i >= nrows as usize * hd {
+        return;
+    }
+    let r = udiv(i, hd);
+    let d = urem(i, hd);
+    let base = part_ml.add(r * js * 2);
+    let mut m = f32::NEG_INFINITY;
+    let mut s = 0usize;
+    while s < js {
+        let x = *base.add(s * 2);
+        m = if x > m { x } else { m };
+        s += 1;
+    }
+    let mut l = 0.0f32;
+    let mut acc = 0.0f32;
+    let mut s = 0usize;
+    while s < js {
+        let ls = *base.add(s * 2 + 1);
+        if ls > 0.0 {
+            let e = expf(*base.add(s * 2) - m);
+            l = ls * e + l;
+            acc = *part_acc.add((r * js + s) * PART_HD_STRIDE + d) * e + acc;
+        }
+        s += 1;
+    }
+    *out.add(i) = f32_to_bf16(acc / l);
+}
+
 // ───────────────────── I1 竖切算子（Qwen3.5 文本骨干） ─────────────────────
 // 零中心 norm / partial rope / 门控乘 / 深度因果卷积 / gated deltanet /
 // 带门 RMSNorm / 设备端 argmax——数值对齐纪律与上文同守。
