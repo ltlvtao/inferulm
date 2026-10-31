@@ -220,7 +220,7 @@ fn o19_conv_golden_bitwise() {
     // 旧状态（span 1 只 2 步——滚动走读旧槽位的移位路径）
     let st_old = vec_bf16(0xe77e, pool_rows * conv_dim * (kernel - 1), 2.0);
     let expect_conv = reference::conv1d_dw(&x, &w, &st_old, &tok_row, &tok_pos, conv_dim, kernel);
-    let expect_state = reference::conv_state_roll(&x, &st_old, &row_start, &row_count, &row_id, conv_dim, kernel);
+    let expect_state = reference::conv_state_roll(&x, &st_old, &row_start, &row_count, &row_id, conv_dim, kernel, 0);
     // 未触行（行 1）必须原样
     let untouched = &st_old[conv_dim * (kernel - 1)..2 * conv_dim * (kernel - 1)];
     assert_eq!(&expect_state[conv_dim * (kernel - 1)..2 * conv_dim * (kernel - 1)], untouched);
@@ -239,7 +239,7 @@ fn o19_conv_golden_bitwise() {
         gpu.alloc_from_slice(&row_id),
     );
     let dstate = gpu.alloc_from_slice(&st_old);
-    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &dri, conv_dim as u32, kernel as u32, row_start.len() as u32, &stream);
+    t.conv_state_roll.run(&dx, &dstate, &drs, &drc, &dri, conv_dim as u32, kernel as u32, row_start.len() as u32, 0, &stream);
     stream.sync();
     assert_bits("conv_state_roll", &dstate.read_to_vec(), &expect_state);
 }
@@ -281,7 +281,7 @@ fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
         .collect();
 
     let expect_out = reference::deltanet(&q, &k, &v, &a, &b, &a_log, &dt_bias, &mut state,
-        &row_start, &row_count, &row_id, k_heads, v_heads, k_dim, v_dim, 1e-6);
+        &row_start, &row_count, &row_id, k_heads, v_heads, k_dim, v_dim, 1e-6, 0);
     let expect_state = state.clone();
 
     let (dq, dk, dv, da, db) = (gpu.alloc_from_slice(&q), gpu.alloc_from_slice(&k), gpu.alloc_from_slice(&v),
@@ -296,7 +296,7 @@ fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
     let dout = gpu.alloc_bytes(tokens * v_heads * v_dim * 2);
     let (drs, drc, dri) = (gpu.alloc_from_slice(&row_start), gpu.alloc_from_slice(&row_count), gpu.alloc_from_slice(&row_id));
     t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
+        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, 0, &stream);
     stream.sync();
     assert_bits(&format!("{tag} core_out"), &dout.read_to_vec(), &expect_out);
     assert_bits(&format!("{tag} state"), &dstate.read_to_vec(), &expect_state);
@@ -380,7 +380,7 @@ fn o25_deltanet_bf16_state_drift_budget() {
     let mut s_bf = vec![0u16; v_heads * v_dim * k_dim];
     let out_bf = reference::deltanet(
         &q, &k, &v, &a, &b, &a_log, &dt_bias, &mut s_bf, &[0], &[tokens as u32], &[0],
-        k_heads, v_heads, k_dim, v_dim, eps,
+        k_heads, v_heads, k_dim, v_dim, eps, 0,
     );
 
     // 度量：单元素相对误差在近零输出上无意义（分母→0），用归一化账——
@@ -461,14 +461,14 @@ fn o22_deltanet_latency_canary() {
     for _ in 0..3 {
         // 热身（JIT/缓存就位）；状态每拍原地演化——形状与访存量不变
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, 0, &stream);
     }
     stream.sync();
     let (e0, e1) = (gpu.event(), gpu.event());
     e0.record_on(&stream);
     for _ in 0..20 {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, 0, &stream);
     }
     e1.record_on(&stream);
     stream.sync();

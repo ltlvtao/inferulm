@@ -480,9 +480,32 @@ pub fn conv_state_roll(
     row_id: &[u32],
     conv_dim: usize,
     kernel: usize,
+    spec: u32,
 ) -> Vec<u16> {
     let st = kernel - 1;
     let mut out = state.to_vec();
+    if spec != 0 {
+        // spec==1 镜像 kernel：第 t 个 token 处理完把窗口写行 row_id[r]+t+1
+        // （行 j = 前 j 个 token 之后的 conv 状态；spec==0 分支不动作）
+        for r in 0..row_start.len() {
+            for c in 0..conv_dim {
+                let rbase = row_id[r] as usize * conv_dim * st + c * st;
+                let t0 = row_start[r] as i64;
+                for ti in 0..row_count[r] as usize {
+                    let wbase = (row_id[r] as usize + ti + 1) * conv_dim * st + c * st;
+                    for j in 0..st {
+                        let li = ti as i64 + 1 - st as i64 + j as i64;
+                        out[wbase + j] = if li < 0 {
+                            state[rbase + (li + st as i64) as usize]
+                        } else {
+                            x[(t0 + li) as usize * conv_dim + c]
+                        };
+                    }
+                }
+            }
+        }
+        return out;
+    }
     for r in 0..row_start.len() {
         for c in 0..conv_dim {
             let base = row_id[r] as usize * conv_dim * st + c * st;
@@ -522,6 +545,7 @@ pub fn deltanet(
     k_dim: usize,
     v_dim: usize,
     l2_eps: f32,
+    spec: u32,
 ) -> Vec<u16> {
     let kd_sqrt = (k_dim as f32).sqrt();
     let total = row_start
@@ -538,16 +562,21 @@ pub fn deltanet(
             let kh = h * k_heads / v_heads; // repeat_interleave 映射
             let big_a = expf(a_log[h]);
             let dtb = bf16_to_f32(dt_bias[h]);
-            // S[vv][j]，镜像 kernel 的线程私有行（装载即展宽——存储值是 bf16）
-            let sbase = (row_id[r] as usize * v_heads + h) * v_dim * k_dim;
-            let mut s: Vec<f32> = state[sbase..sbase + v_dim * k_dim]
-                .iter()
-                .map(|&b| bf16_to_f32(b))
-                .collect();
             // E2 镜像（kd=vd=128）：kernel 的 kvm/o 是切片+两级折叠的
             // warp 归约树——同树镜像保位对齐；其余形状 j 严格升序
             let e2 = k_dim == 128 && v_dim == 128;
+            // 行 stride = v_heads*v_dim*k_dim（与 kernel 同）。spec==0：整段
+            // 一份 S 原地递推；spec==1：token i 读行 row_id[r]+i、写行 +i+1
+            // （逐位置落盘，与 kernel spec 分支同树同序）。S 装载即展宽、
+            // 更新即收 bf16——逐 token 装载/回写与原一次性回写位等价
+            let rstride = v_heads * v_dim * k_dim;
+            let base0 = (row_id[r] as usize * v_heads + h) * v_dim * k_dim;
             for i in 0..cnt {
+                let sbase = if spec == 0 { base0 } else { base0 + i * rstride };
+                let mut s: Vec<f32> = state[sbase..sbase + v_dim * k_dim]
+                    .iter()
+                    .map(|&b| bf16_to_f32(b))
+                    .collect();
                 let g = st + i;
                 let decay = expf(0.0 - big_a * softplus(bf16_to_f32(a[g * v_heads + h]) + dtb));
                 // β 先收 bf16（HF b.sigmoid() 在 bf16 张量上）——与 kernel 同两跳
@@ -609,9 +638,10 @@ pub fn deltanet(
                     }
                     out[(g * v_heads + h) * v_dim + vv] = f32_to_bf16(o);
                 }
-            }
-            for (d, f) in state[sbase..sbase + v_dim * k_dim].iter_mut().zip(s) {
-                *d = f32_to_bf16(f); // 已是 bf16 可表示值——恒等往返
+                let wbase = if spec == 0 { sbase } else { sbase + rstride };
+                for (d, f) in state[wbase..wbase + v_dim * k_dim].iter_mut().zip(s) {
+                    *d = f32_to_bf16(f); // 已是 bf16 可表示值——恒等往返
+                }
             }
         }
     }

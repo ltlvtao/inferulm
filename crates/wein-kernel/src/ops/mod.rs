@@ -397,6 +397,9 @@ pub trait ConvStateRollOp {
         conv_dim: u32,
         kernel: u32,
         rows: u32,
+        // 0 = 逐段滚动（现有语义）；1 = 逐位置落盘（第 t 个 token 写行
+        // row_id[r]+t+1——MTP 验证链；spec==0 路径逐字节不变）
+        spec: u32,
         stream: &Stream,
     );
     fn name(&self) -> &'static str;
@@ -419,11 +422,12 @@ impl ConvStateRollOp for ConvStateRollCuda<'_> {
         conv_dim: u32,
         kernel: u32,
         rows: u32,
+        spec: u32,
         stream: &Stream,
     ) {
         let n = rows * conv_dim;
-        let args =
-            crate::kernel_args![*x, *state, *row_start, *row_count, *row_id, conv_dim, kernel, rows];
+        let args = crate::kernel_args![*x, *state, *row_start, *row_count, *row_id, conv_dim,
+            kernel, rows, spec];
         self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
     }
     fn name(&self) -> &'static str {
@@ -456,6 +460,9 @@ pub trait DeltanetOp {
         k_dim: u32,
         v_dim: u32,
         l2_eps: f32,
+        // 0 = 逐段单行状态（现有语义）；1 = 逐位置行（token i 读行
+        // row_id[r]+i、写行 +i+1——MTP 验证链的零拷贝回滚；仅 kd=vd=128）
+        spec: u32,
         stream: &Stream,
     );
     fn name(&self) -> &'static str;
@@ -491,6 +498,7 @@ impl DeltanetOp for DeltanetCuda<'_> {
         k_dim: u32,
         v_dim: u32,
         l2_eps: f32,
+        spec: u32,
         stream: &Stream,
     ) {
         // 块几何自带：kd=vd=128 走 E2（一块=(行, v 头)×128 线程=4 warp，
@@ -500,7 +508,7 @@ impl DeltanetOp for DeltanetCuda<'_> {
         let e2 = k_dim == 128 && v_dim == 128;
         let args = crate::kernel_args![*q, *k, *v, *a, *b, *a_log, *dt_bias, *state, *core_out,
             *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps,
-            self.scratch];
+            self.scratch, spec];
         if e2 {
             assert!(n_rows as usize * v_heads as usize <= DELTA_BLOCK_CAP,
                 "deltanet 块数 {} 超 scratch 容量 {DELTA_BLOCK_CAP}", n_rows * v_heads);

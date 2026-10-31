@@ -733,6 +733,7 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
     conv_dim: u32,
     kernel: u32,
     rows: u32,
+    spec: u32,
 ) {
     let cd = conv_dim as usize;
     let st = (kernel - 1) as usize;
@@ -741,6 +742,32 @@ pub unsafe extern "ptx-kernel" fn conv_state_roll(
         return;
     }
     let (r, c) = (udiv(i, cd), urem(i, cd));
+    // spec==1（MTP 验证链的逐位置落盘）：第 t 个 token（段内局部下标 t）
+    // 处理完把窗口写行 row_id[r]+t+1——行 j 即"前 j 个 token 之后"的 conv
+    // 状态，与 deltanet 的 spec 分支同构。读写行不相交（读 row_id[r]、
+    // 写 row_id[r]+1..=cnt），无原地序依赖；spec==0 路径文本不动。
+    if spec != 0 {
+        let rbase = *row_id.add(r) as usize * cd * st + c * st;
+        let t0 = *row_start.add(r) as usize;
+        let cnt = *row_count.add(r) as usize;
+        let mut ti = 0usize;
+        while ti < cnt {
+            let wbase = (*row_id.add(r) as usize + ti + 1) * cd * st + c * st;
+            let mut j = 0usize;
+            while j < st {
+                // 窗口末 st 个 token 以局部下标 li 计（<0 取旧 state 槽位）
+                let li = ti as i32 + 1 - st as i32 + j as i32;
+                *state.add(wbase + j) = if li < 0 {
+                    *state.add(rbase + (li + st as i32) as usize)
+                } else {
+                    *x.add((t0 + li as usize) * cd + c)
+                };
+                j += 1;
+            }
+            ti += 1;
+        }
+        return;
+    }
     let base = *row_id.add(r) as usize * cd * st + c * st;
     let mut j = 0usize;
     while j < st {
@@ -891,6 +918,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     v_dim: u32,
     l2_eps: f32,
     scratch: *mut f32, // [块, 1024]——E2 kvm/o 两级折叠槽（op 预分配，块按 blockIdx 私有）
+    spec: u32,         // 0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
 ) {
     let (kd, vd) = (k_dim as usize, v_dim as usize);
     let vh = v_heads as usize;
@@ -911,6 +939,124 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     if kd == 128 && vd == 128 {
         let bid = _block_idx_x() as usize;
         if bid >= n_rows as usize * vh {
+            return;
+        }
+        // ── spec==1：逐位置 state 行（MTP 验证链的零拷贝回滚）──
+        // 链占连续 state 行 row_id[r] ..= row_id[r]+cnt：token i 读行
+        // row_id[r]+i、写行 row_id[r]+i+1（行 stride = vh*vd*kd）。cnt 个 token
+        // 跑完后行 +j 即"处理了前 j 个 token 之后"的递推状态——接受 j 个
+        // token 时下一步直接从该行起算（零拷贝回滚：不撤销、不重算、不拍快照）。
+        // 元素级表达式/归约树与下方 spec==0 路径逐字同式（这里是拷贝而非改
+        // 公共代码）——spec==0 的文本与算术序原样不动，位对齐合同与寄存器
+        // 占用都不受影响。读基址 sbase 与写基址 swrite 分离、逐 token 推进。
+        if spec != 0 {
+            let (r, h) = (udiv(bid, vh), urem(bid, vh));
+            let kh = h * k_heads as usize / vh;
+            let t = _thread_idx_x() as usize;
+            let (w, s) = (t >> 5, t & 31);
+            let big_a = expf(*a_log.add(h));
+            let dtb = bf16_to_f32(*dt_bias.add(h));
+            let st = *row_start.add(r) as usize;
+            let cnt = *row_count.add(r) as usize;
+            let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32);
+            let stride = vh * vd * kd; // 一行 state 的 bf16 单元数
+            let mut sbase = state.add((*row_id.add(r) as usize * vh + h) * vd * kd);
+            let wslot = scratch.add(bid * 1024 + w * 128);
+            let oslot = wslot.add(512);
+            let mut i = 0usize;
+            while i < cnt {
+                let g = st + i;
+                let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
+                let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
+                let qb = (g * k_heads as usize + kh) * kd;
+                let mut sq = 0.0f32;
+                let mut sk = 0.0f32;
+                let mut j = 0usize;
+                while j < kd {
+                    let qv = bf16_to_f32(*q.add(qb + j));
+                    let kv = bf16_to_f32(*k.add(qb + j));
+                    sq = qv * qv + sq;
+                    sk = kv * kv + sk;
+                    j += 1;
+                }
+                let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
+                let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
+                let kw = *(k.add(qb + s * 4) as *const u64);
+                let qw = *(q.add(qb + s * 4) as *const u64);
+                let (klo, khi) = (kw as u32, (kw >> 32) as u32);
+                let (qlo, qhi) = (qw as u32, (qw >> 32) as u32);
+                let (k0, k1) = (f32::from_bits(klo << 16), f32::from_bits(klo & 0xffff_0000));
+                let (k2, k3) = (f32::from_bits(khi << 16), f32::from_bits(khi & 0xffff_0000));
+                let (q0, q1) = (f32::from_bits(qlo << 16), f32::from_bits(qlo & 0xffff_0000));
+                let (q2, q3) = (f32::from_bits(qhi << 16), f32::from_bits(qhi & 0xffff_0000));
+                let obase = (g * vh + h) * vd;
+                let swrite = sbase.add(stride); // 本 token 的落盘行 = 读行 + 1
+                let mut vrow = w * 32; // warp 行段游标（批 4 行步进）
+                // 同 dn_e2!，写指针显式传入（swrite = 读基址 + 1 行）
+                macro_rules! dn_e2w {
+                    ($sw:expr, $ww:expr, $b:literal) => {{
+                        let mut kvm = 0.0f32;
+                        let mut u = 0usize;
+                        while u < 32 {
+                            kvm = *wslot.add($b * 32 + u) + kvm;
+                            u += 1;
+                        }
+                        let vin = bf16_to_f32(*v.add(obase + vrow + $b));
+                        let delta = (vin - kvm) * beta;
+                        let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
+                        let r0 = f32_to_bf16_hi((k0 * invk) * delta + (f32::from_bits(lo << 16) * decay));
+                        let r1 = f32_to_bf16_hi((k1 * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
+                        let r2 = f32_to_bf16_hi((k2 * invk) * delta + (f32::from_bits(hi << 16) * decay));
+                        let r3 = f32_to_bf16_hi((k3 * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
+                        *($sw.add((vrow + $b) * kd + s * 4) as *mut u64) =
+                            (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
+                        let mut o = 0.0f32;
+                        o = f32::from_bits(r0) * ((q0 * invq) / kd_sqrt) + o;
+                        o = f32::from_bits(r1) * ((q1 * invq) / kd_sqrt) + o;
+                        o = f32::from_bits(r2) * ((q2 * invq) / kd_sqrt) + o;
+                        o = f32::from_bits(r3) * ((q3 * invq) / kd_sqrt) + o;
+                        *oslot.add($b * 32 + s) = o;
+                    }};
+                }
+                macro_rules! kvm4w {
+                    ($ww:expr, $b:literal) => {{
+                        let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
+                        let mut kvm = 0.0f32;
+                        kvm = (f32::from_bits(lo << 16) * decay) * (k0 * invk) + kvm;
+                        kvm = (f32::from_bits(lo & 0xffff_0000) * decay) * (k1 * invk) + kvm;
+                        kvm = (f32::from_bits(hi << 16) * decay) * (k2 * invk) + kvm;
+                        kvm = (f32::from_bits(hi & 0xffff_0000) * decay) * (k3 * invk) + kvm;
+                        *wslot.add($b * 32 + s) = kvm;
+                    }};
+                }
+                while vrow < (w + 1) * 32 {
+                    let w0 = *(sbase.add((vrow + 0) * kd + s * 4) as *const u64);
+                    let w1 = *(sbase.add((vrow + 1) * kd + s * 4) as *const u64);
+                    let w2 = *(sbase.add((vrow + 2) * kd + s * 4) as *const u64);
+                    let w3 = *(sbase.add((vrow + 3) * kd + s * 4) as *const u64);
+                    kvm4w!(w0, 0); kvm4w!(w1, 1); kvm4w!(w2, 2); kvm4w!(w3, 3);
+                    _syncthreads();
+                    dn_e2w!(swrite, w0, 0); dn_e2w!(swrite, w1, 1);
+                    dn_e2w!(swrite, w2, 2); dn_e2w!(swrite, w3, 3);
+                    _syncthreads();
+                    let mut b = 0usize;
+                    while b < 4 {
+                        let mut o = 0.0f32;
+                        let mut u = 0usize;
+                        while u < 32 {
+                            o = *oslot.add(b * 32 + u) + o;
+                            u += 1;
+                        }
+                        if s == b {
+                            *core_out.add(obase + vrow + b) = f32_to_bf16(o);
+                        }
+                        b += 1;
+                    }
+                    vrow += 4;
+                }
+                sbase = sbase.add(stride);
+                i += 1;
+            }
             return;
         }
         let (r, h) = (udiv(bid, vh), urem(bid, vh));
@@ -1023,6 +1169,13 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             i += 1;
         }
         return;
+    }
+    // spec==1（逐位置 state 行）只在 kd=vd=128 的 E2 fast path 上实现——exec
+    // 侧保证投机验证链只在该形状下走 spec 分支（链形状 = 真模型快路径）；
+    // 通用路径不镜像：误用即 trap（warp 死给驱动报，不展开 panic 宿主调用——
+    // k2 的"PTX 无 call"结构门禁也保持）。spec==0 的通用路径文本不动。
+    if spec != 0 {
+        unsafe { core::arch::nvptx::trap() };
     }
     let bid = _block_idx_x() as usize;
     if bid >= n_rows as usize * v_heads as usize {

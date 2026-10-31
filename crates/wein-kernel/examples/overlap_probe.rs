@@ -54,7 +54,7 @@ fn main() {
 
     let delta = |s: &wein_kernel::cuda::Stream| {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, kh as u32, vh as u32, kd as u32, vd as u32, 1e-6, s);
+            n_rows as u32, kh as u32, vh as u32, kd as u32, vd as u32, 1e-6, 0, s);
     };
 
     // ── gemm 簇：线性层全量（m=100, h=2560, ii=9728）──

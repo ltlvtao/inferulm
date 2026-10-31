@@ -754,3 +754,122 @@ fn qs8_mtp_teacher_forcing_agreement() {
     ex.mtp_reset();
     assert!(acc >= 0.40, "MTP 教师强制一致率 {:.1}% < 40%（schema 未对齐？）", acc * 100.0);
 }
+
+// ── qs9：投机解码基础原语——逐位置 state 行（零拷贝回滚）+ spec_verify ──
+
+/// A 的 state 行（接受位落定行）与 B 的普通步 state 行逐位比（u16 位级）。
+/// 只读 2 个 lin 层（1MB/行）+ 全部 24 个 conv 层（48KB/行）——整池回读是
+/// 128MB×24 层，禁
+fn assert_state_rows_bitwise(ex: &Qwen35Executor, a_id: u64, b_id: u64) {
+    let ra = ex.state_row_of(a_id).expect("A 无状态行");
+    let rb = ex.state_row_of(b_id).expect("B 无状态行");
+    for (li, _) in [(0usize, 0usize), (12, 0)] {
+        let (va, vb) = (ex.lin_state_row_bits(li, ra), ex.lin_state_row_bits(li, rb));
+        assert_eq!(va.len(), vb.len(), "lin{li} 行宽");
+        for i in 0..va.len() {
+            assert_eq!(
+                va[i], vb[i],
+                "lin{li} 行位不一致 @{i}（A 行 {ra} {:#06x} vs B 行 {rb} {:#06x}）",
+                va[i], vb[i]
+            );
+        }
+    }
+    for li in 0..24usize {
+        let (va, vb) = (ex.conv_state_row_bits(li, ra), ex.conv_state_row_bits(li, rb));
+        for i in 0..va.len() {
+            assert_eq!(va[i], vb[i], "conv{li} 行位不一致 @{i}（A 行 {ra} vs B 行 {rb}）");
+        }
+    }
+}
+
+/// qs9 · 投机验证的逐位置 state 行（MTP 基础原语）：请求 A 真草稿链一轮
+/// `spec_verify(id, &[d1,d2,d3])`（链占连续 cnt+1 = 5 行，token i 读行 +i、
+/// 写 +i+1），接受 a 个草稿 ⇒ 落定行 base+1+a 拷回 A 的状态行。断言：
+///
+/// 1. 草稿取真贪心续写（由同 prompt 的请求 C 用普通步产出）⇒ 全接受
+///    （a = 3）——验证"链式一次前向 ≡ 逐 token 前向"的位级等价；
+/// 2. A 的 `target_tokens[k]` = B 普通步第 k 个采样结果（位级，k = 0..=a）
+///    ——"验证看到的就是真前向"；
+/// 3. A 的状态行 ≡ B 推进 1+a 个普通步后的状态行（2 lin + 24 conv 层逐位）。
+///
+/// 批形状对齐（位级合同的前提）：A 的验证前向 = 一条链 4 行一次前向（t=4）；
+/// B/C 的普通步用 3 个旁路请求凑满 4 行批（t=4）。cuBLASLt 跨 M 换 algo 会
+/// 破位级合同（临时实验：m=1 与 m=4 同一行有 1/2048 位不同），所以两侧必须
+/// 同 t。旁路请求只负责占位（状态/采样丢弃）。
+#[test]
+fn qs9_spec_state_rows_bitwise() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains, and the river flows quietly through the ancient forest where birds sing \
+         to one another in the cool evening air, and every leaf on every branch trembles \
+         softly as the wind moves through the tall trees toward the open meadow beyond",
+    );
+    assert!(p.len() >= 40, "prompt 须 ≥ 40 token（实得 {}）", p.len());
+    p.truncate(40);
+    let l = p.len();
+
+    // chunked prefill（16+16+8，末段带采样位）——A/B/C 同形，状态逐位同
+    let prefill = |ex: &mut Qwen35Executor, id: u64| -> u32 {
+        ex.admitted(id, &p);
+        let mut rem = l;
+        while rem > 16 {
+            let st = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![], batch: vec![] });
+            assert!(st.is_empty(), "chunked prefill 步不采样");
+            rem -= 16;
+        }
+        let t = ex.step(&StepPlan { prefill: vec![(id, rem)], decode: vec![id], batch: vec![] });
+        t[0].1
+    };
+    let (ta, tb, tc) = (prefill(&mut ex, 1), prefill(&mut ex, 2), prefill(&mut ex, 3));
+    assert_eq!(ta, tb, "A/B 同形 prefill 的末位采样须一致");
+    assert_eq!(ta, tc, "A/C 同形 prefill 的末位采样须一致");
+    // 旁路请求（凑批形状用）：短 prompt，自持 token 流（每步推 1 个、采 1 个）
+    for id in 4u64..=6 {
+        ex.admitted(id, &p[..16]);
+        let _ = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![id], batch: vec![] });
+    }
+    let pad = [4u64, 5, 6];
+    // 普通步驱动：目标请求 1 行 + 3 旁路行 = t=4（与 A 的链批同形）
+    let plain_step = |ex: &mut Qwen35Executor, id: u64| -> u32 {
+        let mut dec = vec![id];
+        dec.extend_from_slice(&pad);
+        let out = ex.step(&StepPlan { prefill: vec![(id, 1)], decode: dec, batch: vec![] });
+        out.iter().find(|(r, _)| *r == id).expect("目标请求须采样").1
+    };
+    // C 先走 3 个普通步 → 真贪心续写 d1..d3（作 A 的草稿）
+    let drafts: Vec<u32> = (0..3).map(|_| plain_step(&mut ex, 3)).collect();
+    // A：投机验证链（cnt = 4 行一次前向，spec==1 逐位置落盘）
+    let r = ex.spec_verify(1, &drafts).expect("链行分配失败");
+    assert_eq!(r.target_tokens.len(), drafts.len() + 1, "每链位置一个 argmax");
+    assert_eq!(r.draft_tokens.len(), r.accepted, "draft_tokens = 接受的草稿");
+    assert_eq!(r.accepted, 3, "真贪心续写作草稿须全接受（实得 {}）", r.accepted);
+    for (k, &d) in drafts.iter().enumerate() {
+        assert_eq!(r.target_tokens[k], d, "链位 {k} 的目标 token 须等于草稿 {d}");
+    }
+    // B：普通步推进 1+a 个 token（每步 t=4，与 A 的链批同形）
+    let b_toks: Vec<u32> = (0..=r.accepted).map(|_| plain_step(&mut ex, 2)).collect();
+    // 2. target_tokens（每位置 argmax）= B 逐 token 采样（位级）
+    assert_eq!(
+        r.target_tokens, b_toks,
+        "A 的逐位置 argmax 须与 B 的普通步采样逐 token 相同"
+    );
+    // 3. state 行逐位：A 的接受位落定行 ≡ B 推进 1+a 个普通步后的行
+    assert_state_rows_bitwise(&ex, 1, 2);
+    eprintln!(
+        "qs9 投机验证：drafts={:?} accepted={} target={:?}（A 行 {} ≡ B 行 {}）",
+        drafts,
+        r.accepted,
+        r.target_tokens,
+        ex.state_row_of(1).unwrap(),
+        ex.state_row_of(2).unwrap()
+    );
+    // 记账自洽：A 的待喂游标 = 旧游标 + 1 + accepted（下一步喂奖励 token）
+    let nxt = ex.spec_verify(1, &[]).expect("空草稿一轮（单 token 验证）");
+    assert_eq!(nxt.accepted, 0);
+    assert_eq!(nxt.draft_tokens.len(), 0);
+    eprintln!("qs9 后续单 token 验证：target={:?}", nxt.target_tokens);
+}
