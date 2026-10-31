@@ -920,6 +920,10 @@ fn qs10_spec_greedy_matches_plain_bitwise() {
     // A = 投机（k=4），B = 普通
     ex.admitted(1, &p);
     ex.admitted(2, &p);
+    // 固定 k 合同：自适应策略（`set_spec` 默认开）会让 k 随 EMA 每轮变，
+    // 批形状（链行数 k+1）随之变——跨 M 的 cuBLASLt algo 差异会破位级合同。
+    // 策略本身由探针（[4] 表）测，这里关掉
+    ex.set_spec_policy(false);
     ex.set_spec(1, 4);
     ex.spec_stats_reset();
     let ta = ex.step(&StepPlan { prefill: vec![(1, l)], decode: vec![1], batch: vec![] });
@@ -1041,6 +1045,7 @@ fn qs11_spec_mixed_batch() {
     for (i, q) in prompts.iter().enumerate() {
         ex.admitted(ids[i], q);
     }
+    ex.set_spec_policy(false); // 固定 k=3（理由同 qs10）
     ex.set_spec(1, 3);
     ex.set_spec(2, 3);
     // A..D 各自 prefill 追平并出首 token（E 只喂前 16 token，尾段留给混合步）
@@ -1179,6 +1184,7 @@ fn qs12_spec_multi_chain_batch() {
     ex.spec_stats_reset();
 
     // ── 第二趟 B：step 级批化（4 个 spec_k=3 请求同步 decode）──
+    ex.set_spec_policy(false); // 固定 k=K（理由同 qs10）
     for (i, q) in prompts.iter().enumerate() {
         ex.admitted(ids[i], q);
         ex.set_spec(ids[i], K);
@@ -1232,4 +1238,155 @@ fn qs12_spec_multi_chain_batch() {
         accepted as f64 / drafts.max(1) as f64 * 100.0,
         ex.spec_chain_batch_max()
     );
+}
+
+// ── qs13：换行零拷贝的多轮合同（行账不漂移 / 不串行 / 不泄漏）──
+
+/// 行账守恒：`[0, next_row)` 恰好 = 活请求行（块表行 ∪ 状态行）∪ free_rows，
+/// 且两者不相交、free 表无重复。任何"归还了还占着""同一行发给两个请求"
+/// "行凭空消失"都会在这里炸。
+fn assert_row_accounting(ex: &Qwen35Executor, live: &[u64]) {
+    let (_, _, _, next_row, flen) = ex.spec_row_stats();
+    let free = ex.spec_free_rows();
+    assert_eq!(free.len(), flen, "spec_row_stats 的 free_rows 长度须与快照一致");
+    let mut fset: Vec<u32> = free.clone();
+    fset.sort_unstable();
+    assert!(fset.windows(2).all(|w| w[0] != w[1]), "free_rows 有重复行：{fset:?}");
+    let mut owned: Vec<u32> = Vec::new();
+    for &id in live {
+        if let Some(r) = ex.block_row_of(id) {
+            owned.push(r);
+        }
+        if let Some(r) = ex.state_row_of(id) {
+            owned.push(r);
+        }
+    }
+    owned.sort_unstable();
+    owned.dedup();
+    for &r in &owned {
+        assert!(!fset.contains(&r), "行 {r} 同时在 free_rows 与活请求名下（串行/双发）");
+    }
+    // 并集覆盖：每个已发过的行号（< next_row）要么属于活请求、要么在空闲表
+    let mut bag: Vec<u32> = owned.clone();
+    bag.extend_from_slice(&fset);
+    bag.sort_unstable();
+    bag.dedup();
+    assert_eq!(bag.len(), owned.len() + fset.len(), "活请求行与空闲行重叠");
+    assert_eq!(
+        bag.len(),
+        next_row as usize,
+        "行账不守恒：活 {} + 空闲 {} ≠ next_row {next_row}（有行泄漏）",
+        owned.len(),
+        fset.len()
+    );
+    assert_eq!(*bag.last().unwrap_or(&0) + 1, next_row, "行号越界（≥ next_row）");
+}
+
+/// qs13 · **多轮换行落定**：A 连续 3 轮 `spec_verify`（每轮 k=3，真贪心续写
+/// 作草稿 ⇒ 全接受），B 走普通步。每轮断言：
+///
+/// 1. A 的逐位置 argmax = B 的 4 个普通步采样（逐 token）；
+/// 2. A 的落定状态行 ≡ B 推进 4 个普通步后的状态行（2 lin + 24 conv 逐 u16）
+///    ——换行（`state_row = head+1+accepted`）在多轮下不漂移；
+/// 3. `state_row` 每轮前进 1+accepted 行、块表行全程不动，且拷入次数为 0
+///    （稳态零拷贝：链首恒等于自己的 state_row）；
+/// 4. 行账守恒（`assert_row_accounting`）：free_rows 无重复、不与活请求
+///    重叠、并集 = `[0, next_row)`；3 轮之间不泄漏。
+///
+/// 批形状对齐（位级前提，同 qs9）：A 的链 = 4 行（t=4），B 的普通步用 3 个
+/// 旁路请求凑成 t=4。
+#[test]
+fn qs13_spec_row_swap_multiround() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    if !ex.has_mtp() {
+        eprintln!("SKIP（checkpoint 无 MTP 草稿层权重 mtp.*）");
+        return;
+    }
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains, and the river flows quietly through the ancient forest where birds sing \
+         to one another in the cool evening air, and every leaf on every branch trembles \
+         softly as the wind moves through the tall trees toward the open meadow beyond",
+    );
+    assert!(p.len() >= 40, "prompt 须 ≥ 40 token（实得 {}）", p.len());
+    p.truncate(40);
+    let l = p.len();
+    const K: usize = 3; // 每轮草稿数
+    const ROUNDS: usize = 3; // ≥3 轮（漂移/泄漏都在轮间暴露）
+
+    // A/B 同形 prefill（16+16+8，末段带采样位）；旁路 4..6 只占位凑 t=4
+    let prefill = |ex: &mut Qwen35Executor, id: u64| -> u32 {
+        ex.admitted(id, &p);
+        let mut rem = l;
+        while rem > 16 {
+            let st = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![], batch: vec![] });
+            assert!(st.is_empty(), "chunked prefill 步不采样");
+            rem -= 16;
+        }
+        ex.step(&StepPlan { prefill: vec![(id, rem)], decode: vec![id], batch: vec![] })[0].1
+    };
+    // 准入顺序：先 B/旁路、最后 A——A 的块表行落在已发行号之后（行号后面
+    // 就是未分配前沿），链的 case 1（自己的 state 行当链首、零拷入）才成立；
+    // 否则 A 的行夹在别人中间，头几轮会走 case 2/3 的 25.2MB 拷入
+    let tb = prefill(&mut ex, 2);
+    for id in 4u64..=6 {
+        ex.admitted(id, &p[..16]);
+        let _ = ex.step(&StepPlan { prefill: vec![(id, 16)], decode: vec![id], batch: vec![] });
+    }
+    let ta = prefill(&mut ex, 1);
+    assert_eq!(ta, tb, "A/B 同形 prefill 的末位采样须一致");
+    let pad = [4u64, 5, 6];
+    // B 的普通步：目标请求 1 行 + 3 旁路行 = t=4（与 A 的链批同形）
+    let plain_step = |ex: &mut Qwen35Executor, id: u64| -> u32 {
+        let mut dec = vec![id];
+        dec.extend_from_slice(&pad);
+        let out = ex.step(&StepPlan { prefill: vec![(id, 1)], decode: dec, batch: vec![] });
+        out.iter().find(|(r, _)| *r == id).expect("目标请求须采样").1
+    };
+    let live = [1u64, 2, 4, 5, 6];
+    let (bt0, sr0) = (ex.block_row_of(1).unwrap(), ex.state_row_of(1).unwrap());
+    assert_eq!(bt0, sr0, "投机前 state_row 恒等块表行");
+    ex.spec_stats_reset();
+    let mut sr_prev = sr0;
+    for round in 0..ROUNDS {
+        // B 先走 K 个普通步 → 真贪心续写（作 A 的草稿）
+        let drafts: Vec<u32> = (0..K).map(|_| plain_step(&mut ex, 2)).collect();
+        let r = ex.spec_verify(1, &drafts).expect("链行分配失败");
+        assert_eq!(r.accepted, K, "第 {round} 轮：真贪心续写作草稿须全接受（实得 {}）", r.accepted);
+        // B 再走 1 步（= A 的奖励 token 位），凑满 1+accepted 个普通步
+        let reward = plain_step(&mut ex, 2);
+        let mut want = drafts.clone();
+        want.push(reward);
+        assert_eq!(r.target_tokens, want, "第 {round} 轮：逐位置 argmax 须 = B 的普通步采样");
+        // 状态行逐位（换行落定之后的行 ≡ B 推进 1+a 步后的行）
+        assert_state_rows_bitwise(&ex, 1, 2);
+        // 换行：state_row 前进 1+accepted，块表行不动
+        let (bt, sr) = (ex.block_row_of(1).unwrap(), ex.state_row_of(1).unwrap());
+        assert_eq!(bt, bt0, "第 {round} 轮：块表行全程不动（KV 页账与 state 行分离）");
+        assert_eq!(
+            sr,
+            sr_prev + 1 + r.accepted as u32,
+            "第 {round} 轮：落定行 = 上一轮状态行 + 1 + accepted（换行零拷贝）"
+        );
+        sr_prev = sr;
+        assert_row_accounting(&ex, &live);
+    }
+    let (allocs, copyins, _cap, next_row, flen) = ex.spec_row_stats();
+    assert_eq!(allocs, ROUNDS as u64, "每轮一次链行分配（实得 {allocs}）");
+    assert_eq!(copyins, 0, "稳态零拷入（链首恒 = 自己的 state_row，实得 {copyins} 次）");
+    assert_eq!(ex.spec_chain_batch_max(), 1, "单链测试：每轮一条链");
+    assert_eq!(ex.spec_stats().0, ROUNDS as u64, "轮次记账 = 实跑轮数");
+    eprintln!(
+        "qs13 多轮换行：{ROUNDS} 轮 × (1+{K}) token 逐 token + 逐 u16 与普通步相同；\
+         state_row {sr0} → {sr_prev}，块表行 {bt0} 不动，拷入 0，next_row {next_row}，free_rows {flen}"
+    );
+    // 全部退场后行必须全数回收（泄漏会在"空闲表长度 ≠ next_row"上暴露）
+    ex.retain(&[]);
+    let (_, _, _, next_row, flen) = ex.spec_row_stats();
+    assert_eq!(flen, next_row as usize, "退场后所有行须回到空闲表（实得 {flen}/{next_row}）");
+    assert_row_accounting(&ex, &[]);
 }

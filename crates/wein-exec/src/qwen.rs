@@ -60,6 +60,35 @@ const MAX_POS: usize = 256;
 /// （每次草稿 = 一次 MTP kernel 序，k=8 = 8 次 launch，仍远小于主步成本）
 const SPEC_K_MAX: u32 = 8;
 
+// ── 自适应 k 策略参数（`WEIN_SPEC_ADAPTIVE=0` 关；见 `spec_policy_step`）──
+// 阈值来自 R=16 的 k 扫描（qwen_spec_probe）：接受率 39%/30%/22% 对应
+// k=1/2/3 的 tok/s 0.70/0.72/0.65 —— 即 k=2 是"接受率 ~30% 时的最优档"，
+// k=1 与 k=3 在其两侧几乎并列。于是：
+//   EMA ≥ 0.45  → k=3（接受率高过扫描点时，第 3 个草稿的边际收益翻正：
+//                       期望出 token 1+3a vs 1+2a，a=0.45 即 2.35 vs 2.0）
+//   0.30..0.45   → k=2（扫描实测的最优带 ≈30%）
+//   < 0.30       → k=1（低接受时草稿成本主导，只赌第一个）
+//   连续 3 轮 < 0.15 → k=0（这些请求的草稿纯亏：连第一个都基本不中，
+//                       继续投机等于每步多付 k 次草稿前向 + 一条链行验证）
+const SPEC_EMA_ALPHA: f32 = 0.3;
+const SPEC_K_ON: f32 = 0.45;
+const SPEC_K_MID: f32 = 0.30;
+const SPEC_OFF_RATIO: f32 = 0.15;
+const SPEC_OFF_RUNS: u32 = 3;
+/// 关投机后的再探间隔（步）：k=0 期间不产生轮次 ⇒ EMA 冻结，必须有探针
+/// 才能"回升重开"（用 k=1 试一轮，仍不行就再关）。首探间隔取小：短请求
+/// （R=1 一轮 2~3 token，整段 15~30 步）等不起 8 步——实测固定 8 步的探针
+/// 让 R=1 的自适应从 1.43× 掉到 1.06×（大半个段都在 k=0 空转）。反复被判
+/// "该关"的请求按 2→4→8→16 退避（见 `spec_policy_step` 的 `spec_off_tries`）
+const SPEC_PROBE_STEPS: u32 = 2;
+
+/// 冷启动 k：EMA 未知时先按中档探（k=1 出 token 太少、k=3 草稿成本最高）
+const SPEC_K_COLD: u32 = 2;
+/// 关投机后"搬回块表行"的耐性（连续 k=0 的步数）：搬一次 25.2MB，只为让
+/// 该请求的纯 decode 步重回图档。抖动中的请求（刚关又开）永远等不到这个
+/// 步数 ⇒ 不白搬；稳定关掉的请求 ~8 步后搬一次
+const SPEC_ANCHOR_IDLE: u32 = 8;
+
 /// KV 页池页数（全注意力层共用一个池容量）
 const NUM_PAGES: u32 = 512;
 const BLOCK: u32 = 16;
@@ -286,6 +315,20 @@ struct ReqState {
     snaps: Vec<(u32, u32)>,
     /// 投机草稿步数（0 = 关；`set_spec` 开）。默认 0 ⇒ 现有测试逐位不受影响
     spec_k: u32,
+    /// 自适应 k（`set_spec` 默认开，`WEIN_SPEC_ADAPTIVE=0` 关）：策略接管
+    /// `spec_k` 的取值，见 `spec_policy_step`
+    spec_auto: bool,
+    /// 接受率 EMA（accepted/drafts，α=0.3）。None = 冷启动（首轮实测直接当 EMA）
+    spec_ema: Option<f32>,
+    /// 连续低接受轮数（< `SPEC_OFF_RATIO` 计数到 `SPEC_OFF_RUNS` → 本段关投机）
+    spec_low_run: u32,
+    /// 关投机（k=0）后的再探倒计时（解一步减一；到 0 用 k=1 重试）
+    spec_probe: u32,
+    /// 连续 k=0 的 decode 步数（到 `SPEC_ANCHOR_IDLE` 才把状态搬回块表行）
+    spec_idle: u32,
+    /// 本段已被判"关投机"的次数——再探间隔按它退避（2/4/8/16 步），
+    /// 免得在一个注定亏的请求上每 2 步烧一轮链验证 + 草稿
+    spec_off_tries: u32,
     /// 草稿链槽（0..MTP_CHAINS，与 `mtp_bt` 的行一一对应；None = 未领）。
     /// 槽号 = `MtpItem::kv_page_row` + 草稿 hidden 在 `scr.x` 的行号：
     /// 同一批里多条链各走自己的 KV 页与 hidden 行，互不踩
@@ -326,6 +369,39 @@ struct QGraphMode {
     execs: Vec<GraphExec<'static>>,
     /// 图路径前向计数（qg 系验收：证路径确实被走到）
     replays: u64,
+}
+
+/// eager 混合批的常驻输入表（T_MAX 容量；每步只上传用到的前缀）。
+///
+/// 为什么常驻：`forward_batch_mixed` 每步要喂 ids/pos/seqs/段表/token 侧
+/// 索引/gather 拆分下标/块表共十几张小表。原先每张 `alloc_from_slice` =
+/// 一次 cuMemAlloc + H2D + 步末 cuMemFree——R=16 k=3 实测 host 上传段
+/// 0.27→2.60ms/步（`WEIN_STEP_PROFILE`），驱动分配开销主导，跟流量无关。
+/// 换成常驻 T_MAX 缓冲 + `upload_prefix_on`（只搬前缀），分配账归零。
+///
+/// 与图档无关：FULL_DECODE 图走自己那套 `fx_*` 固化表 + `in_*` 覆写缓冲
+/// （`QGraphMode`），本结构只在 eager 路径出现——图捕获区间内不得分配，
+/// 这些缓冲也必须 open 期就位（见 `open_with_tune`）
+struct MixIn {
+    ids: DevBuf<'static>,   // [T_MAX]
+    pos: DevBuf<'static>,   // [T_MAX]
+    seqs: DevBuf<'static>,  // [T_MAX]
+    start: DevBuf<'static>, // [T_MAX] 段表（段数 ≤ 行数）
+    count: DevBuf<'static>, // [T_MAX]
+    rid: DevBuf<'static>,   // [T_MAX]
+    trow: DevBuf<'static>,  // [T_MAX] conv tap 源状态行
+    tpos: DevBuf<'static>,  // [T_MAX] conv tap 段内局部位
+    /// gather 拆分下标（full q‖gate）：[T_MAX × nqh]
+    iq: DevBuf<'static>,
+    ig: DevBuf<'static>,
+    /// linear qkv 拆分下标：[T_MAX]
+    ilq: DevBuf<'static>,
+    ilk: DevBuf<'static>,
+    ilv: DevBuf<'static>,
+    /// 全块表镜像 [MAX_ROWS × bpr]（页保证先于上传）
+    bt: DevBuf<'static>,
+    /// argmax 采样行表 [T_MAX]
+    samples: DevBuf<'static>,
 }
 
 /// 前向输入束——eager 临时缓冲与图档常驻缓冲同构喂法（run_forward 共用）
@@ -552,6 +628,8 @@ pub struct Qwen35Executor {
     cos: DevBuf<'static>,
     sin: DevBuf<'static>,
     scr: ScrDev,
+    /// eager 混合批的常驻输入表（每步前缀上传；与图档的 `in_*` 分开）
+    mix: MixIn,
     cfg: Qwen35Config,
     pool: BlockPool,
     /// 前缀缓存索引（token 块 → KV 页；与 pool 联动 pin/rc）
@@ -592,6 +670,14 @@ pub struct Qwen35Executor {
     spec_fallbacks: u64,
     /// 一步里同时验证的最大链数（批化证据：≥2 即"多链共享一次前向"）
     spec_chain_max: u32,
+    /// 自适应 k 策略总开关（open 期取 `WEIN_SPEC_ADAPTIVE`，默认开；
+    /// `set_spec_policy` 运行期可翻）
+    spec_policy: bool,
+    /// 自适应 k 的切换次数（读数：策略确实在动）
+    spec_k_switches: u64,
+    /// 换行零拷贝的行账读数：链行分配次数 / 其中需要拷入的（链首 ≠ state 行）
+    spec_chain_allocs: u64,
+    spec_copyins: u64,
     /// 步内耗时分解（探针读数，总毫秒）：草稿（全部链合计，k 次 MTP 前向）、
     /// 混合前向（含普通行 + 链行）、落定（接受 + state 拷贝 + arena 零化）
     spec_ms_draft: f64,
@@ -798,6 +884,25 @@ impl Qwen35Executor {
         // 逐 span 标志常量：一次写定（非投机 = 全 0；投机链段 = 全 1）
         scr.specs_zero.zero_on(session.stream());
         scr.specs_one.upload_on(&vec![1u32; T_MAX], session.stream());
+        // eager 混合批常驻输入表（open 期一次分配；运行期只前缀覆写）
+        let nqh = cfg.num_heads as usize;
+        let mix = MixIn {
+            ids: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            pos: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            seqs: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            start: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            count: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            rid: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            trow: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            tpos: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            iq: pin!(gpu.alloc_bytes(u32b(T_MAX * nqh))),
+            ig: pin!(gpu.alloc_bytes(u32b(T_MAX * nqh))),
+            ilq: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            ilk: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            ilv: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            bt: pin!(gpu.alloc_bytes(u32b(MAX_ROWS * bpr_of()))),
+            samples: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+        };
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
         // 行状态零化的常驻零源（arena 行归还是一批 memcpy 的源头）
@@ -808,6 +913,8 @@ impl Qwen35Executor {
         } else {
             None
         };
+        // 自适应 k 策略默认开（WEIN_SPEC_ADAPTIVE=0 关：固定 k 的 A/B 基线）
+        let spec_policy = std::env::var("WEIN_SPEC_ADAPTIVE").map_or(true, |v| v != "0");
         // 前缀缓存快照池（WEIN_RADIX=0 关：不分配、三钩子全跳过）。
         // 池深跟状态池实际层数（lin_state=24 linear 层，非 n_layers=32）
         let radix_on = std::env::var("WEIN_RADIX").map_or(true, |v| v != "0");
@@ -857,6 +964,7 @@ impl Qwen35Executor {
             cos,
             sin,
             scr,
+            mix,
             cfg,
             pool: BlockPool::new(NUM_PAGES, 0.5),
             radix: RadixCache::new(),
@@ -883,6 +991,10 @@ impl Qwen35Executor {
             spec_accepted: 0,
             spec_fallbacks: 0,
             spec_chain_max: 0,
+            spec_policy,
+            spec_k_switches: 0,
+            spec_chain_allocs: 0,
+            spec_copyins: 0,
             spec_ms_draft: 0.0,
             spec_ms_forward: 0.0,
             spec_ms_finish: 0.0,
@@ -1220,23 +1332,47 @@ impl Qwen35Executor {
     ) -> (Vec<ChainJob>, Vec<ReqId>) {
         let mut jobs = Vec::with_capacity(items.len());
         let mut fails = Vec::new();
+        // 本步所有漂移链的拷入段攒在一起（一次发行，见
+        // `push_copy_row_state_ops`）
+        let mut copy_ops: Vec<CuBatchOp> = Vec::new();
         for (id, drafts) in items {
             let cnt = drafts.len() as u32 + 1;
             let Some(st) = self.reqs.get(id) else {
                 fails.push(*id);
                 continue;
             };
-            let (bt, state_row, start) = (st.row, st.state_row, st.forwarded);
+            let (bt, mut state_row, start) = (st.row, st.state_row, st.forwarded);
             if cnt as usize > T_MAX || start + cnt as usize > MAX_POS {
                 fails.push(*id);
                 continue;
             }
-            let Some((head, borrowed)) = self.spec_chain_rows(state_row, cnt + 1) else {
+            // 漂移再锚定：换行落定让 state_row 每轮往前滑（1+accepted 行），
+            // 滑过的旧行都还进了 free_rows——落在新 state_row **后面**，自己
+            // 用不上（case 1 只借前面）。于是行空间一边被头前进吃掉、一边
+            // 堆着身后的空闲行，几轮后 case 1 必落空 → 每轮退 case 2/3 的
+            // 25.2MB 拷入（R=16 实测 4.97 次/步 ≈ 126MB/步，把换行零拷贝
+            // 省下的钱又花回去）。这里先试"块表行当链首"：一次 25.2MB 把
+            // 状态搬回 `row`，之后若干轮又能零拷入（顺带恢复
+            // `state_row == row` ⇒ 该请求的纯 decode 步重回图档）
+            let n = cnt + 1;
+            if state_row != bt
+                && !self.chain_head_free(state_row, n)
+                && self.chain_head_free(bt, n)
+            {
+                self.spec_reanchor(*id);
+                state_row = bt;
+            }
+            let Some((head, borrowed)) = self.spec_chain_rows(state_row, n) else {
                 fails.push(*id);
                 continue;
             };
+            self.spec_chain_allocs += 1;
             if head != state_row {
-                self.copy_row_state(state_row, head); // 25.2MB D2D：递推状态 → 链首
+                // 拷入：链首不是请求自己的 state 行（前沿/空闲段分配）——每链
+                // 25.2MB D2D。换行零拷贝下这只是"漂移到池边"时的再锚定，不再
+                // 是每步必付的账（旧实现是每步每链一次拷出）
+                self.spec_copyins += 1;
+                self.push_copy_row_state_ops(state_row, head, &mut copy_ops);
             }
             self.ensure_pages(*id, start + cnt as usize - 1);
             jobs.push(ChainJob {
@@ -1250,12 +1386,32 @@ impl Qwen35Executor {
                 borrowed,
             });
         }
+        if !copy_ops.is_empty() {
+            // 流序：拷入排在本步前向之前（前向的链首行读的就是这份状态）
+            self.session.stream().memcpy_batch(&copy_ops);
+        }
         (jobs, fails)
     }
 
-    /// 投机段的落定：一条前向的 argmax 按链切分 → 贪心接受 → 落定行 state
-    /// 拷回 → 发射簿记（seq/forwarded）→ arena 行零化归还。返回每链的
+    /// 投机段的落定：一条前向的 argmax 按链切分 → 贪心接受 → **换行**
+    /// 落定 → 发射簿记（seq/forwarded）→ arena 行归还。返回每链的
     /// SpecRound（与 `jobs` 同序）。
+    ///
+    /// **落定 = 换行零拷贝（不搬 25.2MB）**：链行空间 `[head, head+cnt]` 里
+    /// 第 `head+j` 行 = "处理完前 j 个链 token 后的递推状态"（deltanet/conv
+    /// kernel 的 `spec==1` 逐位置落盘），于是接受 a 个草稿后的落定行
+    /// `head+1+a` **本来就是**请求要的状态行 ⇒ 直接把 `state_row` 指过去，
+    /// 把它从 `job.borrowed` 里剔除（留在请求名下），其余借出行连同旧
+    /// `state_row` 一起还给 `free_rows`。
+    ///
+    /// 旧实现是 24 lin + 24 conv 段 `memcpy_batch` 拷回旧 state_row：R=16 时
+    /// 768 段/步、实测只跑到 82GB/s（4.85ms/步，驱动开销主导）——投机负收益
+    /// 的第二大项。块表行 `st.row` 完全不动（KV 页账与 state 行早已分离）。
+    ///
+    /// 零化纪律：还回 `free_rows` 的行**不在这里零化**（`admitted` 领用时零，
+    /// 见那里的论证）——链内只有链首行会被**读**，而链首恒等于请求自己的
+    /// `state_row`（`spec_chain_rows` case 1）或已拷入状态的行（case 2/3），
+    /// 其余行 deltanet/conv 都是先写后读，不需要零态起点。
     fn spec_finish(
         &mut self,
         jobs: Vec<ChainJob>,
@@ -1266,7 +1422,6 @@ impl Qwen35Executor {
         self.spec_chain_max = self.spec_chain_max.max(n_jobs);
         let mut out = Vec::with_capacity(jobs.len());
         let mut cursor = 0usize;
-        let mut copy_ops: Vec<CuBatchOp> = Vec::new();
         let mut give_back: Vec<u32> = Vec::new();
         for job in jobs {
             let target: Vec<u32> = targets[cursor..cursor + job.cnt as usize].to_vec();
@@ -1282,16 +1437,19 @@ impl Qwen35Executor {
             // hidden 喂给草稿层，语义错位一拍，接受率 43%→16%）。
             // scr.x 此刻仍是本轮链行的 hidden（后续任何 forward 都会覆写）
             self.stash_hidden(job.id, job.row as usize + accepted);
-            // 落定行 = 处理完前 1+accepted 个链 token 后的状态；拷回请求状态行
-            // （每链每轮恰 1 次 25.2MB 拷回；拷入仅在链首 ≠ state_row 时发生）
-            if let Some(st) = self.reqs.get(&job.id) {
-                self.push_row_state_ops(
-                    job.head + 1 + accepted as u32,
-                    st.state_row,
-                    &mut copy_ops,
-                );
-            }
+            // ── 落定：认领落定行（零拷贝）──
+            let landed = job.head + 1 + accepted as u32;
+            let mut freed_state = None;
             if let Some(st) = self.reqs.get_mut(&job.id) {
+                if st.state_row != landed {
+                    // 旧 state 行归还——但请求首次投机时 state_row 就是块表行
+                    // （KV 页账的行号），那一行**不能**还：它仍归本请求的
+                    // 块表用，还了会被别的请求领走（页表串台/批内行号撞车）
+                    if st.state_row != st.row {
+                        freed_state = Some(st.state_row);
+                    }
+                    st.state_row = landed;
+                }
                 st.seq.truncate(job.start as usize + 1);
                 st.seq.extend_from_slice(&job.drafts[..accepted]);
                 st.seq.push(target[accepted]); // 奖励 token（位置 forwarded+a+1）
@@ -1306,11 +1464,22 @@ impl Qwen35Executor {
             self.spec_rounds += 1;
             self.spec_drafts += job.drafts.len() as u64;
             self.spec_accepted += accepted as u64;
+            // 自适应 k：本轮实测接受率喂 EMA，策略改下一轮的 k
+            self.spec_policy_step(job.id, accepted, job.drafts.len());
             // 归还 arena 行（**不在这里零化**）：借出行恒为连续段，且只有链首
-            // 行会被读（= 拷入的递推状态；其余行 deltanet/conv 都是先写后读）。
-            // 零化改在 `admitted` 领到 free_rows 行时做——链每步都要借同一批行，
-            // 归还即零化等于每步白扫 R×cnt×25.2MB（R=16 时 1.6GB/步）
-            give_back.extend_from_slice(&job.borrowed);
+            // 行会被读（= 请求自己的旧 state 行或拷入的状态行；其余行
+            // deltanet/conv 都是先写后读）。零化改在 `admitted` 领到
+            // free_rows 行时做——链每步都要借同一批行，归还即零化等于每步
+            // 白扫 R×cnt×25.2MB（R=16 时 1.6GB/步）。
+            // 落定行（`landed`）留下当请求的 state_row，不进归还表
+            if let Some(r) = freed_state {
+                give_back.push(r); // 旧 state 行：已被 landed 取代
+            }
+            for &r in &job.borrowed {
+                if r != landed {
+                    give_back.push(r);
+                }
+            }
             out.push((
                 job.id,
                 SpecRound {
@@ -1320,15 +1489,96 @@ impl Qwen35Executor {
                 },
             ));
         }
-        let stream = self.session.stream();
-        // 落定拷贝先于零化（拷入源可能是借出行的落定行——同批无序会读到零化值）
-        if !copy_ops.is_empty() {
-            stream.memcpy_batch(&copy_ops);
-        }
         self.free_rows.extend(give_back);
-        stream.sync(); // 拷回落定：调用方随后即可读状态行
+        // 无拷贝 ⇒ 无需 sync：混合前向已在 argmax 回读处同步过，落定行由
+        // 那条前向的 kernel 写好；后续任何对该行的读（D2H 对拍/下一步
+        // kernel）都在同一流上保序
         self.spec_ms_finish += prof_ms(t_fin.elapsed());
         out
+    }
+
+    /// 自适应 k 策略一拍：喂一轮 (accepted, drafts) 进 EMA，重算本请求的
+    /// `spec_k`（阈值与理由见文件头 `SPEC_*` 常量）。只对 `spec_auto` 的
+    /// 请求生效（普通 `spec_k` 固定档 / 测试用的 `spec_verify` 不受影响）。
+    ///
+    /// 关闭（k=0）时顺手把状态行搬回块表行（`spec_reanchor`）：关投机后
+    /// 请求回到"state_row == row"的不变量，纯 decode 步才能继续走图档。
+    fn spec_policy_step(&mut self, id: ReqId, accepted: usize, drafts: usize) {
+        if drafts == 0 {
+            return;
+        }
+        let ratio = accepted as f32 / drafts as f32;
+        let (new_k, changed) = {
+            let Some(st) = self.reqs.get_mut(&id) else { return };
+            if !st.spec_auto {
+                return;
+            }
+            st.spec_ema = Some(match st.spec_ema {
+                Some(e) => SPEC_EMA_ALPHA * ratio + (1.0 - SPEC_EMA_ALPHA) * e,
+                None => ratio, // 冷启动：首轮实测直接当 EMA
+            });
+            let ema = st.spec_ema.unwrap_or(0.0);
+            // 关闭判据要"瞬时踩低"且"EMA 也在 k=1 档以下"两条同时成立：
+            // k=1 时 ratio 只有 0/1 两档，接受率 ~0.4 的请求连丢 3 个的概率
+            // 也有 ~18%（实测 R=1 的自适应因此 14 步里关投机 8 次、从
+            // 1.43× 掉到 1.06×）；EMA 在 0.30 以上说明"只是运气差"，不关
+            st.spec_low_run =
+                if ratio < SPEC_OFF_RATIO && ema < SPEC_K_MID { st.spec_low_run + 1 } else { 0 };
+            let mut k = if ema >= SPEC_K_ON {
+                3
+            } else if ema >= SPEC_K_MID {
+                2
+            } else {
+                1
+            };
+            if st.spec_low_run >= SPEC_OFF_RUNS {
+                k = 0; // 本段关投机（草稿纯亏），由 `step` 的探针定时重开
+                st.spec_off_tries = st.spec_off_tries.saturating_add(1);
+                st.spec_low_run = 0;
+                // 再探退避：2 → 4 → 8 → 16 步。反复关=这个请求确实不该投机
+                // （R=16 的 4B 模型就是：主前向已被 16 行摊薄，草稿纯亏），
+                // 每 2 步一探等于每步都在付一轮链验证的钱
+                st.spec_probe = SPEC_PROBE_STEPS << (st.spec_off_tries - 1).min(3);
+            } else {
+                st.spec_off_tries = 0;
+            }
+            let k = k.min(SPEC_K_MAX);
+            let changed = k != st.spec_k;
+            st.spec_k = k;
+            (k, changed)
+        };
+        if changed {
+            self.spec_k_switches += 1;
+        }
+        if std::env::var("WEIN_SPEC_POLICY_DEBUG").is_ok() {
+            let (ema, low) = self
+                .reqs
+                .get(&id)
+                .map(|st| (st.spec_ema.unwrap_or(0.0), st.spec_low_run))
+                .unwrap_or((0.0, 0));
+            eprintln!(
+                "[spec-policy] id={id} accepted={accepted}/{drafts} ema={ema:.3} low_run={low} → k={new_k}{}",
+                if changed { "（切换）" } else { "" }
+            );
+        }
+    }
+
+    /// 把请求的递推状态从投机链借来的行搬回块表行（`state_row → row`），
+    /// 恢复 `state_row == row` 不变量——图档路径（`forward_graph`）把 rid 与
+    /// 块表行当同一套固化表，表达不出分离的 state 行。只在关投机时搬一次
+    /// （25.2MB），之后该请求的纯 decode 步照旧可回放图。
+    fn spec_reanchor(&mut self, id: ReqId) {
+        let Some(st) = self.reqs.get(&id) else { return };
+        if st.state_row == st.row {
+            return;
+        }
+        let (src, dst) = (st.state_row, st.row);
+        self.copy_row_state(src, dst);
+        if let Some(st) = self.reqs.get_mut(&id) {
+            st.state_row = dst;
+        }
+        // 归还的行不零化（`admitted` 领用时零）；拷贝与后续任何零化同流保序
+        self.free_rows.push(src);
     }
 
     /// 一步里同时验证的最大链数（批化读数：≥2 = 多条链共享一次前向）
@@ -1360,9 +1610,18 @@ impl Qwen35Executor {
         // 槽耗尽后所有投机请求都退化）
         let need_slot = k > 0 && self.reqs[&id].mtp_chain.is_none();
         let slot = if need_slot { self.mtp_free.pop() } else { None };
+        let policy = self.spec_policy;
         let buf = self.session.gpu();
         let st = self.reqs.get_mut(&id).unwrap();
-        st.spec_k = k;
+        st.spec_auto = policy && k > 0;
+        st.spec_ema = None;
+        st.spec_low_run = 0;
+        st.spec_probe = 0;
+        st.spec_idle = 0;
+        st.spec_off_tries = 0;
+        // 策略接管时本参数只是"上界"：冷启动按中档探（`SPEC_K_COLD`），
+        // 之后由 `spec_policy_step` 依 EMA 逐轮定档
+        st.spec_k = if st.spec_auto { k.min(SPEC_K_COLD) } else { k };
         if k > 0 {
             if st.hid.is_none() {
                 st.hid = Some(pin!(buf.alloc_bytes(h * 2)));
@@ -1371,6 +1630,46 @@ impl Qwen35Executor {
                 st.mtp_chain = slot;
             }
         }
+        // 关投机：把状态行搬回块表行，恢复图档可回放的形态
+        if k == 0 {
+            self.spec_reanchor(id);
+        }
+    }
+
+    /// 自适应 k 策略开关（`WEIN_SPEC_ADAPTIVE` 的运行期覆盖；探针用它做
+    /// "固定 k vs 策略自选"的同进程 A/B）。关掉后新开的投机请求走固定 k，
+    /// 已在跑的请求保留当前档位
+    pub fn set_spec_policy(&mut self, on: bool) {
+        self.spec_policy = on;
+    }
+
+    /// 测试/探针：请求当前的投机草稿数（策略下 = 自适应选出的档）
+    pub fn spec_k_of(&self, id: ReqId) -> Option<u32> {
+        self.reqs.get(&id).map(|st| st.spec_k)
+    }
+
+    /// 行账读数（换行零拷贝的漂移/复用证据）：(链行分配次数, 其中拷入次数,
+    /// 状态池行数, 当前 next_row, 当前 free_rows 长度)。
+    /// 拷入次数 → 0 即稳态零拷贝；`free_rows` 长度在多轮之间不涨即不泄漏
+    pub fn spec_row_stats(&self) -> (u64, u64, usize, u32, usize) {
+        (self.spec_chain_allocs, self.spec_copyins, self.row_capacity as usize, self.next_row, self.free_rows.len())
+    }
+
+    /// 自适应 k 读数：(当前每请求 k 的分布（升序）, 切换次数)。
+    /// 分布按活跃请求计——0 = 被策略关掉的、1/2/3 = 策略当前所选档
+    pub fn spec_k_stats(&self) -> (Vec<(u32, usize)>, u64) {
+        let mut hist: Vec<(u32, usize)> = Vec::new();
+        for st in self.reqs.values() {
+            if !st.spec_auto {
+                continue;
+            }
+            match hist.iter_mut().find(|(k, _)| *k == st.spec_k) {
+                Some((_, c)) => *c += 1,
+                None => hist.push((st.spec_k, 1)),
+            }
+        }
+        hist.sort_unstable();
+        (hist, self.spec_k_switches)
     }
 
     /// 草稿链槽归还（页回池、块表行清零、槽回空闲表）。请求退场/关投机/
@@ -1559,12 +1858,21 @@ impl Qwen35Executor {
     /// （免拷入），否则从 `next_row` 尾部连续切（未分配区恒空），再退化到
     /// `free_rows` 里找连续段。返回 (链首, 借出行表)——借出行轮末零化归还，
     /// 链首若就是 state 行则不在借出表里。None = 池里找不到连续 n 行。
-    fn spec_chain_rows(&mut self, state_row: u32, n: u32) -> Option<(u32, Vec<u32>)> {
-        let cap = self.row_capacity;
+    /// case 1 的判据（"`head` 当链首、后面 n-1 行都空闲"）：`spec_chain_rows`
+    /// 的零拷入分配与 `spec_chain_alloc` 的再锚定决策共用同一套语义
+    fn chain_head_free(&self, head: u32, n: u32) -> bool {
+        if head + n > self.row_capacity {
+            return false;
+        }
         let owned: HashSet<u32> = self.reqs.values().map(|s| s.state_row).collect();
         let free = |r: u32| !owned.contains(&r) && (r >= self.next_row || self.free_rows.contains(&r));
+        (1..n).all(|k| free(head + k))
+    }
+
+    fn spec_chain_rows(&mut self, state_row: u32, n: u32) -> Option<(u32, Vec<u32>)> {
+        let cap = self.row_capacity;
         // 1) 请求自己的状态行当链首：占地连续、行数不变（最省，零拷入）
-        if state_row + n <= cap && (1..n).all(|k| free(state_row + k)) {
+        if self.chain_head_free(state_row, n) {
             let mut borrowed = Vec::with_capacity(n as usize - 1);
             for r in state_row + 1..state_row + n {
                 if let Some(p) = self.free_rows.iter().position(|&x| x == r) {
@@ -1605,52 +1913,52 @@ impl Qwen35Executor {
 
     /// 行状态整行 D2D 位拷贝（24 lin + 24 conv 段一次批量发行；25.2MB/次）。
     /// 段表写法同 `restore_row_snapshot`：逐层小段 + 一次 cuMemcpyBatchAsync
+    /// 攒一条"状态行 src → dst"的段表（24 lin + 24 conv = 48 段）。跨链攒进
+    /// **同一个**段表再一次发行：逐链发行是 48 段 × 链数 次驱动调用（R=16
+    /// 漂移步实测 ~4.2 链/步 ≈ 200 次调用 ≈ 1.3ms/步，纯驱动开销；D2D 数据
+    /// 本身只要 ~0.07ms）。`spec_chain_alloc` 用它把一步内所有拷入合并成一次
+    fn push_copy_row_state_ops(&self, src: u32, dst: u32, ops: &mut Vec<CuBatchOp>) {
+        let (ro, wo) = (src as usize * self.lin_row, dst as usize * self.lin_row);
+        for t in &self.lin_state {
+            ops.push(CuBatchOp {
+                dst: t.device_ptr() + wo as u64,
+                src: t.device_ptr() + ro as u64,
+                size: self.lin_row,
+            });
+        }
+        let (ro, wo) = (src as usize * self.conv_row, dst as usize * self.conv_row);
+        for t in &self.conv_state {
+            ops.push(CuBatchOp {
+                dst: t.device_ptr() + wo as u64,
+                src: t.device_ptr() + ro as u64,
+                size: self.conv_row,
+            });
+        }
+    }
+
+    /// 单条状态行拷贝（一次发行）——再锚定/测试路径用
     fn copy_row_state(&self, src: u32, dst: u32) {
         let mut ops: Vec<CuBatchOp> =
             Vec::with_capacity(self.lin_state.len() + self.conv_state.len());
-        let (ro, wo) = (src as usize * self.lin_row, dst as usize * self.lin_row);
-        for t in &self.lin_state {
-            ops.push(CuBatchOp {
-                dst: t.device_ptr() + wo as u64,
-                src: t.device_ptr() + ro as u64,
-                size: self.lin_row,
-            });
-        }
-        let (ro, wo) = (src as usize * self.conv_row, dst as usize * self.conv_row);
-        for t in &self.conv_state {
-            ops.push(CuBatchOp {
-                dst: t.device_ptr() + wo as u64,
-                src: t.device_ptr() + ro as u64,
-                size: self.conv_row,
-            });
-        }
+        self.push_copy_row_state_ops(src, dst, &mut ops);
         self.session.stream().memcpy_batch(&ops);
-    }
-
-    /// `copy_row_state` 的段表版：同一批段推入调用方的 op 表（多条链的落定
-    /// 拷贝攒成一次 `memcpy_batch`，省 (R-1) 次驱动调用）
-    fn push_row_state_ops(&self, src: u32, dst: u32, ops: &mut Vec<CuBatchOp>) {
-        let (ro, wo) = (src as usize * self.lin_row, dst as usize * self.lin_row);
-        for t in &self.lin_state {
-            ops.push(CuBatchOp {
-                dst: t.device_ptr() + wo as u64,
-                src: t.device_ptr() + ro as u64,
-                size: self.lin_row,
-            });
-        }
-        let (ro, wo) = (src as usize * self.conv_row, dst as usize * self.conv_row);
-        for t in &self.conv_state {
-            ops.push(CuBatchOp {
-                dst: t.device_ptr() + wo as u64,
-                src: t.device_ptr() + ro as u64,
-                size: self.conv_row,
-            });
-        }
     }
 
     /// 测试/诊断：请求的递推状态行号（spec_verify 之后 = 接受位落定行）
     pub fn state_row_of(&self, id: ReqId) -> Option<u32> {
         self.reqs.get(&id).map(|s| s.state_row)
+    }
+
+    /// 测试/诊断：请求的块表行号（KV 页账）；投机跑过之后与 `state_row`
+    /// 分离——换行零拷贝只动 state_row，块表行全程不动
+    pub fn block_row_of(&self, id: ReqId) -> Option<u32> {
+        self.reqs.get(&id).map(|s| s.row)
+    }
+
+    /// 测试/诊断：空闲行表快照。行账守恒判据：
+    /// `[0, next_row)` = 活请求行（块表行 ∪ 状态行）∪ free_rows，两者不相交
+    pub fn spec_free_rows(&self) -> Vec<u32> {
+        self.free_rows.clone()
     }
 
     /// 测试/诊断：读回第 `layer` 个线性层的状态行 `row`（bf16 位，u16）。
@@ -1929,7 +2237,7 @@ impl Qwen35Executor {
         let n_rows = row_start.len() as u32;
         self.spec_chain_max = self.spec_chain_max.max(chains.len() as u32);
 
-        let (gpu, stream, tb) = (self.session.gpu(), self.session.stream(), self.session.table());
+        let (stream, tb) = (self.session.stream(), self.session.table());
         let prof_on = self.prof.borrow().is_some();
         let tw = Instant::now();
         let ids: Vec<u32> = rows.iter().map(|r| r.2).collect();
@@ -1948,25 +2256,22 @@ impl Qwen35Executor {
         let ids_lk: Vec<u32> = (0..t).map(|tt| (tt * 4 + 1) as u32).collect();
         let ids_lv: Vec<u32> = (0..t).map(|tt| (tt * 2 + 1) as u32).collect();
         let tu = Instant::now();
-        let (d_ids, d_pos, d_seqs, d_bt) = (
-            gpu.alloc_from_slice(&ids),
-            gpu.alloc_from_slice(&pos),
-            gpu.alloc_from_slice(&seqs),
-            gpu.alloc_from_slice(&self.bt_host),
-        );
-        let (d_start, d_count, d_rid) = (
-            gpu.alloc_from_slice(&row_start),
-            gpu.alloc_from_slice(&row_count),
-            gpu.alloc_from_slice(&row_id),
-        );
-        let (d_trow, d_tpos) =
-            (gpu.alloc_from_slice(&tok_row), gpu.alloc_from_slice(&tok_pos));
-        let (d_iq, d_ig) = (gpu.alloc_from_slice(&ids_q), gpu.alloc_from_slice(&ids_gate));
-        let (d_ilq, d_ilk, d_ilv) = (
-            gpu.alloc_from_slice(&ids_lq),
-            gpu.alloc_from_slice(&ids_lk),
-            gpu.alloc_from_slice(&ids_lv),
-        );
+        // 常驻输入表前缀覆写（零分配：open 期一次分配，见 MixIn 注释）
+        let mi = &self.mix;
+        mi.ids.upload_prefix_on(&ids, stream);
+        mi.pos.upload_prefix_on(&pos, stream);
+        mi.seqs.upload_prefix_on(&seqs, stream);
+        mi.bt.upload_prefix_on(&self.bt_host, stream);
+        mi.start.upload_prefix_on(&row_start, stream);
+        mi.count.upload_prefix_on(&row_count, stream);
+        mi.rid.upload_prefix_on(&row_id, stream);
+        mi.trow.upload_prefix_on(&tok_row, stream);
+        mi.tpos.upload_prefix_on(&tok_pos, stream);
+        mi.iq.upload_prefix_on(&ids_q, stream);
+        mi.ig.upload_prefix_on(&ids_gate, stream);
+        mi.ilq.upload_prefix_on(&ids_lq, stream);
+        mi.ilk.upload_prefix_on(&ids_lk, stream);
+        mi.ilv.upload_prefix_on(&ids_lv, stream);
         // 逐 span 标志：全 0/全 1 走常驻常量，混合时拼一次 T_MAX 长的表覆写
         let all_zero = span_spec.iter().all(|&s| s == 0);
         let all_one = span_spec.iter().all(|&s| s == 1);
@@ -1981,20 +2286,20 @@ impl Qwen35Executor {
             &self.scr.specs_mix
         };
         let inp = FwdIn {
-            ids: &d_ids,
-            pos: &d_pos,
-            seqs: &d_seqs,
-            bt: &d_bt,
-            start: &d_start,
-            count: &d_count,
-            rid: &d_rid,
-            trow: &d_trow,
-            tpos: &d_tpos,
-            iq: &d_iq,
-            ig: &d_ig,
-            ilq: &d_ilq,
-            ilk: &d_ilk,
-            ilv: &d_ilv,
+            ids: &self.mix.ids,
+            pos: &self.mix.pos,
+            seqs: &self.mix.seqs,
+            bt: &self.mix.bt,
+            start: &self.mix.start,
+            count: &self.mix.count,
+            rid: &self.mix.rid,
+            trow: &self.mix.trow,
+            tpos: &self.mix.tpos,
+            iq: &self.mix.iq,
+            ig: &self.mix.ig,
+            ilq: &self.mix.ilq,
+            ilk: &self.mix.ilk,
+            ilv: &self.mix.ilv,
             specs: specs_buf,
         };
         if prof_on {
@@ -2018,9 +2323,9 @@ impl Qwen35Executor {
         let s = samples.len() as u32;
         assert!((s as usize) <= t, "采样行数超批");
         self.prof_mark("argmax");
-        let d_rows = gpu.alloc_from_slice(samples);
+        self.mix.samples.upload_prefix_on(samples, stream);
         tb.argmax_rows.run(
-            &self.scr.logits, &d_rows, &self.scr.am_scratch, &self.scr.am_out,
+            &self.scr.logits, &self.mix.samples, &self.scr.am_scratch, &self.scr.am_out,
             self.cfg.vocab_size as u32, s, stream,
         );
         self.prof_end();
@@ -2246,6 +2551,9 @@ impl Qwen35Executor {
         self.spec_accepted = 0;
         self.spec_fallbacks = 0;
         self.spec_chain_max = 0;
+        self.spec_k_switches = 0;
+        self.spec_chain_allocs = 0;
+        self.spec_copyins = 0;
         self.spec_ms_draft = 0.0;
         self.spec_ms_forward = 0.0;
         self.spec_ms_finish = 0.0;
@@ -2518,6 +2826,8 @@ impl Qwen35Executor {
     /// = 全部行）且桶覆盖 → 图回放；否则 eager 直发。混合步/prefill 永远
     /// eager（图只在纯 decode 档——批形状固定，§4 入图安全规则）
     fn forward_rows(&mut self, rows: &[(u32, u32, u32, u32)], samples: &[u32], pure_decode: bool) -> Vec<u32> {
+        // 护栏（同 `step` 的 pure_decode 判定）：带分离 state 行的批不许进图档
+        let pure_decode = pure_decode && rows.iter().all(|r| r.1 == r.0);
         if pure_decode && !rows.is_empty() && samples.len() == rows.len() {
             if let Some(bi) = self.bucket_for(rows.len()) {
                 return self.forward_graph(bi, rows);
@@ -2556,9 +2866,11 @@ impl Qwen35Executor {
         let mut seqs = vec![sink; cap];
         let mut rid = vec![sink; cap];
         for (j, &(bt, sr, tok, p)) in rows.iter().enumerate() {
-            // 图档的 rid/trow 与块表行同缓冲：仅当 state_row == 块表行时成立
-            // （默认情形）；投机链走 eager（不绘图）
-            assert_eq!(sr, bt, "图档要求 state_row == 块表行（投机链须走 eager）");
+            // 图档的 rid/trow 与块表行同缓冲：仅当 state_row == 块表行时成立。
+            // 投机链的逐位置 state 行（`spec_finish` 换行落定后 ≠ 块表行）由
+            // `step`/`forward_rows` 的 pure_decode 护栏挡在入口，走到这里还
+            // 不等就是护栏失效——宁可炸也不许把借来的行烤进图
+            assert_eq!(sr, bt, "图档要求 state_row == 块表行（分离行须走 eager，见 step 的 pure_decode 护栏）");
             ids[j] = tok;
             pos[j] = p;
             seqs[j] = bt;
@@ -2583,6 +2895,11 @@ impl Qwen35Executor {
 }
 
 // ---- 布局常量辅助（open 期与运行期共用）----
+
+/// n 个 u32 的字节数（eager 混合批常驻输入表）
+fn u32b(n: usize) -> usize {
+    n * 4
+}
 
 fn bpr_of() -> usize {
     MAX_POS.div_ceil(BLOCK as usize)
@@ -2704,6 +3021,12 @@ impl Executor for Qwen35Executor {
                 shared,
                 snaps: Vec::new(),
                 spec_k: 0,
+                spec_auto: false,
+                spec_ema: None,
+                spec_low_run: 0,
+                spec_probe: 0,
+                spec_idle: 0,
+                spec_off_tries: 0,
                 mtp_chain: None,
                 hid: None,
             },
@@ -2724,6 +3047,37 @@ impl Executor for Qwen35Executor {
         }
         let mut batch: Vec<RowIn> = Vec::new();
         let mut samples: Vec<(ReqId, usize)> = Vec::new();
+        // 自适应 k 的再探：k=0（策略判定本段关投机）的请求每解一步倒计时，
+        // 到点用 k=1 试一轮——k=0 期间不产生轮次 ⇒ EMA 冻结，靠这只探针
+        // 才能"由 EMA 回升重新开"（见 `SPEC_PROBE_STEPS`）
+        let mut anchor_now: Vec<ReqId> = Vec::new();
+        for id in plan.decode.iter().copied() {
+            let Some(st) = self.reqs.get_mut(&id) else { continue };
+            if !st.spec_auto {
+                continue;
+            }
+            if st.spec_k != 0 {
+                st.spec_idle = 0;
+                continue;
+            }
+            if st.spec_probe > 0 {
+                st.spec_probe -= 1;
+                st.spec_idle += 1;
+            } else {
+                st.spec_k = 1;
+            }
+            if st.spec_idle >= SPEC_ANCHOR_IDLE && st.state_row != st.row {
+                anchor_now.push(id);
+            }
+        }
+        // 关投机够久：把递推状态搬回块表行（一次 25.2MB），该请求的纯 decode
+        // 步重回图档；k=0 期间没有任何轮次 ⇒ 不搬就永远 eEager
+        for id in anchor_now {
+            self.spec_reanchor(id);
+            if let Some(st) = self.reqs.get_mut(&id) {
+                st.spec_idle = 0;
+            }
+        }
         // 投机候选（纯 decode 且 spec_k > 0）：先整批起草——第 i 个草稿步 = 一次
         // MTP 前向覆盖全部链，成本与链数无关。起草必须在主前向之前（要读
         // `st.hid`，写 `scr.x`/`scr.n2`）；草稿拿不到（无 MTP 权重 / 无链槽 /
@@ -2838,8 +3192,15 @@ impl Executor for Qwen35Executor {
         let segs = self.spec_chain_fill(&mut jobs, &mut rows, &mut sample_rows);
         // 含投机链的步一律 eager：链行不进图（forward_graph 有 sr==bt 断言），
         // 且图捕获的采样行表是纯 decode 桶形的纯函数，混进链批会错位。
-        // 链全退化 / 无候选的步仍是纯 decode → 走图档
-        let pure_decode = plan.prefill.is_empty() && jobs.is_empty();
+        // 链全退化 / 无候选的步仍是纯 decode → 走图档。
+        //
+        // **护栏**：跑过投机的请求 `state_row ≠ row`（换行落定把它指到了链行），
+        // 而图档的 rid/trow 与块表行是同一套固化表（`forward_graph` 的
+        // `assert_eq!(sr, bt)`）——混进去必 panic。这里把"有没有分离行"放进
+        // 纯 decode 的判定：只要有借来的 state 行就退 eager（关投机时会
+        // `spec_reanchor` 搬回，请求随即恢复图档资格）
+        let pure_decode =
+            plan.prefill.is_empty() && jobs.is_empty() && batch.iter().all(|r| r.state_row == r.row);
         let t_fwd = Instant::now();
         let toks = if rows.is_empty() {
             Vec::new()
@@ -2875,9 +3236,12 @@ impl Executor for Qwen35Executor {
                 if nb == 0 || grid == 0 || (p + 1) % grid != 0 {
                     continue;
                 }
-                // nb <= blocks.len() 即该边界所在页已分配（防御：请求已不在）
-                let (row, blk) = match self.reqs.get(&id) {
-                    Some(st) if st.blocks.len() >= nb => (st.row, st.blocks[nb - 1]),
+                // nb <= blocks.len() 即该边界所在页已分配（防御：请求已不在）。
+                // 快照源行取 `state_row`（不是块表行）：跑过投机的请求两者
+                // 分离，递推状态在 state_row 上——拿块表行会存一份过期状态，
+                // 将来 radix 命中恢复出错位（静默污染）
+                let (srow, blk) = match self.reqs.get(&id) {
+                    Some(st) if st.blocks.len() >= nb => (st.state_row, st.blocks[nb - 1]),
                     _ => continue,
                 };
                 let Some(slot) = self.acquire_slot() else {
@@ -2886,13 +3250,13 @@ impl Executor for Qwen35Executor {
                 if let Some(st) = self.reqs.get_mut(&id) {
                     st.snaps.push((blk, slot));
                 }
-                snaps.push((row, slot));
+                snaps.push((srow, slot));
             }
             if !snaps.is_empty() {
                 let per = self.snap_lin.len() + self.snap_conv.len();
                 let mut ops: Vec<CuBatchOp> = Vec::with_capacity(snaps.len() * per);
-                for (row, slot) in snaps {
-                    self.push_snapshot_ops(row, slot, &mut ops);
+                for (srow, slot) in snaps {
+                    self.push_snapshot_ops(srow, slot, &mut ops);
                 }
                 self.session.stream().memcpy_batch(&ops);
             }
@@ -2929,8 +3293,14 @@ impl Executor for Qwen35Executor {
     }
 
     fn retain(&mut self, active: &[ReqId]) {
-        let gone: Vec<ReqId> =
+        // 排序退场：`reqs` 是 HashMap，迭代序每进程随机——退场顺序决定
+        // 行/页/槽回池的顺序，进而决定后续 `admitted`/`spec_chain_rows` 领到
+        // 哪个行号。行号变 ⇒ 状态行地址对齐变 ⇒ cuBLASLt 选别的 algo（跨 M
+        // ulp 漂移，见 q5/qs9 注释）⇒ 探针吃掉两档不同的接受率（~43%/25%）。
+        // 排序让"同一串操作 → 同一套行号"成立，读数可比
+        let mut gone: Vec<ReqId> =
             self.reqs.keys().copied().filter(|k| !active.contains(k)).collect();
+        gone.sort_unstable();
         for id in gone {
             self.mtp_release(id); // 草稿链槽 + 链 KV 归还（在移除请求态之前）
             if let Some(st) = self.reqs.remove(&id) {
@@ -2989,8 +3359,15 @@ impl Executor for Qwen35Executor {
                 for j in 0..st.blocks.len() {
                     self.bt_host[base + j] = 0;
                 }
-                self.zero_row_state(st.state_row, &self.session.stream()); // 回收行零化（q10 钉）
-                self.free_rows.push(st.row);
+                // 回收行零化（q10 钉）。投机跑过的请求有两个行号：块表行管 KV 页、
+                // 换行落定后的 state_row 管递推状态——都零化、都归还（`admitted`
+                // 领用时还会再零一次，幂等）
+                self.zero_row_state(st.state_row, &self.session.stream());
+                self.free_rows.push(st.state_row);
+                if st.row != st.state_row {
+                    self.zero_row_state(st.row, &self.session.stream());
+                    self.free_rows.push(st.row);
+                }
             }
         }
         self.pool.recycle();

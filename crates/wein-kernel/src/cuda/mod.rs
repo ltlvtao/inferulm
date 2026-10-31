@@ -328,6 +328,21 @@ impl DevBuf<'_> {
             .memcpy_htod_async(self.ptr, slice.as_ptr().cast(), n, stream.handle)
             .expect("cuMemcpyHtoDAsync");
     }
+
+    /// 异步前缀上传（流上排队）：只搬 `slice.len()` 项到缓冲开头，尾部残留
+    /// 不动——常驻 T_MAX 容量缓冲按"本步实际用的行数"喂（eager 混合批的
+    /// 十几次小表上传既不想每步 alloc，也不想整段 512 行搬）。
+    /// 合同：缓冲容量 ≥ slice，且 kernel 只读 slice 覆盖的前缀
+    pub fn upload_prefix_on<T: Copy>(&self, slice: &[T], stream: &Stream) {
+        let n = slice.len() * std::mem::size_of::<T>();
+        assert!(n <= self.bytes, "upload_prefix_on 越界：{n} 字节 > 缓冲 {} 字节", self.bytes);
+        if n == 0 {
+            return;
+        }
+        self.drv
+            .memcpy_htod_async(self.ptr, slice.as_ptr().cast(), n, stream.handle)
+            .expect("cuMemcpyHtoDAsync");
+    }
 }
 
 impl Drop for DevBuf<'_> {
