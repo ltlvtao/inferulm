@@ -1081,3 +1081,155 @@ fn qs11_spec_mixed_batch() {
         accepted as f64 / drafts.max(1) as f64 * 100.0
     );
 }
+
+/// qs12 · **多链共享一次前向**（批化投机的核心合同）：一步里 ≥4 条投机链
+/// 同时起草（k=3）与验证（一条目标前向覆盖 4×4 = 16 行），每条链的输出仍
+/// 与其"单独跑、spec 关"的贪心序列逐 token 相同。
+///
+/// 三件事各钉一处：
+/// 1. **链 KV 不互踩**：4 条链的草稿槽（`mtp_chain` = `mtp_bt` 页行）必须两两
+///    不同——v1 全部写死 `SPEC_CHAIN_ROW = 0`，多链会互相覆盖草稿 KV；
+/// 2. **验证批的 per-span 切分**：4 条链各自用真贪心续写作草稿，一次
+///    `spec_commit_batch` 把 4 条链放进**同一条前向**，每条链都须 3/3 全接受、
+///    逐位置 argmax = 参考序列（段切错/链内 pos 写错就会掉接受）；
+/// 3. **step 级批化**：4 个 `spec_k = 3` 请求同一步 decode，`spec_chain_max`
+///    记到 4，输出与单独跑逐 token 相同。
+#[test]
+fn qs12_spec_multi_chain_batch() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    if !ex.has_mtp() {
+        eprintln!("SKIP（checkpoint 无 MTP 草稿层权重 mtp.*）");
+        return;
+    }
+    ex.set_radix(false);
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let base = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant \
+         mountains and the river flows quietly through the ancient forest where birds sing \
+         their evening songs before night falls over the sleeping village, and the farmers \
+         walk home along the narrow road with lanterns in their hands",
+    );
+    assert!(base.len() >= 36, "prompt 须 ≥ 36 token（实得 {}）", base.len());
+    const R: usize = 4; // 同一步里同时投机的链数
+    const K: u32 = 3; // 每条链的草稿数
+    const N: usize = 6; // 每请求比较的 token 数
+    // 4 个不同 prompt（长度/相位各异 ⇒ 4 条互不相干的链）
+    let prompts: Vec<Vec<u32>> = (0..R)
+        .map(|i| {
+            let mut q = base.clone();
+            q.truncate(20 + 4 * i);
+            q.rotate_left(i * 5);
+            q
+        })
+        .collect();
+
+    // ── 第一趟：参考序列（4 个请求各自单独跑，spec 关）──
+    let mut reference: Vec<Vec<u32>> = Vec::new();
+    for (i, q) in prompts.iter().enumerate() {
+        let id = 100 + i as u64;
+        ex.admitted(id, q);
+        let l = q.len();
+        let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+        let o = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+        collect(&o, &mut got);
+        while toks_of(&got, id).len() < N + 1 {
+            let o = ex.step(&StepPlan { prefill: vec![], decode: vec![id], batch: vec![] });
+            collect(&o, &mut got);
+        }
+        reference.push(toks_of(&got, id)[..N + 1].to_vec());
+    }
+    ex.retain(&[]);
+    ex.spec_stats_reset();
+
+    // ── 第二趟 A：验证批（4 条链一条前向，真贪心续写作草稿 ⇒ 须全接受）──
+    let ids: Vec<u64> = (1..=R as u64).collect();
+    for (i, q) in prompts.iter().enumerate() {
+        ex.admitted(ids[i], q);
+    }
+    for i in 0..R {
+        let (id, l) = (ids[i], prompts[i].len());
+        let _ = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+    }
+    let items: Vec<(u64, Vec<u32>)> =
+        ids.iter().enumerate().map(|(i, &id)| (id, reference[i][1..4].to_vec())).collect();
+    let rounds = ex.spec_commit_batch(&items);
+    assert_eq!(rounds.len(), R, "每条链一个结果");
+    for (i, r) in rounds.iter().enumerate() {
+        let r = r.as_ref().expect("链行分配失败（池里须有连续行）");
+        assert_eq!(
+            r.accepted,
+            K as usize,
+            "链 {i} 用真贪心续写作草稿须 {K}/{K} 全接受（实得 {} ⇒ 4 链共享前向的段切分/链内 pos 错）",
+            r.accepted
+        );
+        assert_eq!(
+            r.target_tokens,
+            reference[i][1..5].to_vec(),
+            "链 {i} 的逐位置 argmax 须等于它自己单独跑的贪心序列"
+        );
+    }
+    assert!(
+        ex.spec_chain_batch_max() >= R as u32,
+        "一条前向须验证 ≥{R} 条链（实得 {}）",
+        ex.spec_chain_batch_max()
+    );
+    ex.retain(&[]);
+    ex.spec_stats_reset();
+
+    // ── 第二趟 B：step 级批化（4 个 spec_k=3 请求同步 decode）──
+    for (i, q) in prompts.iter().enumerate() {
+        ex.admitted(ids[i], q);
+        ex.set_spec(ids[i], K);
+    }
+    // 链槽（MTP KV 页行）两两不同：多链同批前向的隔离前提
+    let mut slots: Vec<u32> = ids.iter().filter_map(|&id| ex.spec_chain_of(id)).collect();
+    assert_eq!(slots.len(), R, "每条投机请求须领到一个草稿链槽（实得 {}）", slots.len());
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(slots.len(), R, "草稿链槽须两两不同——否则多链草稿 KV 互相覆盖");
+
+    let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+    for i in 0..R {
+        let (id, l) = (ids[i], prompts[i].len());
+        let o = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+        collect(&o, &mut got);
+    }
+    // 一条步里 4 条链同时起草 + 验证
+    let o = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: ids.clone() });
+    assert!(
+        ex.spec_chain_batch_max() >= R as u32,
+        "同一步须验证 ≥{R} 条链（实得 {}）",
+        ex.spec_chain_batch_max()
+    );
+    assert!(
+        (R..=R * (K as usize + 1)).contains(&o.len()),
+        "4 条链一步须出 {R}..={} 个 token（实得 {}）",
+        R * (K as usize + 1),
+        o.len()
+    );
+    collect(&o, &mut got);
+    for &id in &ids {
+        assert!(toks_of(&got, id).len() >= 2, "请求 {id} 的首个多链步须出 token");
+    }
+    while ids.iter().any(|&id| toks_of(&got, id).len() < N) {
+        let o = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: ids.clone() });
+        collect(&o, &mut got);
+    }
+    for (i, &id) in ids.iter().enumerate() {
+        let have = toks_of(&got, id);
+        assert_eq!(
+            &have[..N],
+            &reference[i][..N],
+            "链 {i}（{id}）的输出须与单独跑（spec 关）逐 token 相同"
+        );
+    }
+    let (r, drafts, accepted, fallbacks) = ex.spec_stats();
+    eprintln!(
+        "qs12 多链同批：{R} 链 × {N} token 与单独跑逐 token 相同；槽 {:?}；接受率 {:.1}%（{accepted}/{drafts}，{r} 轮，退化 {fallbacks}，峰值链数 {}）",
+        ex.spec_chain_of(1),
+        accepted as f64 / drafts.max(1) as f64 * 100.0,
+        ex.spec_chain_batch_max()
+    );
+}

@@ -95,8 +95,20 @@ fn main() {
         rows.push((r, K, s_tps.0 / p_tps.0, s_tps.2, s_tps.1 as f64));
     }
 
-    // 每步耗时分解（R=1）：主前向 1 行 vs k 次草稿前向 vs 验证（链 4 行 +
-    // 25.2MB 拷入/拷回）。这是"加速比 < 1 时先修哪"的判据
+    // k 扫描（R=16）：接受率随 k 掉、草稿成本随 k 线性涨——找拐点用。
+    // 参考基线 = 同 R 的 spec 关 tok/s（上表 R=16 / spec_k=0）
+    let base16 = run(&mut ex, &prompt, 16, 0).0;
+    println!("\nR=16 的 k 扫描（基线 {base16:.1} tok/s）：");
+    println!("{:>3}  {:>9}  {:>9}  {:>8}  {:>9}  {:>8}", "k", "tok/s", "加速比", "步数", "接受率", "出token/步");
+    for k in [1u32, 2, K] {
+        let m = run(&mut ex, &prompt, 16, k);
+        println!(
+            "{:>3}  {:>9.1}  {:>9.2}×  {:>8}  {:>8.1}%  {:>8.2}",
+            k, m.0, m.0 / base16, m.1, m.2 * 100.0, m.3
+        );
+    }
+
+    // 每步耗时分解：主前向 / 草稿（全部链合计）/ 验证前向 / 落定拷贝
     decompose(&mut ex, &prompt);
 
     let worst = rows.iter().map(|x| x.2).fold(f64::INFINITY, f64::min);
@@ -189,47 +201,140 @@ fn run(
 }
 
 fn decompose(ex: &mut Qwen35Executor, prompt: &dyn Fn(usize) -> Vec<u32>) {
-    let id = 500u64;
-    let q = prompt(0);
-    let l = q.len();
-    ex.admitted(id, &q);
-    ex.set_spec(id, K);
-    let _ = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
-    let reps = 12;
-    let mut t_plain = 0.0f64;
-    let mut t_draft = 0.0f64;
-    let mut t_verify = 0.0f64;
-    for _ in 0..reps {
-        // 普通 decode（1 行主前向 + argmax）
-        let t = Instant::now();
-        let _ = ex.step(&StepPlan { prefill: vec![], decode: vec![id], batch: vec![] });
-        t_plain += t.elapsed().as_secs_f64();
-        // 草稿：k 次 MTP 前向（每次含 sync 回读）
-        let t = Instant::now();
-        let d = ex.spec_draft(id, K);
-        t_draft += t.elapsed().as_secs_f64();
-        assert_eq!(d.len(), K as usize, "草稿数须 = k");
-        // 验证：链 cnt=4 行 eager 前向 + 落定行 25.2MB 拷回（+ 可能的拷入）
-        let t = Instant::now();
-        let r = ex.spec_verify(id, &d).expect("链行分配失败");
-        t_verify += t.elapsed().as_secs_f64();
-        let _ = r;
+    println!("\n步内耗时分解（每步均值；草稿 = 全部链合计的 k 次 MTP 前向）：");
+    println!(
+        "{:>3}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>8}",
+        "R", "spec_k", "主前向", "草稿", "验证前向", "落定拷贝", "合计ms", "出token/步"
+    );
+    for r in [1usize, 16] {
+        for k in [0u32, K] {
+            let m = profile_run(ex, prompt, r, k);
+            let spec_step = m.draft_ms + m.fwd_ms + m.fin_ms;
+            let sum = if k > 0 { spec_step } else { m.plain_ms };
+            println!(
+                "{:>3}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>8}",
+                r,
+                k,
+                fmt_ms(m.plain_ms),
+                fmt_ms(m.draft_ms),
+                fmt_ms(m.fwd_ms),
+                fmt_ms(m.fin_ms),
+                fmt_ms(sum),
+                format!("{:.2}", m.tok_per_step)
+            );
+            if let Some(rep) = &m.prof {
+                println!("\n--- R={r} spec_k={k} 段级分解（WEIN_STEP_PROFILE；仅主/验证前向那条 eager 前向）---\n{rep}");
+            }
+        }
     }
+    println!(
+        "  说明：k=0 行只有主前向（R 行 eager decode）；k={K} 行的主前向列 = 同 R 的普通 decode\n  \
+         步成本（对照基准），投机步 = 草稿 + 验证前向（R×{kw} 行）+ 落定（R×25.2MB 拷回 + \
+         arena 零化）"
+    , kw = K + 1);
+}
+
+struct StepMs {
+    /// 同 R 的普通 decode 步（1 行/请求）每步毫秒——投机步的对照组
+    plain_ms: f64,
+    draft_ms: f64,
+    fwd_ms: f64,
+    fin_ms: f64,
+    tok_per_step: f64,
+    /// `WEIN_STEP_PROFILE` 下的段级报告（未开启 = None）
+    prof: Option<String>,
+}
+
+fn fmt_ms(x: f64) -> String {
+    format!("{x:.2}")
+}
+
+/// 跑一个配置到 N token，返回每步的耗时分解（exec 内计时器在草稿 / 混合
+/// 前向 / 落定三段上的累计 ÷ 步数）
+fn profile_run(
+    ex: &mut Qwen35Executor,
+    prompt: &dyn Fn(usize) -> Vec<u32>,
+    r: usize,
+    k: u32,
+) -> StepMs {
+    let ids: Vec<u64> = (1..=r as u64).collect();
+    let prompts: Vec<Vec<u32>> = (0..r).map(prompt).collect();
+    for (i, id) in ids.iter().enumerate() {
+        ex.admitted(*id, &prompts[i]);
+        if k > 0 {
+            ex.set_spec(*id, k);
+        }
+    }
+    // prefill（chunked，32 token/段；尾段带采样位）
+    let mut emitted = vec![0usize; r];
+    let mut off = vec![0usize; r];
+    loop {
+        let mut prefill = Vec::new();
+        let mut decode = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            if off[i] < prompts[i].len() {
+                let take = 32.min(prompts[i].len() - off[i]);
+                off[i] += take;
+                prefill.push((*id, take));
+                if off[i] == prompts[i].len() {
+                    decode.push(*id);
+                    emitted[i] += 1;
+                }
+            }
+        }
+        if prefill.is_empty() {
+            break;
+        }
+        let _ = ex.step(&StepPlan { prefill, decode, batch: vec![] });
+    }
+    ex.spec_stats_reset();
+    ex.step_profile_reset();
+    let mut steps = 0u64;
+    while emitted.iter().any(|&n| n < N) {
+        let out = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: ids.clone() });
+        for &(id, _) in &out {
+            if let Ok(i) = ids.binary_search(&id) {
+                emitted[i] += 1;
+            }
+        }
+        steps += 1;
+        assert!(steps < 4 * N as u64 + 8, "投机未收敛（emitted={emitted:?}）");
+    }
+    let total: usize = emitted.iter().sum();
+    // 段级分解（仅 WEIN_STEP_PROFILE 开启时有值；只覆盖主/验证那条 eager 前向——
+    // MTP 草稿前向不打断点，其 GPU 时间不计入段账）
+    let prof = ex.step_profile_report();
+    let (draft_ms, fwd_ms, fin_ms) = ex.spec_timing_ms();
     ex.retain(&[]);
-    let ms = |x: f64| x / reps as f64 * 1e3;
-    let total = ms(t_plain) + ms(t_draft) + ms(t_verify);
-    println!(
-        "\n每步耗时分解（R=1，k={K}，{reps} 轮均值）：主前向 {:.2} ms ｜ {K} 次草稿 {:.2} ms ｜ 验证（链 {} 行 + 25.2MB 状态拷）{:.2} ms ｜ 合计 {:.2} ms/投机步",
-        ms(t_plain),
-        ms(t_draft),
-        K + 1,
-        ms(t_verify),
-        total
-    );
-    println!(
-        "  对照：普通 decode 步 = {:.2} ms/token ⇒ 投机步 {:.2} ms 出 1..={} token",
-        ms(t_plain),
-        total,
-        K + 1
-    );
+    // 主前向对照：同 R、spec 关的普通 decode 步（每步 1 token）
+    let plain_ms = plain_step_ms(ex, prompt, r);
+    StepMs {
+        plain_ms,
+        draft_ms: draft_ms / steps as f64,
+        fwd_ms: fwd_ms / steps as f64,
+        fin_ms: fin_ms / steps as f64,
+        tok_per_step: total as f64 / steps as f64,
+        prof,
+    }
+}
+
+/// 同 R 的普通 decode 步（spec 关）每步毫秒
+fn plain_step_ms(ex: &mut Qwen35Executor, prompt: &dyn Fn(usize) -> Vec<u32>, r: usize) -> f64 {
+    let ids: Vec<u64> = (1..=r as u64).collect();
+    let prompts: Vec<Vec<u32>> = (0..r).map(prompt).collect();
+    for (i, id) in ids.iter().enumerate() {
+        ex.admitted(*id, &prompts[i]);
+    }
+    for i in 0..r {
+        let (id, l) = (ids[i], prompts[i].len());
+        let _ = ex.step(&StepPlan { prefill: vec![(id, l)], decode: vec![id], batch: vec![] });
+    }
+    let reps = 8;
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        let _ = ex.step(&StepPlan { prefill: vec![], decode: ids.clone(), batch: ids.clone() });
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    ex.retain(&[]);
+    ms
 }
