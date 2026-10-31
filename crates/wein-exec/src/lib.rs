@@ -16,7 +16,7 @@ pub mod reference;
 pub mod toy;
 
 pub use device::DeviceSession;
-pub use qwen::Qwen35Executor;
+pub use qwen::{MtpItem, Qwen35Executor};
 pub use qwen_ref::QwenMirror;
 pub use toy::{ToyConfig, ToyExecutor, ToyWeights};
 

@@ -35,6 +35,12 @@ pub struct Qwen35Config {
     pub linear_k_dim: u32,
     pub linear_v_dim: u32,
     pub conv_kernel: u32,
+    /// MTP（多 token 预测）草稿层数：`text_config.mtp_num_hidden_layers`
+    /// （0 = checkpoint 无 MTP；文本骨干前向不依赖它）
+    pub mtp_num_hidden_layers: u32,
+    /// MTP 是否另有一套词表 embedding：`mtp_use_dedicated_embeddings`
+    /// （False = 与主模型 tie，草稿层直用 embed 表）
+    pub mtp_use_dedicated_embeddings: bool,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +67,11 @@ struct TextConfigRaw {
     linear_key_head_dim: u32,
     linear_value_head_dim: u32,
     linear_conv_kernel_dim: u32,
+    #[serde(default)]
+    mtp_num_hidden_layers: u32,
+    /// MTP 专用 embedding 形态（True 时 mtp.embed_tokens 另有一套词表权重）
+    #[serde(default)]
+    mtp_use_dedicated_embeddings: bool,
     rope_parameters: RopeParams,
 }
 
@@ -112,6 +123,8 @@ impl Qwen35Config {
             linear_k_dim: t.linear_key_head_dim,
             linear_v_dim: t.linear_value_head_dim,
             conv_kernel: t.linear_conv_kernel_dim,
+            mtp_num_hidden_layers: t.mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings: t.mtp_use_dedicated_embeddings,
         })
     }
 
@@ -164,6 +177,18 @@ impl Qwen35Config {
         }
         if self.head_dim % 2 != 0 || self.linear_k_dim % 2 != 0 {
             return Err(ModelError::Json("头维非偶数（rope/l2norm 需要）".into()));
+        }
+        // MTP 草稿层：本刀只落单层（多头嵌套 + 层间 hidden 传递另刀）
+        if self.mtp_num_hidden_layers > 1 {
+            return Err(ModelError::Json(format!(
+                "mtp>1 层暂不支持（mtp_num_hidden_layers={}）",
+                self.mtp_num_hidden_layers
+            )));
+        }
+        if self.mtp_num_hidden_layers > 0 && self.mtp_use_dedicated_embeddings {
+            return Err(ModelError::Json(
+                "mtp_use_dedicated_embeddings=true 暂不支持（草稿层复用 tie 的 embed 表）".into(),
+            ));
         }
         Ok(())
     }

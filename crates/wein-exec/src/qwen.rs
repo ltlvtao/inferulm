@@ -9,6 +9,9 @@
 //!   attn → sigmoid 门乘 → o_proj
 //! - 共通：零中心 RMSNorm / SwiGLU MLP / 残差；lm_head 与 embed 同张量
 //!   （tie_word_embeddings，gemm_wt 直用）
+//! - MTP 草稿层（可选，checkpoint 带 `mtp.*` 张量时装配）：单层 full
+//!   attention 草稿头，入 = [pre_fc_norm_embedding(embed(t_{p+1})) ‖
+//!   pre_fc_norm_hidden(h_p)] 过 fc，自有 KV 池 + 因果自注意（见 MtpDev）
 //!
 //! 状态分账：块表行号同时索引 linear 状态行 [32,128,128] f32、conv 状态行
 //! [8192,3] bf16、KV 块表 [bpr]——行回收（retain/preempted）时线性/卷积
@@ -100,6 +103,70 @@ struct LayerDev {
     wg: DevBuf<'static>,
     wu: DevBuf<'static>,
     wd: DevBuf<'static>,
+}
+
+/// MTP 草稿链条数上限（块表行 = 并发草稿会话数；`MtpItem::kv_page_row` 索引）
+const MTP_CHAINS: usize = 16;
+
+/// MTP（多 token 预测）草稿层权重 + 专属 scratch。checkpoint 无 `mtp.*`
+/// 张量时整体 None，主链路逐位不变。schema 对齐 vLLM `qwen3_5_mtp.py`：
+/// `e = pre_fc_norm_embedding(embed(t_{p+1}))`、`hh = pre_fc_norm_hidden(h_p)`、
+/// `x = fc([e ‖ hh])`、`y = x + attn(ln1(x))`、`z = y + mlp(ln2(y))`、
+/// `logits = rms_norm_zc(z, norm) @ embedᵀ`（tie 的 embed 兼作 lm_head）
+struct MtpDev {
+    /// [2560, 5120]：入序 = [pre_fc_norm_embedding ‖ pre_fc_norm_hidden]
+    fc: DevBuf<'static>,
+    pre_e: DevBuf<'static>, // [2560] pre_fc_norm_embedding
+    pre_h: DevBuf<'static>, // [2560] pre_fc_norm_hidden
+    /// 单层 full attention + SwiGLU MLP（与主模型层同构，复用 LayerDev）
+    layer: LayerDev,
+    norm: DevBuf<'static>, // [2560] mtp.norm
+    /// 草稿层 K/V 池在 k_pool/v_pool 中的下标（主模型 8 个 full 层之后）
+    kv: usize,
+    /// 上一步 hidden 的行 gather 落点 [T_MAX,2560]（fc 输入的 hidden 半）
+    hid: DevBuf<'static>,
+    /// fc 输入拼接 [T_MAX,5120]（行 = [e ‖ hh]）
+    cat: DevBuf<'static>,
+}
+
+/// MTP 草稿前向的一项输入：链行 + 链内位置 + 上一步 hidden 行 + 下一 token
+#[derive(Debug, Clone, Copy)]
+pub struct MtpItem {
+    /// 草稿链的块表行（每链独立 KV 页表；因果上下文 = 该链 0..=pos）
+    pub kv_page_row: u32,
+    /// 链内位置（= 主模型 token 位置 p；rope 与 KV 槽位同尺）
+    pub pos: u32,
+    /// 上一步前向的 hidden 行号（`last_hidden` 的切片尺）
+    pub h: u32,
+    /// 位置 p+1 的 token（embed 输入）
+    pub next_tok: u32,
+}
+
+/// MTP 前向输入束（每项一行的 H2D 小表 + 草稿链块表）
+struct MtpIn<'a> {
+    ids: &'a DevBuf<'a>,
+    pos: &'a DevBuf<'a>,
+    seqs: &'a DevBuf<'a>,
+    hrows: &'a DevBuf<'a>,
+    bt: &'a DevBuf<'a>,
+    iq: &'a DevBuf<'a>,
+    ig: &'a DevBuf<'a>,
+}
+
+/// q‖gate 拆分下标（单位 = head_dim 宽的 gather 行）：HF 在 view(T,-1,2·hd)
+/// 上 chunk(2) ⇒ 每头 [q ‖ gate] 交错，q 取偶数行、gate 取奇数行
+/// （qs8 消融：按"前 nqh 行 q / 后 nqh 行 gate"错读 → 一致率 45%→4.2%）
+fn qg_split_ids(t: usize, nqh: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut q = Vec::with_capacity(t * nqh);
+    let mut g = Vec::with_capacity(t * nqh);
+    for tt in 0..t {
+        let base = tt * 2 * nqh;
+        for hh in 0..nqh {
+            q.push((base + 2 * hh) as u32);
+            g.push((base + 2 * hh + 1) as u32);
+        }
+    }
+    (q, g)
 }
 
 /// 前向 scratch（按 T_MAX 一次分配；下标/块表等小数组每步上传）
@@ -380,6 +447,14 @@ pub struct Qwen35Executor {
     layers: Vec<LayerDev>,
     embed: DevBuf<'static>,
     norm_f: DevBuf<'static>,
+    /// MTP 草稿层（checkpoint 无 `mtp.*` 张量 → None，主链路逐位不变）
+    mtp: Option<MtpDev>,
+    /// MTP 草稿链块表（行 = MtpItem::kv_page_row，与主模型 bt_host 分账）
+    mtp_bt: Vec<u32>,
+    /// 已分配页的草稿链（链行 → 块串）；mtp_reset 全数归还页池
+    mtp_chains: HashMap<u32, Vec<u32>>,
+    /// 上一步前向的批行数（last_hidden 的行数；mtp_draft 的 h 行上界）
+    last_t: usize,
     /// 24 个线性层状态池 [MAX_ROWS, 32,128,128] f32（层序）
     lin_state: Vec<DevBuf<'static>>,
     /// 24 个线性层 conv 状态池 [MAX_ROWS, 8192,3] bf16
@@ -526,6 +601,53 @@ impl Qwen35Executor {
         let embed = up(&format!("{P}embed_tokens.weight"))?;
         let norm_f = up(&format!("{P}norm.weight"))?;
 
+        // ---- MTP 草稿层（顶级前缀 `mtp.`，不带 model.language_model.）----
+        // 15 张量；checkpoint 无 `mtp.fc.weight` → None（主链路逐位不变）。
+        // K/V 池是第 9 对（索引 = 主模型 8 个 full 层之后），full_i 语义不动
+        let mtp = if store.names().iter().any(|n| *n == "mtp.fc.weight") {
+            if cfg.mtp_num_hidden_layers != 1 {
+                return Err(format!(
+                    "checkpoint 带 MTP 张量，config mtp_num_hidden_layers={}（须为 1）",
+                    cfg.mtp_num_hidden_layers
+                ));
+            }
+            let ml = "mtp.layers.0.";
+            let layer = LayerDev {
+                ln1: up(&format!("{ml}input_layernorm.weight"))?,
+                attn: AttnDev::Full(FullDev {
+                    qg: up(&format!("{ml}self_attn.q_proj.weight"))?,
+                    k: up(&format!("{ml}self_attn.k_proj.weight"))?,
+                    v: up(&format!("{ml}self_attn.v_proj.weight"))?,
+                    o: up(&format!("{ml}self_attn.o_proj.weight"))?,
+                    qn: up(&format!("{ml}self_attn.q_norm.weight"))?,
+                    kn: up(&format!("{ml}self_attn.k_norm.weight"))?,
+                }),
+                ln2: up(&format!("{ml}post_attention_layernorm.weight"))?,
+                wg: up(&format!("{ml}mlp.gate_proj.weight"))?,
+                wu: up(&format!("{ml}mlp.up_proj.weight"))?,
+                wd: up(&format!("{ml}mlp.down_proj.weight"))?,
+            };
+            let kv = k_pool.len();
+            let bytes = NUM_PAGES as usize * BLOCK as usize
+                * (cfg.num_kv_heads * cfg.head_dim) as usize
+                * 2;
+            k_pool.push(pin!(gpu.alloc_bytes(bytes)));
+            v_pool.push(pin!(gpu.alloc_bytes(bytes)));
+            let hidden_bytes = cfg.hidden_size as usize * 2;
+            Some(MtpDev {
+                fc: up("mtp.fc.weight")?,
+                pre_e: up("mtp.pre_fc_norm_embedding.weight")?,
+                pre_h: up("mtp.pre_fc_norm_hidden.weight")?,
+                layer,
+                norm: up("mtp.norm.weight")?,
+                kv,
+                hid: pin!(gpu.alloc_bytes(hidden_bytes * T_MAX)),
+                cat: pin!(gpu.alloc_bytes(hidden_bytes * 2 * T_MAX)),
+            })
+        } else {
+            None
+        };
+
         // ---- rope 表：HF 收 bf16 再用（.to(x.dtype)）——executor/镜像同表 ----
         let rot_half = (cfg.rot_dim() / 2) as usize;
         let (mut cos, mut sin) = reference::rope_table(MAX_POS, rot_half, cfg.rope_theta);
@@ -616,6 +738,10 @@ impl Qwen35Executor {
             layers,
             embed,
             norm_f,
+            mtp,
+            mtp_bt: vec![0u32; MTP_CHAINS * bpr_of()],
+            mtp_chains: HashMap::new(),
+            last_t: 0,
             lin_state,
             conv_state,
             k_pool,
@@ -873,6 +999,8 @@ impl Qwen35Executor {
             s.zero_on(stream);
         }
         stream.sync();
+        // 草稿链页一并归还（MTP 链属请求态——reset 后从零开始）
+        self.mtp_reset();
     }
 
     /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）
@@ -1047,6 +1175,7 @@ impl Qwen35Executor {
         self.session.gpu().bind_thread();
         let t = rows.len();
         assert!(t > 0 && t <= T_MAX, "批大小 {t} 超前向缓冲上限 {T_MAX}");
+        self.last_t = t;
         for &(_, _, pos) in rows {
             assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
         }
@@ -1343,6 +1472,203 @@ impl Qwen35Executor {
         }
     }
 
+    // ── MTP 草稿层（可选能力：checkpoint 带 `mtp.*` 张量时激活）──
+    //
+    // 接口分三层：
+    //   `last_hidden`  上一步前向的末层 hidden（final norm 之前）→ 教师强制的 h_p
+    //   `mtp_draft`    一批 (链行, 位置, hidden 行, 下一 token) 一次前向出每项 argmax
+    //   `mtp_reset`    草稿链页归还（请求生命周期收尾）
+    // 因果性靠 paged_attn 的 pos 语义 + 草稿链自有块表：项 (row, p) 只看该链
+    // 位置 0..=p——同批先行项（更小 pos）的 KV 已在本前向的 scatter 落池。
+    // 步时插桩不覆盖 MTP（profile 的"步"= 主模型前向；草稿层是另一条账）
+
+    /// 上一步前向的末层 hidden（final norm 之前）：(行数, [T, hidden] bf16 位)。
+    /// 行号与该步批内行号同尺——`MtpItem::h` 直接引用
+    pub fn last_hidden(&self) -> (usize, Vec<u16>) {
+        let h = self.cfg.hidden_size as usize;
+        let t = self.last_t;
+        let bits: Vec<u16> = self.scr.x.read_to_vec();
+        (t, bits[..t * h].to_vec())
+    }
+
+    /// MTP 是否在场（checkpoint 带草稿层权重）
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// 草稿链页归还（行清零；页回池）。链属请求态——请求退场/重放时调
+    pub fn mtp_reset(&mut self) {
+        for (_, blocks) in std::mem::take(&mut self.mtp_chains) {
+            for b in blocks {
+                self.pool.release(b);
+            }
+        }
+        self.mtp_bt.iter_mut().for_each(|x| *x = 0);
+        self.pool.recycle();
+    }
+
+    /// 页保证：草稿链 `row` 的块表行长到覆盖 `pos`（含）
+    fn ensure_mtp_pages(&mut self, row: u32, pos: u32) {
+        let need = pos as usize / BLOCK as usize + 1;
+        let have = self.mtp_chains.get(&row).map_or(0, |v| v.len());
+        if have >= need {
+            return;
+        }
+        // 先攒本地（alloc_page 可能驱逐 radix，须避开链表借用）
+        let news: Vec<u32> = (have..need).map(|_| self.alloc_page()).collect();
+        let base = row as usize * self.bpr;
+        let chain = self.mtp_chains.entry(row).or_default();
+        for b in news {
+            self.mtp_bt[base + chain.len()] = b;
+            chain.push(b);
+        }
+    }
+
+    /// 草稿前向：一批项一次前向，返回每项 argmax（预测位置 p+2 的 token）。
+    /// hidden 行号取自**上一步前向**（`last_hidden` 同尺）；同链项按 pos
+    /// 升序给出即可（因果自注意不依赖批内序——scatter 先于 attn 落池）
+    pub fn mtp_draft(&mut self, items: &[MtpItem]) -> Vec<u32> {
+        let t = items.len();
+        assert!(t > 0, "mtp_draft：空批");
+        assert!(t <= T_MAX, "MTP 批 {t} 超前向缓冲上限 {T_MAX}");
+        let voc = self.cfg.vocab_size;
+        assert!(self.mtp.is_some(), "mtp_draft：checkpoint 无 MTP 权重");
+        for it in items {
+            assert!(
+                (it.kv_page_row as usize) < MTP_CHAINS,
+                "草稿链行 {} 超上限 {MTP_CHAINS}",
+                it.kv_page_row
+            );
+            assert!((it.pos as usize) < MAX_POS, "MTP 位置 {} 超 paged_attn 上限 {MAX_POS}", it.pos);
+            assert!(
+                (it.h as usize) < self.last_t,
+                "hidden 行 {} 超上一步行数 {}（先跑一步主前向）",
+                it.h,
+                self.last_t
+            );
+            assert!(it.next_tok < voc, "MTP token {} 越界（vocab {voc}）", it.next_tok);
+            self.ensure_mtp_pages(it.kv_page_row, it.pos);
+        }
+        self.session.gpu().bind_thread();
+        let gpu = self.session.gpu();
+        let stream = self.session.stream();
+        let ids: Vec<u32> = items.iter().map(|i| i.next_tok).collect();
+        let pos: Vec<u32> = items.iter().map(|i| i.pos).collect();
+        let seqs: Vec<u32> = items.iter().map(|i| i.kv_page_row).collect();
+        let hrows: Vec<u32> = items.iter().map(|i| i.h).collect();
+        let (iq, ig) = qg_split_ids(t, self.cfg.num_heads as usize);
+        let (d_ids, d_pos, d_seqs, d_hrows, d_bt, d_iq, d_ig) = (
+            gpu.alloc_from_slice(&ids),
+            gpu.alloc_from_slice(&pos),
+            gpu.alloc_from_slice(&seqs),
+            gpu.alloc_from_slice(&hrows),
+            gpu.alloc_from_slice(&self.mtp_bt),
+            gpu.alloc_from_slice(&iq),
+            gpu.alloc_from_slice(&ig),
+        );
+        let inp = MtpIn {
+            ids: &d_ids,
+            pos: &d_pos,
+            seqs: &d_seqs,
+            hrows: &d_hrows,
+            bt: &d_bt,
+            iq: &d_iq,
+            ig: &d_ig,
+        };
+        self.run_mtp_forward(t as u32, &inp);
+        // 每项一个草稿 token（设备端 argmax，只回读 t 个 u32）
+        let rows: Vec<u32> = (0..t as u32).collect();
+        let d_rows = gpu.alloc_from_slice(&rows);
+        self.session.table().argmax_rows.run(
+            &self.scr.logits,
+            &d_rows,
+            &self.scr.am_scratch,
+            &self.scr.am_out,
+            voc,
+            t as u32,
+            stream,
+        );
+        stream.sync();
+        let out: Vec<u32> = self.scr.am_out.read_to_vec();
+        out[..t].to_vec()
+    }
+
+    /// MTP 单层前向 kernel 序（embed gather → 双 pre-norm → cat → fc →
+    /// 单层 full attention（自有池 + 因果）→ SwiGLU MLP → final norm + logits）。
+    /// 主模型 scratch 复用：n1/o/h2/x/n2 + g/u/act/m/d + attn/agated/qg/qh/gate/kh/vh
+    fn run_mtp_forward(&self, t32: u32, inp: &MtpIn) {
+        let stream = self.session.stream();
+        let tb = self.session.table();
+        let eps = self.cfg.rms_eps;
+        let (h, ii, voc) =
+            (self.cfg.hidden_size, self.cfg.inter_size, self.cfg.vocab_size);
+        let w = self.mtp.as_ref().expect("run_mtp_forward：无 MTP 权重");
+        let AttnDev::Full(a) = &w.layer.attn else { panic!("MTP 层须为 full attention") };
+        let (qh_n, kvh, hd) =
+            (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
+        let he = kvh * hd;
+
+        // ① 两个 pre-norm（各 2560）：e = norm_embed(embed(t_{p+1}))，
+        //    hh = norm_hidden(h_p)——hidden 行先按行 gather 成紧排 [t,2560]
+        tb.embed.run(inp.hrows, &self.scr.x, &w.hid, h, t32, stream);
+        tb.embed.run(inp.ids, &self.embed, &self.scr.n1, h, t32, stream);
+        tb.rms_norm_zc.run(&self.scr.n1, &w.pre_e, &self.scr.o, t32, h, eps, stream);
+        tb.rms_norm_zc.run(&w.hid, &w.pre_h, &self.scr.h2, t32, h, eps, stream);
+
+        // ② cat 行 = [e ‖ hh]：rms_norm_zc 只写紧排行、embed gather 的宽与源
+        //    行宽同尺——跨缓冲拼半行只能逐行 D2D（段表一次发行，非逐项 launch）
+        let (lower, upper) = (&self.scr.o, &self.scr.h2);
+        let half = h as usize * 2;
+        let mut ops: Vec<CuBatchOp> = Vec::with_capacity(2 * t32 as usize);
+        for j in 0..t32 as usize {
+            let dst = w.cat.device_ptr() + (j * 2 * half) as u64;
+            let src = (j * half) as u64;
+            ops.push(CuBatchOp { dst, src: lower.device_ptr() + src, size: half });
+            ops.push(CuBatchOp { dst: dst + half as u64, src: upper.device_ptr() + src, size: half });
+        }
+        stream.memcpy_batch(&ops);
+        tb.gemm.run_wt(&w.cat, &w.fc, &self.scr.x, t32, h, 2 * h, stream);
+
+        // ③ 单层 full attention（q‖gate 交错投影 → 零中心 q/k norm →
+        //    partial rope（位置 = 链内 p）→ 自有池 scatter → 因果 GQA →
+        //    门乘 → o_proj）
+        tb.rms_norm_zc.run(&self.scr.x, &w.layer.ln1, &self.scr.n1, t32, h, eps, stream);
+        tb.gemm.run_wt(&self.scr.n1, &a.qg, &self.scr.qg, t32, 2 * qh_n * hd, h, stream);
+        tb.embed.run(inp.iq, &self.scr.qg, &self.scr.qh, hd, t32 * qh_n, stream);
+        tb.embed.run(inp.ig, &self.scr.qg, &self.scr.gate, hd, t32 * qh_n, stream);
+        tb.rms_norm_zc.run(&self.scr.qh, &a.qn, &self.scr.qh, t32 * qh_n, hd, eps, stream);
+        tb.gemm.run_wt(&self.scr.n1, &a.k, &self.scr.kh, t32, he, h, stream);
+        tb.gemm.run_wt(&self.scr.n1, &a.v, &self.scr.vh, t32, he, h, stream);
+        tb.rms_norm_zc.run(&self.scr.kh, &a.kn, &self.scr.kh, t32 * kvh, hd, eps, stream);
+        let rd = self.cfg.rot_dim();
+        tb.rope_pt.run(&self.scr.qh, &self.cos, &self.sin, inp.pos, &self.scr.qh, rd, hd, qh_n, t32, stream);
+        tb.rope_pt.run(&self.scr.kh, &self.cos, &self.sin, inp.pos, &self.scr.kh, rd, hd, kvh, t32, stream);
+        tb.kv_scatter.run(
+            &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
+            &self.v_pool[w.kv], self.bpr as u32, BLOCK, he, t32, stream,
+        );
+        tb.paged_attn.run(
+            &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
+            &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh, hd, t32, stream,
+        );
+        tb.sigmul.run(&self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream);
+        tb.gemm.run_wt(&self.scr.agated, &a.o, &self.scr.o, t32, h, qh_n * hd, stream);
+
+        // ④ 残差 + SwiGLU MLP（h2 此前是 hh 的临时落点，此处起作 y）
+        tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, t32 * h, stream);
+        tb.rms_norm_zc.run(&self.scr.h2, &w.layer.ln2, &self.scr.n2, t32, h, eps, stream);
+        tb.gemm.run_wt(&self.scr.n2, &w.layer.wg, &self.scr.g, t32, ii, h, stream);
+        tb.gemm.run_wt(&self.scr.n2, &w.layer.wu, &self.scr.u, t32, ii, h, stream);
+        tb.silu.run(&self.scr.g, &self.scr.act, t32 * ii, stream);
+        tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t32 * ii, stream);
+        tb.gemm.run_wt(&self.scr.m, &w.layer.wd, &self.scr.d, t32, h, ii, stream);
+        tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.x, t32 * h, stream);
+
+        // ⑤ final norm + logits（tie：embed 兼作 lm_head 的 W[n,k]）
+        tb.rms_norm_zc.run(&self.scr.x, &w.norm, &self.scr.n2, t32, h, eps, stream);
+        tb.gemm.run_wt(&self.scr.n2, &self.embed, &self.scr.logits, t32, voc, h, stream);
+    }
+
     /// 通用缓冲落盘（bf16 n 元素 → f32 LE）——full-attn 组件级对拍用
     fn trace_buf(&self, tag: &str, buf: &DevBuf, n: usize) {
         let Ok(dir) = std::env::var("WEIN_TRACE_DIR") else { return };
@@ -1441,6 +1767,7 @@ impl Qwen35Executor {
             (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row)
         };
         assert!(m > 0 && m <= b, "桶路由合同：m {m} ≤ 桶 {b}");
+        self.last_t = m;
         for &(_, _, pos) in rows {
             assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
         }

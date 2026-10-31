@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use wein_engine::{CoreConfig, EngineCore, EngineEvent, Executor, FinishReason, SamplingParams};
 use wein_exec::qwen_ref::QwenMirror;
-use wein_exec::{argmax, Qwen35Executor};
+use wein_exec::{argmax, MtpItem, Qwen35Executor};
 use wein_model::{model_dir, HfTokenizer};
 use wein_sched::StepPlan;
 
@@ -640,4 +640,117 @@ fn qs7_shared_system_prompt_many_sessions() {
             steady = Some(used);
         }
     }
+}
+
+// ── qs8：MTP 草稿层（多 token 预测）教师强制一致率 ──
+
+/// MTP 草稿层单层前向的 schema 证据：给定位置 p 的目标末层 hidden `h_p` 与
+/// 位置 p+1 的 token `t_{p+1}`，草稿层应预测 `t_{p+2}`。一条真文本上逐位
+/// 教师强制（target 全在上下文里，草稿层学到的就是"下一个 token"）的一致率
+/// 就是 schema 是否逐项对齐的判据：结构错一处（拼接序 / q‖gate 交错 / pre-norm
+/// 漏重 / rope 位置偏移）一致率掉到个位数百分比（随机量级，见下实测）。
+///
+/// 驱动方式：chunk 16 的前向把整段 prompt 喂完（模拟服务侧 chunked prefill，
+/// 同时让 hidden 行落在每步的上限内），**每喂完一个 chunk 就对这 16 行发一次
+/// `mtp_draft`**——MTP 的 KV 链（chain 0）跨 chunk 累积，项 (p, h 行, t_{p+1})
+/// 的因果上下文 = 链内 0..=p，与真实草稿解码逐位同构。注意 `last_hidden`
+/// 只保上一步的行（hidden 不跨步留在设备上，主前向的 scratch 是逐级覆写的），
+/// 故教师强制的 h 行号 = 该 chunk 内的行号（绝对位置另由 item.pos 给出）。
+///
+/// 实测（本机 Qwen3.5-4B / RTX 4090 / WSL，2026-10-31，prompt = 下面这段
+/// 122 token，n_cmp = T-2 = 120）：
+/// - **正确组合**（cat = [embed ‖ hidden]，q‖gate 按头交错）：**45.0%**（54/120）
+///   分段 [0,16)44%｜[16,32)44%｜[32,48)31%｜[48,64)50%｜[64,80)50%｜[80,96)44%
+///   ｜[96,112)44%｜[112,120)62%——后期上下文更充分略高，整体与位置弱相关
+/// - 仅拼接序反（消融：临时把 cat 改成 [hidden ‖ embed]）：**0.0%**（0/120，随机量级）
+/// - 仅 q‖gate 错读法（消融：前 16 行 q / 后 16 行 gate）：
+///   **4.2%**（5/120，随机量级）
+/// - 两者同时错：**0.0%**（0/120）
+/// 即两侧各自都是"全对/全错"的开关（45% ↔ ≈0%），拼接序与 q‖gate 交错这两处
+/// 正是 schema 最易踩错的地方，本条即证据。另做了一次自注意消融（每项独立
+/// 链、pos=0 → 只看得见自己）：总一致率仍 45.0% 但逐位输出全变——草稿头主要
+/// 吃 target hidden + next-token embed，草稿链自注意对 top-1 一致率贡献在噪声内。
+/// pre-norm 语义的现场旁证：mtp.pre_fc_norm_* 权重全负（min -0.55 / -0.43，
+/// 均 -0.41 / -0.25），只有零中心 (1+w) 读法才给出合理的 ≈0.5-1.5 缩放；
+/// 普通 RMSNorm（w 直乘）语义下这层是"整向量反号"，不可能训练出来。
+#[test]
+fn qs8_mtp_teacher_forcing_agreement() {
+    let _g = guard();
+    let Some(dir) = mdir() else { return };
+    let Some(mut ex) = exec(&dir) else { return };
+    if !ex.has_mtp() {
+        eprintln!("SKIP（checkpoint 无 MTP 草稿层权重 mtp.*）");
+        return;
+    }
+    let tok = HfTokenizer::open(&dir).unwrap();
+    let mut p = tok.encode(
+        "The quick brown fox jumps over the lazy dog while the sun sets behind the distant mountains, \
+         and the river flows quietly through the ancient forest where birds sing their evening songs \
+         before night falls over the sleeping village. In the spring, farmers plant wheat and barley \
+         in the wide fields, and by late summer the harvest fills the barns with golden grain. The \
+         village school has one room, a wooden stove, and a shelf of books that the teacher brought \
+         from the city many years ago. Every winter the children walk through the snow to reach it, \
+         carrying their lunch in small metal boxes and laughing at the cold wind.",
+    );
+    assert!(p.len() >= 120 && p.len() <= 200, "prompt 须 120-200 token（实得 {}）", p.len());
+    p.truncate(200);
+    let t_len = p.len();
+    let n_cmp = t_len - 2; // p = 0..=T-3（要 t_{p+1} 与 t_{p+2} 都在上下文里）
+    ex.admitted(1, &p);
+
+    const CHUNK: usize = 16;
+    let mut draft = vec![0u32; n_cmp];
+    let mut rows_seen = 0usize;
+    let mut start = 0usize;
+    while start < t_len {
+        let n = CHUNK.min(t_len - start);
+        let st = ex.step(&StepPlan { prefill: vec![(1, n)], decode: vec![], batch: vec![] });
+        assert!(st.is_empty(), "chunked prefill 步不采样");
+        let (t, hid) = ex.last_hidden();
+        assert_eq!(t, n, "last_hidden 行数 = 本 chunk 行数");
+        assert_eq!(hid.len(), n * 2560, "hidden 宽度 = 2560");
+        rows_seen += t;
+        // 本 chunk 覆盖的 p：绝对位置 start..min(start+n, T-2)（上界留 t_{p+2}）
+        let hi = (start + n).min(n_cmp);
+        let items: Vec<MtpItem> = (start..hi)
+            .map(|q| MtpItem {
+                kv_page_row: 0,
+                pos: q as u32,
+                h: (q - start) as u32,
+                next_tok: p[q + 1],
+            })
+            .collect();
+        if !items.is_empty() {
+            let out = ex.mtp_draft(&items);
+            assert_eq!(out.len(), items.len(), "每项一个草稿 token");
+            draft[start..hi].copy_from_slice(&out);
+        }
+        start += n;
+    }
+    assert_eq!(rows_seen, t_len, "chunked prefill 走完 → hidden 行数 = T");
+
+    let hits = (0..n_cmp).filter(|&q| draft[q] == p[q + 2]).count();
+    let acc = hits as f64 / n_cmp as f64;
+    eprintln!("qs8 MTP 教师强制一致率 {:.1}%（{hits}/{n_cmp}）", acc * 100.0);
+    // 分段一致率（自注意上下文长度 = pos，前几段上下文极短——分段读数既是
+    // schema 证据也是"短上下文先天弱"的归档）
+    let mut segs = Vec::new();
+    let mut q = 0usize;
+    while q < n_cmp {
+        let hi = (q + 16).min(n_cmp);
+        let h = (q..hi).filter(|&i| draft[i] == p[i + 2]).count();
+        segs.push(format!("[{q},{hi}) {:.0}%", h as f64 / (hi - q) as f64 * 100.0));
+        q = hi;
+    }
+    eprintln!("  分段：{}", segs.join("｜"));
+    for q in [0usize, 31, 63, 95, n_cmp - 1] {
+        eprintln!(
+            "  样本 p={q}：期望 {:?} / 草稿 {:?}（{}）",
+            tok.decode(&[p[q + 2]]),
+            tok.decode(&[draft[q]]),
+            if draft[q] == p[q + 2] { "命中" } else { "未中" }
+        );
+    }
+    ex.mtp_reset();
+    assert!(acc >= 0.40, "MTP 教师强制一致率 {:.1}% < 40%（schema 未对齐？）", acc * 100.0);
 }
