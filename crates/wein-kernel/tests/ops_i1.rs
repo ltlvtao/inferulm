@@ -253,17 +253,23 @@ fn o19_conv_golden_bitwise() {
 #[test]
 fn o20_deltanet_golden_bitwise() {
     // kd=8 走通用 u64 车道路径；kd=128 走行驻留快路径（local depot/寄存器）
-    o20_case(2, 4, 8, 8);
-    o20_case(2, 4, 128, 8);
-    o20_case(4, 8, 128, 128); // E2 路径：kd=vd=128（块=(行,v 头)×4 warp，kvm/o 两级折叠）
+    o20_case(2, 4, 8, 8, 1);
+    o20_case(2, 4, 128, 8, 1);
+    o20_case(4, 8, 128, 128, 1); // E2 路径：kd=vd=128（块=(行,v 头)×4 warp，kvm/o 两级折叠）
+    // B 档 chunked：同一形状按 v 行切 4 块（块=(行, v 头, v 行块)，grid ×4）
+    // ——逐位必须同上（切块只改"哪个块负责哪几行"，行内算术一个字不动）
+    o20_case(4, 8, 128, 128, 4);
+    o20_case(4, 8, 128, 128, 2);
+    // 8 块 = 生产 prefill 几何（16 行/块 × 2 warp × 8 行 = 批 8）
+    o20_case(4, 8, 128, 128, 8);
 }
 
-fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
+fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize, vsplit: u32) {
     let _g = guard();
     let Some(gpu) = gpu() else { return };
     let stream = gpu.stream();
     let t = table(&gpu);
-    let tag = format!("deltanet kd={k_dim}");
+    let tag = format!("deltanet kd={k_dim} vd={v_dim} vsplit={vsplit}");
     let (row_start, row_count): (Vec<u32>, Vec<u32>) = (vec![0, 6], vec![6, 3]);
     let row_id: Vec<u32> = vec![0, 1];
     let tokens: usize = 9;
@@ -298,7 +304,8 @@ fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize) {
     let (drs, drc, dri) = (gpu.alloc_from_slice(&row_start), gpu.alloc_from_slice(&row_count), gpu.alloc_from_slice(&row_id));
     let dspec0 = gpu.alloc_from_slice(&vec![0u32; n_rows]); // 非投机路径：全 0 常量数组
     t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &dspec0, &stream);
+        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &dspec0,
+        vsplit, &stream);
     stream.sync();
     assert_bits(&format!("{tag} core_out"), &dout.read_to_vec(), &expect_out);
     assert_bits(&format!("{tag} state"), &dstate.read_to_vec(), &expect_state);
@@ -465,14 +472,16 @@ fn o22_deltanet_latency_canary() {
     for _ in 0..3 {
         // 热身（JIT/缓存就位）；状态每拍原地演化——形状与访存量不变
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &dspec0, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6,
+            &dspec0, 1, &stream);
     }
     stream.sync();
     let (e0, e1) = (gpu.event(), gpu.event());
     e0.record_on(&stream);
     for _ in 0..20 {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &dspec0, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6,
+            &dspec0, 1, &stream);
     }
     e1.record_on(&stream);
     stream.sync();

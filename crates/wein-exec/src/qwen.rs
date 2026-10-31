@@ -2831,10 +2831,17 @@ impl Qwen35Executor {
                     tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.b, &self.scr.bb, t32, 32, h, stream);
                     self.prof_mark("delta");
+                    // B 档 chunked 的自适应门（保守档）：**同 span token 数 t>1**
+                    // 才切 v 行。判据 = 本步 token 总数 > 行数（有任一行吃了多
+                    // token ⇒ 该行的状态行在块内串行递推、依赖链即延迟）；纯
+                    // decode（每行 1 token）仍走不切块的现有几何（实测无退化，
+                    // 见 bench 报告）。容量/铺满/几何的上限钳制在 op 内做
+                    let dn_split = if t32 > n_rows { 8 } else { 1 };
                     tb.deltanet.run(
                         &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
                         &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
-                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, inp.specs, stream,
+                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, inp.specs,
+                        dn_split, stream,
                     );
                     if trace {
                         // 定位解码递推偏差：conv 输出与 deltanet 输出（decode vs

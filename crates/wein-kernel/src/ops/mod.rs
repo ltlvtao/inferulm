@@ -263,6 +263,21 @@ const DELTA_WIDE_GRID_MAX: usize = 64;
 /// 每块 scratch 槽数 = 2 区 × warp 数 × 16 行批 × 32 lane（与 kernel 侧
 /// `bid * nwarps * 1024` 同构）；按宽块（warp 多）预留
 const DELTA_SLOTS_PER_BLOCK: usize = (DELTA_WIDE_BLOCK_DIM / 32) * 1024;
+/// B 档 chunked（保守档）的 v 行切分数：块从 (行, v 头) 扩成 (行, v 头, v 行块)，
+/// 每块只吃 vd/vsplit 个连续 v 行 ⇒ 块数 ×vsplit、每块依赖链 ÷vsplit。
+/// vd=128、单 span prefill ⇒ 16 行/块、grid 32→256。实测（250 token）：不切
+/// 44.5ms、切 4 + 128 线程 23.9ms、切 8 + 64 线程 20.9ms、切 16 21.0ms（重复
+/// l2norm 变大吃掉收益）⇒ 取 8。
+/// **行内算术一个字不动**：切块只改"哪个块负责哪几行"（v 行彼此独立、归约在
+/// warp 内 32 lane 上），故位级输出与不切块同（o20/o25 钉住）。
+const DELTA_SPLIT: usize = 8;
+/// 切块时的块宽（线程数）：64 = 2 warp（行/warp 加倍、每 token 的屏障减半）；
+/// 128 = 4 warp。行内算术全同，只改 warp 数与批大小（屏障密度）；实测同 split
+/// 下两者的 delta 反向不定（split4：128 线程 23.9 vs 64 线程 27.5），故靠测量选
+const DELTA_SPLIT_BLOCK_DIM: usize = 64;
+/// 切块门 ②：块数已达此值即视为铺满（128 SM × 4 块）——此时再切只加重复读
+/// （每块每 token 各算一遍 q/k l2norm），不加并行
+const DELTA_SPLIT_MAX_BLOCKS: usize = 512;
 
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
@@ -463,7 +478,7 @@ impl ConvStateRollOp for ConvStateRollCuda<'_> {
     }
 }
 
-/// gated deltanet 递推：grid = rows×v_heads；block = v_dim（kd=vd=128 时
+/// gated deltanet 递推：grid = rows×v_heads×vsplit；block = v_dim（kd=vd=128 时
 /// 128 线程走 E2 warp 重映射）。状态池属 executor（[rows, v_heads, v_dim,
 /// k_dim] bf16，行号经 row_id 间接）
 pub trait DeltanetOp {
@@ -492,6 +507,9 @@ pub trait DeltanetOp {
         // （token i 读行 row_id[r]+i、写行 +i+1——MTP 验证链的零拷贝回滚；
         // 仅 kd=vd=128）。逐 span 而非整批标量：链段与普通行同批
         specs: &DevBuf,
+        // v 行切分数（B 档 chunked；1 = 不切）。调用方按批形给建议值
+        // （同 span token 数 t>1 才值得切），run 内按容量/几何上限钳制
+        vsplit: u32,
         stream: &Stream,
     );
     fn name(&self) -> &'static str;
@@ -528,6 +546,7 @@ impl DeltanetOp for DeltanetCuda<'_> {
         v_dim: u32,
         l2_eps: f32,
         specs: &DevBuf,
+        vsplit: u32,
         stream: &Stream,
     ) {
         // 块几何自带：kd=vd=128 走 E2（一块=(行, v 头)×128 线程=4 warp，
@@ -535,16 +554,48 @@ impl DeltanetOp for DeltanetCuda<'_> {
         // kvm/o 归约走 scratch 两级折叠）；其余一块 = (行, v 头)、
         // block 宽 = v_dim（kernel 侧同条件分支）
         let e2 = k_dim == 128 && v_dim == 128;
+        // ── B 档 chunked 的自适应门（仅 E2）──
+        // ① 容量：块数 rows×v_heads×vsplit ≤ DELTA_BLOCK_CAP（块私有 scratch 槽）
+        // ② 铺满：块数已 ≥ DELTA_SPLIT_MAX_BLOCKS 时切块只加重复读（每块每
+        //    token 各自算一遍 q/k l2norm + 再读一遍 k/q 切片），不加并行
+        // ③ 几何：vd 可被 vsplit 整除，且每 warp 行数 = vd/(vsplit·nwarps) 是
+        //    kernel 侧批 4 的整数倍（rows_pw % 4 == 0）
+        let sp = if !e2 {
+            1
+        } else {
+            let base = (n_rows as usize * v_heads as usize).max(1);
+            let cap = DELTA_BLOCK_CAP / base;
+            let mut s = (vsplit as usize).clamp(1, DELTA_SPLIT);
+            // kernel 侧批大小 = min(16, rows_pw)、步进按 4 的整数倍 ⇒ rows_pw ∈
+            // {4, 8, 16, 32}（vd=128 与 2 幂 warp 数下必为 2 幂）
+            let ok = |s: usize| {
+                if v_dim as usize % s != 0 {
+                    return false;
+                }
+                let rows_pw = (v_dim as usize / s) / (DELTA_SPLIT_BLOCK_DIM / 32);
+                rows_pw >= 4 && rows_pw <= 32 && rows_pw.is_power_of_two()
+            };
+            if base >= DELTA_SPLIT_MAX_BLOCKS {
+                s = 1;
+            }
+            while s > 1 && (s > cap || !ok(s)) {
+                s -= 1;
+            }
+            s
+        };
+        let sp = sp as u32; // 活过 launch 的 place（kernel_args! 取地址，临时值会被栈槽复用）
         let args = crate::kernel_args![*q, *k, *v, *a, *b, *a_log, *dt_bias, *state, *core_out,
             *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps,
-            self.scratch, *specs];
+            self.scratch, *specs, sp];
+        let grid = n_rows * v_heads * sp;
         if e2 {
-            assert!(n_rows as usize * v_heads as usize <= DELTA_BLOCK_CAP,
-                "deltanet 块数 {} 超 scratch 容量 {DELTA_BLOCK_CAP}", n_rows * v_heads);
+            assert!((grid as usize) <= DELTA_BLOCK_CAP,
+                "deltanet 块数 {grid} 超 scratch 容量 {DELTA_BLOCK_CAP}");
         }
-        let grid = n_rows * v_heads;
         let bdim = if !e2 {
             v_dim
+        } else if sp > 1 {
+            DELTA_SPLIT_BLOCK_DIM as u32
         } else if (grid as usize) <= DELTA_WIDE_GRID_MAX {
             DELTA_WIDE_BLOCK_DIM as u32
         } else {

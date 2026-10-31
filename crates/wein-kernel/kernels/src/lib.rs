@@ -1320,6 +1320,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     l2_eps: f32,
     scratch: *mut f32, // [块, 1024]——E2 kvm/o 两级折叠槽（op 预分配，块按 blockIdx 私有）
     specs: *const u32, // [rows] 逐 span：0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
+    vsplit: u32, // E2 chunked：v 行切分数（1 = 不切；grid = rows×v_heads×vsplit）
 ) {
     let (kd, vd) = (k_dim as usize, v_dim as usize);
     let vh = v_heads as usize;
@@ -1337,11 +1338,27 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     // 4 行：u64 在途 ×4 藏 DRAM 时延、屏障 16/token；k/q 切片每 token
     // 载一次复用整段行。行/槽下标全 literal 宏展开（[u64;4] 动态索引
     // 会落 local memory）
+    //
+    // B 档 chunked（保守档，`vsplit` > 1）：块从 (行, v 头) 扩成
+    // (行, v 头, v 行块)，每块只负责 vd/vsplit 个连续 v 行（vbase 起）。
+    // 切块**只改"哪个 block 负责哪几行"**：每行的 kvm/o 折叠树、元素级
+    // 表达式、批内槽位算术序全部逐字不变 ⇒ 位级输出与不切块同（v 行彼此
+    // 独立、归约在 warp 内的 32 lane 上，块边界不切任何一条依赖链）。
+    // 状态读/写按行私有（state[v][kd]），块间不共享 ⇒ 无 scratch 广播、
+    // 无重复状态读；唯一的重复读是块内每 token 各载一次的 q/k 切片与
+    // l2norm（每块 2×kd bf16 + 256 flop），vsplit 倍于不切块时的量。
     if kd == 128 && vd == 128 {
         let bid = _block_idx_x() as usize;
-        if bid >= n_rows as usize * vh {
+        let nsp = if vsplit == 0 { 1 } else { vsplit as usize };
+        if bid >= n_rows as usize * vh * nsp {
             return;
         }
+        // (r, h, chunk) ← bid：chunk 是最内维（同 (行, v 头) 的 v 行块相邻）
+        let chunk = urem(bid, nsp);
+        let rest = udiv(bid, nsp);
+        let (r, h) = (udiv(rest, vh), urem(rest, vh));
+        let rows_pb = udiv(vd, nsp); // 本块负责的 v 行数
+        let vbase = chunk * rows_pb; // 本块首 v 行
         // ── specs[r]==1：逐位置 state 行（MTP 验证链的零拷贝回滚）──
         // 逐 span 取标志（不是整批标量）：同一步里链行与其他请求的普通行
         // 同批——只有链段走逐位置落盘，其余段仍走下面的 spec==0 路径。
@@ -1352,13 +1369,12 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         // 元素级表达式/归约树与下方 spec==0 路径逐字同式（这里是拷贝而非改
         // 公共代码）——spec==0 的文本与算术序原样不动，位对齐合同与寄存器
         // 占用都不受影响。读基址 sbase 与写基址 swrite 分离、逐 token 推进。
-        if *specs.add(udiv(bid, vh)) != 0 {
-            let (r, h) = (udiv(bid, vh), urem(bid, vh));
+        if *specs.add(r) != 0 {
             let kh = h * k_heads as usize / vh;
             let t = _thread_idx_x() as usize;
             let (w, s) = (t >> 5, t & 31);
             let nwarps = _block_dim_x() as usize >> 5;
-            let rows_pw = udiv(vd, nwarps);
+            let rows_pw = udiv(rows_pb, nwarps); // 本 warp 行数（切块后 = vd/(vsplit·nwarps)）
             let big_a = expf(*a_log.add(h));
             let dtb = bf16_to_f32(*dt_bias.add(h));
             let st = *row_start.add(r) as usize;
@@ -1396,7 +1412,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                 let (q2, q3) = (f32::from_bits(qhi << 16), f32::from_bits(qhi & 0xffff_0000));
                 let obase = (g * vh + h) * vd;
                 let swrite = sbase.add(stride); // 本 token 的落盘行 = 读行 + 1
-                let mut vrow = w * rows_pw; // warp 行段游标（批 4 行步进）
+                let mut vrow = vbase + w * rows_pw; // warp 行段游标（批 4 行步进）
                 // 同 dn_e2!，写指针显式传入（swrite = 读基址 + 1 行）
                 macro_rules! dn_e2w {
                     ($sw:expr, $ww:expr, $b:literal) => {{
@@ -1434,7 +1450,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                         *wslot.add($b * 32 + s) = kvm;
                     }};
                 }
-                while vrow < (w + 1) * rows_pw {
+                while vrow < vbase + (w + 1) * rows_pw {
                     let w0 = *(sbase.add((vrow + 0) * kd + s * 4) as *const u64);
                     let w1 = *(sbase.add((vrow + 1) * kd + s * 4) as *const u64);
                     let w2 = *(sbase.add((vrow + 2) * kd + s * 4) as *const u64);
@@ -1464,15 +1480,16 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             }
             return;
         }
-        let (r, h) = (udiv(bid, vh), urem(bid, vh));
         let kh = h * k_heads as usize / vh;
         let t = _thread_idx_x() as usize;
         let (w, s) = (t >> 5, t & 31); // warp = 行段号；lane = j 切片号
-        // 并行度旋钮：block 宽 ÷ 32 = warp 数，vd 行按 warp 等分（128 线程 = 旧
-        // 4 warp × 32 行；256 线程 = 8 × 16）。v 行彼此独立 ⇒ 行内 32 lane 折叠
-        // 树、批内算术序完全不变
+        // 并行度旋钮：block 宽 ÷ 32 = warp 数，本块的 rows_pb 行按 warp 等分
+        // （128 线程 = 4 warp、256 线程 = 8 warp；vsplit=1 时 vd 行按 warp 等分
+        // —— 128 线程 = 旧 4 warp × 32 行、256 线程 = 8 × 16；vsplit>1 时每块
+        // 只吃 vd/vsplit 行）。v 行彼此独立 ⇒ 行内 32 lane 折叠树、批内算术序
+        // 完全不变
         let nwarps = _block_dim_x() as usize >> 5;
-        let rows_pw = udiv(vd, nwarps);
+        let rows_pw = udiv(rows_pb, nwarps);
         let big_a = expf(*a_log.add(h));
         let dtb = bf16_to_f32(*dt_bias.add(h));
         let st = *row_start.add(r) as usize;
@@ -1621,92 +1638,58 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     *wslot.add($b * 32 + s) = kvm;
                 }};
             }
-            // 批 16 行（8 批 → 2 批/token，屏障 16 道 → 4 道）：kvm 趟 →
-            //（屏障）→ 更新趟 + o 部分和（屏障）→ o 折叠 + core_out。
-            // scratch 槽位是批内行号 0..15（warp 私有区 16×32 槽）。**每行自己的
+            // 批 n 行（rows_pw / n 批 ⇒ 屏障 2 道/批）：kvm 趟 →（屏障）→
+            // 更新趟 + o 部分和（屏障）→ o 折叠 + core_out。scratch 槽位是批内
+            // 行号 0..n-1（warp 私有区，槽址 = b·32 + lane）。**每行自己的
             // kvm/o 折叠算术序一个字不动**（切片内 j 升序 4 项 + 跨 lane u 升序
-            // 32 项两级折叠，与 4 行批逐字同式）——变的只是分组：16 行共一道屏障，
-            // S0 一次取齐 16 行（u64 在途 ×16 vs 旧 4）。
-            // o 折叠仍是 4 行一组、lane 0..3 分领（16 lanes 分领时 o 槽 128B 跨步
-            // 打点组从 ×4 变 ×16，实测更慢且无必要——行内 u 升序折叠序不变）
+            // 32 项两级折叠，16/8/4 行批逐字同式）——变的只是分组：同批共一道
+            // 屏障、S0 一次取齐 n 行（u64 在途 ×n vs 旧 4）。
+            // o 折叠仍是 4 行一组、lane 0..3 分领（32 lanes 分领时 o 槽 128B
+            // 跨步打点组过大，实测更慢且无必要——行内 u 升序折叠序不变）。
+            //
+            // 批内行号 / o 组首行号由宏参数列表给**字面量**：`[u64;16]` 的常量
+            // 下标 ⇒ SROA 提到寄存器（动态下标会落 local memory，见上）。
             macro_rules! dn_batch {
-                ($vr:expr) => {{
+                ($vr:expr, [$($r:literal)*], [$($g:literal)*]) => {{
                     let vrow = $vr;
-                    // kvm 趟：16 行的 S0 一次取齐（u64 在途 ×16 藏 DRAM 时延；行 stride 256B），
-                    // 每行的 kvm 部分和按切片内 j 升序 4 项折叠落槽（逐字同旧 4 行批）
-                    let w0 = *(sbase.add((vrow + 0) * kd + s * 4) as *const u64);
-                    let w1 = *(sbase.add((vrow + 1) * kd + s * 4) as *const u64);
-                    let w2 = *(sbase.add((vrow + 2) * kd + s * 4) as *const u64);
-                    let w3 = *(sbase.add((vrow + 3) * kd + s * 4) as *const u64);
-                    let w4 = *(sbase.add((vrow + 4) * kd + s * 4) as *const u64);
-                    let w5 = *(sbase.add((vrow + 5) * kd + s * 4) as *const u64);
-                    let w6 = *(sbase.add((vrow + 6) * kd + s * 4) as *const u64);
-                    let w7 = *(sbase.add((vrow + 7) * kd + s * 4) as *const u64);
-                    let w8 = *(sbase.add((vrow + 8) * kd + s * 4) as *const u64);
-                    let w9 = *(sbase.add((vrow + 9) * kd + s * 4) as *const u64);
-                    let w10 = *(sbase.add((vrow + 10) * kd + s * 4) as *const u64);
-                    let w11 = *(sbase.add((vrow + 11) * kd + s * 4) as *const u64);
-                    let w12 = *(sbase.add((vrow + 12) * kd + s * 4) as *const u64);
-                    let w13 = *(sbase.add((vrow + 13) * kd + s * 4) as *const u64);
-                    let w14 = *(sbase.add((vrow + 14) * kd + s * 4) as *const u64);
-                    let w15 = *(sbase.add((vrow + 15) * kd + s * 4) as *const u64);
-                    kvm4e!(w0, 0); kvm4e!(w1, 1); kvm4e!(w2, 2); kvm4e!(w3, 3);
-                    kvm4e!(w4, 4); kvm4e!(w5, 5); kvm4e!(w6, 6); kvm4e!(w7, 7);
-                    kvm4e!(w8, 8); kvm4e!(w9, 9); kvm4e!(w10, 10); kvm4e!(w11, 11);
-                    kvm4e!(w12, 12); kvm4e!(w13, 13); kvm4e!(w14, 14); kvm4e!(w15, 15);
+                    let mut sw = [0u64; 16];
+                    // kvm 趟：n 行的 S0 一次取齐（u64 在途 ×n 藏 DRAM 时延；行
+                    // stride 256B），每行的 kvm 部分和按切片内 j 升序 4 项折叠
+                    // 落槽（逐字同 4 行批）
+                    $( sw[$r] = *(sbase.add((vrow + $r) * kd + s * 4) as *const u64); )*
+                    $( kvm4e!(sw[$r], $r); )*
                     _syncthreads();
-                    // 更新趟：直接用持有的 w0..w15（S0 一行只读一次——状态流 2 趟）
-                    *(sbase.add((vrow + 0) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w0, obase + vrow + 0, 0);
-                    *(sbase.add((vrow + 1) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w1, obase + vrow + 1, 1);
-                    *(sbase.add((vrow + 2) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w2, obase + vrow + 2, 2);
-                    *(sbase.add((vrow + 3) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w3, obase + vrow + 3, 3);
-                    *(sbase.add((vrow + 4) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w4, obase + vrow + 4, 4);
-                    *(sbase.add((vrow + 5) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w5, obase + vrow + 5, 5);
-                    *(sbase.add((vrow + 6) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w6, obase + vrow + 6, 6);
-                    *(sbase.add((vrow + 7) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w7, obase + vrow + 7, 7);
-                    *(sbase.add((vrow + 8) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w8, obase + vrow + 8, 8);
-                    *(sbase.add((vrow + 9) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w9, obase + vrow + 9, 9);
-                    *(sbase.add((vrow + 10) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w10, obase + vrow + 10, 10);
-                    *(sbase.add((vrow + 11) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w11, obase + vrow + 11, 11);
-                    *(sbase.add((vrow + 12) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w12, obase + vrow + 12, 12);
-                    *(sbase.add((vrow + 13) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w13, obase + vrow + 13, 13);
-                    *(sbase.add((vrow + 14) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w14, obase + vrow + 14, 14);
-                    *(sbase.add((vrow + 15) * kd + s * 4) as *mut u64) =
-                        dn_e2!(w15, obase + vrow + 15, 15);
+                    // 更新趟：直接用持有的 sw[..]（S0 一行只读一次——状态流 2 趟）
+                    $( { let nw = dn_e2!(sw[$r], obase + vrow + $r, $r);
+                         sw[$r] = nw;
+                         *(sbase.add((vrow + $r) * kd + s * 4) as *mut u64) = nw; } )*
                     _syncthreads();
-                    // o 两级折叠第二级 + core_out 落点：4 行一组由 lane 0..3 分领（访问形态与
-                    // 旧 4 行批逐字同；16 lanes 分领实测更慢——o 槽 128B 跨步 x16 打点组过大）
+                    // o 两级折叠第二级 + core_out 落点：4 行一组由 lane 0..3
+                    // 分领（访问形态与旧 4 行批逐字同）
                     if s < 4 {
-                        let o0 = fold32!(oslot.add((0 + s) * 32));
-                        *core_out.add(obase + vrow + 0 + s) = f32_to_bf16(o0);
-                        let o4 = fold32!(oslot.add((4 + s) * 32));
-                        *core_out.add(obase + vrow + 4 + s) = f32_to_bf16(o4);
-                        let o8 = fold32!(oslot.add((8 + s) * 32));
-                        *core_out.add(obase + vrow + 8 + s) = f32_to_bf16(o8);
-                        let o12 = fold32!(oslot.add((12 + s) * 32));
-                        *core_out.add(obase + vrow + 12 + s) = f32_to_bf16(o12);
+                        $( { let o = fold32!(oslot.add(($g + s) * 32));
+                             *core_out.add(obase + vrow + $g + s) = f32_to_bf16(o); } )*
                     }
                 }};
             }
-            let mut vrow = w * rows_pw;
-            while vrow < (w + 1) * rows_pw {
-                dn_batch!(vrow);
-                vrow += 16;
+            // 批 = min(16, rows_pw)（rows_pw 32/16 → 批 16；8 → 批 8；4 → 批 4）：
+            // 批大小只改屏障密度与在途 u64 数，不改任何一行的算术
+            let mut vrow = vbase + w * rows_pw;
+            if rows_pw >= 16 {
+                while vrow < vbase + (w + 1) * rows_pw {
+                    dn_batch!(vrow, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15], [0 4 8 12]);
+                    vrow += 16;
+                }
+            } else if rows_pw >= 8 {
+                while vrow < vbase + (w + 1) * rows_pw {
+                    dn_batch!(vrow, [0 1 2 3 4 5 6 7], [0 4]);
+                    vrow += 8;
+                }
+            } else {
+                while vrow < vbase + (w + 1) * rows_pw {
+                    dn_batch!(vrow, [0 1 2 3], [0]);
+                    vrow += 4;
+                }
             }
             i += 1;
         }

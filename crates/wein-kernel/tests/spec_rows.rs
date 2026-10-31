@@ -147,17 +147,19 @@ fn o27_deltanet_spec_rows() {
         gpu.alloc_from_slice(&[base]),
     );
     let dout = gpu.alloc_bytes(cnt * vh * vd * 2);
-    let launch = |dstate: &wein_kernel::cuda::DevBuf, specs: &wein_kernel::cuda::DevBuf| {
+    let launch = |dstate: &wein_kernel::cuda::DevBuf,
+                  specs: &wein_kernel::cuda::DevBuf,
+                  split: u32| {
         t.deltanet.run(
             &dq, &dk, &dv, &da, &db, &da_log, &ddtb, dstate, &dout, &drs, &drc, &drid, 1,
-            kh as u32, vh as u32, kd as u32, vd as u32, eps, specs, &stream,
+            kh as u32, vh as u32, kd as u32, vd as u32, eps, specs, split, &stream,
         );
     };
 
     // spec==0 回归：单段单行递推 ≡ reference（位对齐合同）
     let ds0 = gpu.alloc_from_slice(&init);
     let dspec0 = gpu.alloc_from_slice(&[0u32]);
-    launch(&ds0, &dspec0);
+    launch(&ds0, &dspec0, 1);
     stream.sync();
     let got0: Vec<u16> = ds0.read_to_vec();
     let out0: Vec<u16> = dout.read_to_vec();
@@ -172,7 +174,7 @@ fn o27_deltanet_spec_rows() {
     // spec==1：逐位置行 —— 行 base+j ≡ 前 j 个 token 的独立结果
     let ds1 = gpu.alloc_from_slice(&init);
     let dspec1 = gpu.alloc_from_slice(&[1u32]);
-    launch(&ds1, &dspec1);
+    launch(&ds1, &dspec1, 1);
     stream.sync();
     let got: Vec<u16> = ds1.read_to_vec();
     let out1: Vec<u16> = dout.read_to_vec();
@@ -194,6 +196,11 @@ fn o27_deltanet_spec_rows() {
             &out_j[..j * per_tok],
         );
     }
+    // B 档 chunked 不变性：同一 spec==1 形状按 v 行切 4 块 ⇒ 逐位同上
+    let ds1c = gpu.alloc_from_slice(&init);
+    launch(&ds1c, &dspec1, 4);
+    stream.sync();
+    assert_bits("deltanet spec==1 切 4 块 ≡ 不切块", &ds1c.read_to_vec(), &got);
     // 链首行仍是旧状态（spec 分支读它、不写它）
     assert_bits(
         "deltanet 链首行保持旧状态",
