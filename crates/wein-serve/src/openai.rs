@@ -76,7 +76,22 @@ pub fn finish_reason_str(r: FinishReason) -> &'static str {
     match r {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
-        // OpenAI 协议无 aborted；客户端断开时响应本就无人收
-        FinishReason::Aborted => "stop",
+        // **兼容性取舍**：OpenAI 规范的 finish_reason 只有 stop/length/
+        // content_filter/tool_calls，没有 "error"。把"引擎侧异常终结"
+        // （`Done{Aborted}`、执行器可恢复失败 `StepError::Invalid`）报成
+        // stop/length 会让客户端把**截断/失败**当成正常完成——这正是旧实现
+        // 的可用性缺陷。故这里输出规范的超集值 "error"，并在非流式 body
+        // 顶层附 `wein_finish`（"aborted"/"error"）、流式在终止帧前先发
+        // `event: error`，客户端可无歧义判别（`tests/recovery.rs` 钉死）。
+        FinishReason::Aborted | FinishReason::Error => "error",
+    }
+}
+
+/// 非流式 body 的可判别字段值（`wein_finish`）：只有异常收尾才 Some。
+pub fn wein_finish(r: FinishReason) -> Option<&'static str> {
+    match r {
+        FinishReason::Aborted => Some("aborted"),
+        FinishReason::Error => Some("error"),
+        FinishReason::Stop | FinishReason::Length => None,
     }
 }

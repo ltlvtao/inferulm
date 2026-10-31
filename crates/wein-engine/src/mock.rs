@@ -60,11 +60,20 @@ pub struct MockEngine;
 
 impl MockEngine {
     /// 启动 mock 引擎任务，返回 (serve 用的句柄, 断言用的状态)。
+    ///
+    /// 句柄带一个**有限的**上下文窗口（4096）：`max_tokens` 缺省 = ctx_limit -
+    /// prompt_tokens - 1 是 serve 的合同，mock 若不报窗口就会缺省成"无上限"
+    /// 而无限流。MockScript 不在意窗口大小——它只按 max_tokens 吐 token
     pub fn spawn(script: MockScript) -> (EngineHandle, Arc<MockState>) {
+        /// 替身引擎声明的上下文窗口（够任何验收请求用，且使"缺省 max_tokens"
+        /// 落在可终止区间内）
+        const MOCK_CTX_LIMIT: usize = 4096;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new(MockState::default());
+        let stats = Arc::new(crate::EngineStats::default());
+        stats.set_ctx_limit(MOCK_CTX_LIMIT);
         tokio::spawn(Self::run(script, cmd_rx, state.clone()));
-        (EngineHandle::new(cmd_tx), state)
+        (EngineHandle::new(cmd_tx).with_stats(stats), state)
     }
 
     async fn run(script: MockScript, mut cmd_rx: UnboundedReceiver<EngineCommand>, state: Arc<MockState>) {

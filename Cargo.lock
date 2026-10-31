@@ -2044,6 +2044,7 @@ dependencies = [
  "wein-exec",
  "wein-memory",
  "wein-model",
+ "wein-sched",
 ]
 
 [[package]]

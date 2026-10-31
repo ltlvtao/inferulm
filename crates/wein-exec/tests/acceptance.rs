@@ -128,7 +128,7 @@ async fn x6_engine_integration() {
     let (handle, stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
     let prompt = vec![3u32, 17, 5, 9, 2];
-    let (_id, mut rx) = handle.submit(prompt.clone(), 8, SamplingParams::default());
+    let (_id, mut rx) = handle.submit(prompt.clone(), 8, SamplingParams::default()).expect("engine alive");
     let mut toks = Vec::new();
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -148,7 +148,7 @@ async fn x6_engine_integration() {
     // multi_thread flavor 必须：step_delay=0 时 sleep(ZERO) 立即就绪不 yield，
     // 单线程 runtime 里引擎任务会独占线程自由跑——toy 的 max_pos=256 上限
     // 会被冲破（真发现：exec 的位置上限是 caller 合同，max_tokens 须 ≤ 上限）
-    let (id2, mut rx2) = handle.submit(vec![1, 2, 3], 1_000, SamplingParams::default());
+    let (id2, mut rx2) = handle.submit(vec![1, 2, 3], 1_000, SamplingParams::default()).expect("engine alive");
     loop {
         match rx2.recv().await {
             Some(EngineEvent::Token(_)) => break,

@@ -29,7 +29,7 @@ async fn w4_engine_integration() {
     let (handle, stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
     let prompt = vec![3u32, 17, 5, 9, 2];
-    let (_id, mut rx) = handle.submit(prompt.clone(), 10, SamplingParams::default());
+    let (_id, mut rx) = handle.submit(prompt.clone(), 10, SamplingParams::default()).expect("engine alive");
     let mut toks = Vec::new();
     while let Some(ev) = rx.recv().await {
         match ev {

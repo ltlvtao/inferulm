@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wein_engine::{CoreConfig, EngineCore, EngineHandle, MockEngine, MockScript};
-use wein_serve::{spawn_server, MockTokenizer, ServeState, Tokenizer};
+use wein_serve::{spawn_server_guarded, MockTokenizer, ServeState, Tokenizer};
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
     args.iter()
@@ -68,6 +68,8 @@ fn main() {
     let exec_kind = arg(&args, "--exec", "scripted");
     let prefill_ms: u64 = arg(&args, "--prefill-delay-ms", "2").parse().unwrap();
     let token_ms: u64 = arg(&args, "--token-delay-ms", "1").parse().unwrap();
+    // SIGINT/SIGTERM 后的 drain 上限：等完在飞请求再退，超时强制退出并列出未完成
+    let drain_ms: u64 = arg(&args, "--drain-timeout-ms", "5000").parse().unwrap_or(5000);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
@@ -144,6 +146,18 @@ fn main() {
                             std::process::exit(1)
                         });
                     }
+                    // --memory：BlockPool 水位准入 + radix 前缀缓存（真模型路径
+                    // 与 toy/scripted 同一套尺子）。块几何取自执行器自己的
+                    // 页池常量（KV 页 16 token × 512 页）——不在 cli 里抄魔数。
+                    // 溢出策略走既有 `PoolCapacity`：先 preempt（recompute），
+                    // 批内仅剩自己才 abort（engine/core.rs 的 forced 路径）
+                    if args.iter().any(|a| a == "--memory") {
+                        cfg.memory = Some(wein_memory::state::MemConfig {
+                            block_size: wein_exec::KV_BLOCK,
+                            num_blocks: wein_exec::KV_PAGES,
+                            low_watermark: 0.1,
+                        });
+                    }
                     cfg
                 },
                 Box::new(ex),
@@ -188,10 +202,12 @@ fn main() {
             };
             (engine, Arc::new(mock_tok))
         };
-        let state = ServeState { model_id: model.clone(), tokenizer: tok, engine };
-        let addr = spawn_server(state, format!("0.0.0.0:{port}").parse().unwrap())
+        let ctx_limit = engine.ctx_limit();
+        let state = ServeState::new(model.clone(), tok, engine);
+        let server = spawn_server_guarded(state, format!("0.0.0.0:{port}").parse().unwrap())
             .await
             .expect("bind failed");
+        let addr = server.addr;
         let mem_tag = if args.iter().any(|a| a == "--memory") { "+memory" } else { "" };
         let graph_tag = if use_graph { "+graph" } else { "" };
         let exec_tag = if engine_kind == "core" && exec_kind == "toy" {
@@ -201,7 +217,51 @@ fn main() {
         } else {
             graph_tag.to_string()
         };
-        println!("wein ({engine_kind}{mem_tag}{exec_tag}) listening on http://{addr}  model={model}");
-        tokio::signal::ctrl_c().await.ok();
+        println!(
+            "wein ({engine_kind}{mem_tag}{exec_tag}) listening on http://{addr}  model={model} \
+             ctx_limit={ctx_limit} drain_timeout={drain_ms}ms"
+        );
+        // SIGINT + SIGTERM 同一路径：停止接纳 → 等在飞 ≤ drain_ms → 退出码 0
+        let sig = wait_for_signal().await;
+        println!("收到 {sig}：停止接纳新请求，drain 上限 {drain_ms}ms");
+        let left = server.shutdown(Duration::from_millis(drain_ms)).await;
+        if left.is_empty() {
+            println!("drain 完成（无在飞请求）：退出码 0");
+        } else {
+            println!("drain 超时：强制退出，未完成请求 {} 个：", left.len());
+            for (engine_id, request_id) in &left {
+                println!("  未完成 request_id={request_id}（引擎 #{engine_id}）");
+            }
+        }
+        // 退出码 0：drain 超时也算"已尽力"——编排层看的是日志里的未完成清单
+        std::process::exit(0);
     });
+}
+
+/// 等 SIGINT 或 SIGTERM（返回信号名）。
+///
+/// 旧实现只等 `ctrl_c()`：容器/编排层发 SIGTERM（docker stop、systemd）时
+/// 进程被直接杀掉——在飞请求全断、退出码 143。现在两者同一路径：
+/// 停止接纳 → drain → 退出码 0。
+#[cfg(unix)]
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SIGTERM 处理注册失败（退回只接 SIGINT）：{e}");
+            tokio::signal::ctrl_c().await.ok();
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() -> &'static str {
+    tokio::signal::ctrl_c().await.ok();
+    "SIGINT"
 }

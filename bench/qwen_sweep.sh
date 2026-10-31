@@ -24,7 +24,7 @@ run_mode () {  # $1=tag，$2..=wein-cli 附加旗标
       >/dev/null 2>&1 &
   local pid=$!
   trap "kill $pid 2>/dev/null || true" EXIT
-  until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$DIR"; do sleep 0.2; done
+  until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.2; done
   for c in $CONC; do
     echo "-- $tag · c=$c n=$c mt=32 --"
     "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --model "$DIR" --concurrency "$c" --num "$c" \

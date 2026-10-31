@@ -107,15 +107,38 @@ impl CapacityModel for PoolCapacity {
 }
 
 /// 引擎侧可断言状态（对应 MockState 的角色；BASELINE §4 L2 插桩的载体）。
-#[derive(Default)]
+/// 全部字段是无锁原子量——serve 的 `/health`、`/metrics` 直接读这里。
 pub struct EngineStats {
     accepted: AtomicUsize,
     cancelled: AtomicUsize,
     finished: AtomicUsize,
     preempted: AtomicUsize,
     steps: AtomicU64,
+    /// 上一步的批行数（gauge：exec 单步前向的行数 = prefill token + decode 行）
+    batch_rows: AtomicUsize,
+    /// 前缀缓存命中 token 累计（执行器 `admitted` 上报的恢复量之和）
+    prefix_hit_tokens: AtomicU64,
+    /// 执行器上下文窗口（serve 前置校验用；`usize::MAX` = 无上限）
+    ctx_limit: AtomicUsize,
     /// 内存层快照（每步末刷新；未启用内存层时恒为默认值）
     mem: Mutex<MemStats>,
+}
+
+impl Default for EngineStats {
+    fn default() -> Self {
+        Self {
+            accepted: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            preempted: AtomicUsize::new(0),
+            steps: AtomicU64::new(0),
+            batch_rows: AtomicUsize::new(0),
+            prefix_hit_tokens: AtomicU64::new(0),
+            // AtomicUsize::default() = 0 会被误读成"上下文窗口为 0"
+            ctx_limit: AtomicUsize::new(usize::MAX),
+            mem: Mutex::new(MemStats::default()),
+        }
+    }
 }
 
 impl EngineStats {
@@ -134,8 +157,45 @@ impl EngineStats {
     pub fn step_count(&self) -> u64 {
         self.steps.load(Ordering::Relaxed)
     }
+    /// 上一步的批行数（gauge）
+    pub fn batch_rows(&self) -> usize {
+        self.batch_rows.load(Ordering::Relaxed)
+    }
+    pub fn prefix_hit_tokens(&self) -> u64 {
+        self.prefix_hit_tokens.load(Ordering::Relaxed)
+    }
+    pub fn ctx_limit(&self) -> usize {
+        self.ctx_limit.load(Ordering::Relaxed)
+    }
+    pub fn set_ctx_limit(&self, n: usize) {
+        self.ctx_limit.store(n, Ordering::Relaxed);
+    }
     pub fn mem(&self) -> MemStats {
         self.mem.lock().expect("mem stats 锁中毒").clone()
+    }
+}
+
+/// 执行器请求级失败：**可恢复**——只终结该请求，引擎任务与同批其他请求不受影响。
+///
+/// 这是"exec 侧不再 panic"的通道：执行器在 `step`/`admitted` 内部发现页池耗尽、
+/// 行/位置上限、vocab 越界时，把该请求记进失败表（`Executor::take_failures`），
+/// 引擎在步间 drain 后按类别终结它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepError {
+    /// 容量类（页池耗尽 / 块表行耗尽 / 绝对位置超上限）= "这段装不下/到头了"
+    /// → 该请求以 `FinishReason::Length` 结束（serve: finish_reason "length"）
+    Capacity(String),
+    /// 请求本身非法或执行器真异常（vocab 越界等）
+    /// → 该请求以 `FinishReason::Error` 结束（serve: finish_reason "error"）
+    Invalid(String),
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StepError::Capacity(m) => write!(f, "容量失败：{m}"),
+            StepError::Invalid(m) => write!(f, "请求非法：{m}"),
+        }
     }
 }
 
@@ -177,6 +237,20 @@ pub trait Executor: Send {
     /// 默认 1（不对齐）——无前缀缓存的执行器账与旧版逐位一致
     fn prefix_align(&self) -> usize {
         1
+    }
+    /// 上下文窗口（token 数）：prompt + max_tokens 的上限。serve 用它做前置
+    /// 校验（越界 → 400），引擎在提交处再校验一次（兜底）。默认无上限
+    fn ctx_limit(&self) -> usize {
+        usize::MAX
+    }
+    /// 取走自上次调用以来累积的**请求级失败**（见 [`StepError`]）。
+    ///
+    /// 执行器一旦遇到页池耗尽 / 行耗尽 / 位置越界 / vocab 越界，记进本表而
+    /// **不是 panic**：panic 会让 engine 任务整体消失（在飞请求全部 Aborted、
+    /// 之后 submit 全失败 = 服务假死）。引擎在每步之后 drain 并按类别终结
+    /// 对应请求，同批其他请求照常推进。
+    fn take_failures(&mut self) -> Vec<(ReqId, StepError)> {
+        Vec::new()
     }
 }
 
@@ -229,8 +303,12 @@ impl EngineCore {
     ) -> (EngineHandle, Arc<EngineStats>) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let stats = Arc::new(EngineStats::default());
+        // 执行器上报的上下文窗口进 stats（serve 经 handle.ctx_limit() 读，
+        // 引擎在提交处也用它兜底）——须在执行器 move 进任务之前取
+        stats.set_ctx_limit(exec.ctx_limit());
+        let handle = EngineHandle::new(cmd_tx).with_stats(stats.clone());
         tokio::spawn(Self::run(cfg, cmd_rx, stats.clone(), exec));
-        (EngineHandle::new(cmd_tx), stats)
+        (handle, stats)
     }
 
     async fn run(
@@ -282,6 +360,12 @@ impl EngineCore {
                 Self::pump(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 let plan = sched.plan();
                 stats.steps.fetch_add(1, Ordering::Relaxed);
+                // gauge：本步前向行数（prefill token 数 + decode 行数）
+                stats.batch_rows.store(
+                    plan.prefill.iter().map(|&(_, n)| n as usize).sum::<usize>()
+                        + plan.decode.len(),
+                    Ordering::Relaxed,
+                );
                 if !cfg.step_delay.is_zero() {
                     sleep(cfg.step_delay).await;
                 }
@@ -317,6 +401,10 @@ impl EngineCore {
                         sched.cancel(id);
                     }
                 }
+                // 执行器请求级失败（页池耗尽/vocab 越界/位置越界…）：**不 panic**，
+                // 只终结该请求。放在本步 token 发射之后：同批其他请求的 token
+                // 已经出去了，不受影响
+                Self::settle_failures(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 // 强制抢占：内存层报的失败者（块耗尽/批空放不下的超大请求）。
                 // preempt 被拒（批内仅剩此请求）→ abort 兜底
                 let forced: Vec<ReqId> = match sched.capacity_mut().as_any_mut() {
@@ -392,16 +480,36 @@ impl EngineCore {
                 if let Some(tx) = senders.get(&id) {
                     let _ = tx.send(EngineEvent::Accepted);
                 }
+                // 上下文窗口兜底（serve 已前置校验 → 400；这里防直连引擎的
+                // 调用方绕过校验）：prompt 本身已吃满窗口 → 一个位置都没有，
+                // 直接以 Error 终结。**只查 prompt**：prompt+max_tokens 越界
+                // 是容量问题不是协议问题——让它进调度器，跑到窗口尽头由执行器
+                // 报 Capacity → finish_reason=length（客户端能拿到部分结果）
+                let ctx = stats.ctx_limit();
+                if ctx != usize::MAX && prompt_token_ids.len() >= ctx {
+                    tracing::warn!(
+                        request = id,
+                        prompt_tokens = prompt_token_ids.len(),
+                        ctx_limit = ctx,
+                        "prompt 已吃满上下文窗口，直接以 Error 终结"
+                    );
+                    stats.cancelled.fetch_add(1, Ordering::Relaxed);
+                    if let Some(tx) = senders.remove(&id) {
+                        let _ = tx.send(EngineEvent::Finished(FinishReason::Error));
+                    }
+                    stops.remove(&id);
+                    return;
+                }
                 // 采样参数先过执行器校验（设备侧能力边界：top_k ≤ 64 的
                 // top-k/top-p；全词表 top_k=0 不可满足）。不可满足 → 不进
                 // 调度器、不建行，直接终结（serve 侧表现为 Aborted/400）：
                 // 让它跑起来再中途出错会把错序列吐给客户端
                 if let Err(e) = exec.set_sampling(id, sp) {
-                    eprintln!("[engine] 采样参数不可满足 id={id}：{e}");
+                    tracing::warn!(request = id, "采样参数不可满足，请求以 Error 终结：{e}");
                     sched.cancel(id);
                     stats.cancelled.fetch_add(1, Ordering::Relaxed);
                     if let Some(tx) = senders.remove(&id) {
-                        let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
+                        let _ = tx.send(EngineEvent::Finished(FinishReason::Error));
                     }
                     stops.remove(&id);
                     return;
@@ -426,14 +534,54 @@ impl EngineCore {
         stats: &EngineStats,
         id: RequestId,
     ) {
+        Self::terminate(sched, senders, stops, prompts, stats, id, FinishReason::Aborted);
+    }
+
+    /// 以指定原因终结一个请求（取消 / 执行器失败共用一支路径）。
+    /// 幂等：终结过一次后再调无副作用（sender 已除名则不再发事件、不再计数）
+    fn terminate(
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
+        stats: &EngineStats,
+        id: RequestId,
+        reason: FinishReason,
+    ) {
         stops.remove(&id);
         prompts.remove(&id);
-        if !sched.cancel(id) {
-            return;
+        let known = sched.cancel(id);
+        if let Some(tx) = senders.remove(&id) {
+            if known {
+                stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = tx.send(EngineEvent::Finished(reason));
         }
-        stats.cancelled.fetch_add(1, Ordering::Relaxed);
-        if let Some(tx) = senders.get(&id) {
-            let _ = tx.send(EngineEvent::Finished(FinishReason::Aborted));
+    }
+
+    /// 执行器请求级失败 → 按类别终结（容量类 = Length，其余 = Error）。
+    /// 这是"exec 不再 panic"的落地处：只有失败者离场，引擎任务与同批其他
+    /// 请求继续跑（旧实现里一次 assert 就带走整个引擎任务 = 服务假死）
+    fn settle_failures(
+        sched: &mut Scheduler,
+        senders: &mut HashMap<RequestId, UnboundedSender<EngineEvent>>,
+        stops: &mut HashMap<RequestId, Vec<u32>>,
+        prompts: &mut HashMap<RequestId, Vec<u32>>,
+        stats: &EngineStats,
+        exec: &mut Box<dyn Executor>,
+    ) {
+        for (id, err) in exec.take_failures() {
+            let reason = match &err {
+                StepError::Capacity(m) => {
+                    tracing::warn!(request = id, "执行器容量不足 → 该请求以 length 结束：{m}");
+                    FinishReason::Length
+                }
+                StepError::Invalid(m) => {
+                    tracing::warn!(request = id, "执行器请求级失败 → 该请求以 error 结束：{m}");
+                    FinishReason::Error
+                }
+            };
+            Self::terminate(sched, senders, stops, prompts, stats, id, reason);
         }
     }
 
@@ -486,9 +634,14 @@ impl EngineCore {
                         // 前缀缓存命中对账：exec 已恢复的状态让调度债等量消减
                         // （预算切片/mix_cap/追平判定按剩余段计算）
                         sched.prefix_hit(id, hit);
+                        // 观测口（/metrics 的 wein_prefix_hit_tokens_total）
+                        stats.prefix_hit_tokens.fetch_add(hit as u64, Ordering::Relaxed);
                     }
                 }
             }
+            // 建行失败（vocab 越界 / 行耗尽）→ 该请求以 Error/Length 结束，
+            // 同批其他请求不受影响（绝不 panic）
+            Self::settle_failures(sched, senders, stops, prompts, stats, exec);
         }
     }
 }

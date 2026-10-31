@@ -30,13 +30,14 @@ export WEIN_PROFILE=$PROFILE
 mkdir -p "$OUT"
 echo "== wein battery  $STAMP  profile=$PROFILE  rev=$WEIN_GIT_REV  → $OUT =="
 
-run_suite () { # $1=tag；$2.. 传给 wein-cli 的延迟参数（模型 id = 就绪探针的 grep 目标）
+run_suite () { # $1=tag；$2.. 传给 wein-cli 的延迟参数
   local tag=$1; shift
-  local ready=${WEIN_READY:-mock-model}
   "$BIN/wein-cli" --port "$PORT" "$@" >/dev/null 2>&1 &
   local pid=$!
   trap "kill $pid 2>/dev/null || true" EXIT
-  until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -q "$ready"; do sleep 0.2; done
+  # 就绪探针 = /health 的 status（引擎活即 ok）；旧探针用 /v1/models 的模型 id，
+  # 那只证明进程在监听，不证明执行器没死——引擎任务退出后 /v1/models 仍是 200
+  until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.2; done
 
   echo "-- $tag · L0 router flood --"
   "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --concurrency 100 --num 20000 \
@@ -67,7 +68,7 @@ run_qwen_suite () {
       >/dev/null 2>&1 &
   local pid=$!
   trap "kill $pid 2>/dev/null || true" EXIT
-  until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$dir"; do sleep 0.2; done
+  until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.2; done
 
   echo "-- $tag · L3q streaming (轻载 c=4 n=8 max_tokens=12) --"
   "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --model "$dir" --concurrency 4 --num 8 \

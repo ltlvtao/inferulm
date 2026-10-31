@@ -18,7 +18,7 @@ run_one () { # $1=名字 $2..=cli 旗标
   env "${ENVV[@]}" "$BIN/wein-cli" --port "$PORT" --engine core --exec qwen --model "$DIR" \
       --token-delay-ms 0 "$@" >/dev/null 2>&1 &
   local pid=$!
-  until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$DIR"; do sleep 0.2; done
+  until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.2; done
   "$BIN/wein-bench" --url "http://127.0.0.1:$PORT" --model "$DIR" --concurrency 100 --num 500 \
       --max-tokens 32 --repeat 3 --warmup --json "$OUT/$name.json" \
       | grep -E '"(ttft_p50_ms|itl_p50_ms|itl_p99_ms|aggregate_tps|errors)"'

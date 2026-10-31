@@ -57,8 +57,8 @@ async fn im1_pool_pressure_preempts_and_both_finish_exactly() {
     let (engine, stats) = mem_core(2, 12, 0.25, 8);
     let expected: Vec<u32> = (0..20).map(|i| [5u32, 6, 7, 8][i % 4]).collect();
 
-    let (_a, mut sa) = engine.submit(vec![1, 2], 20, Default::default());
-    let (_b, mut sb) = engine.submit(vec![3, 4], 20, Default::default());
+    let (_a, mut sa) = engine.submit(vec![1, 2], 20, Default::default()).expect("engine alive");
+    let (_b, mut sb) = engine.submit(vec![3, 4], 20, Default::default()).expect("engine alive");
     let (ta, ra) = run_to_end(&mut sa).await;
     let (tb, rb) = run_to_end(&mut sb).await;
 
@@ -81,12 +81,12 @@ async fn im2_prefix_cache_hit_on_second_request() {
     let (engine, stats) = roomy_core();
     let prompt = vec![11u32, 22, 33, 44, 55, 66]; // 3 整块（bs=2）
 
-    let (_a, mut sa) = engine.submit(prompt.clone(), 4, Default::default());
+    let (_a, mut sa) = engine.submit(prompt.clone(), 4, Default::default()).expect("engine alive");
     run_to_end(&mut sa).await;
     let hit0 = stats.mem().cache_hit_tokens;
     assert_eq!(hit0, 0, "首请求无缓存可命中");
 
-    let (_b, mut sb) = engine.submit(prompt, 4, Default::default());
+    let (_b, mut sb) = engine.submit(prompt, 4, Default::default()).expect("engine alive");
     run_to_end(&mut sb).await;
     let hit1 = stats.mem().cache_hit_tokens;
     assert!(hit1 >= 6, "第二个请求必须命中 prompt 前缀（≥6 token），got {hit1}");
@@ -99,7 +99,7 @@ async fn im3_oversized_request_aborted_engine_alive() {
     // 4 块 × bs 2 = 8 token 容量；prompt 20 token 放不下
     let (engine, stats) = mem_core(2, 4, 0.25, 4);
 
-    let (_big, mut sb) = engine.submit(vec![7u32; 20], 4, Default::default());
+    let (_big, mut sb) = engine.submit(vec![7u32; 20], 4, Default::default()).expect("engine alive");
     assert!(matches!(next(&mut sb).await, EngineEvent::Accepted));
     let r = loop {
         match next(&mut sb).await {
@@ -113,7 +113,7 @@ async fn im3_oversized_request_aborted_engine_alive() {
     assert_eq!(stats.cancelled_count(), 1);
 
     // 引擎存活：小请求正常完成
-    let (_ok, mut sok) = engine.submit(vec![1], 3, Default::default());
+    let (_ok, mut sok) = engine.submit(vec![1], 3, Default::default()).expect("engine alive");
     let (toks, rok) = run_to_end(&mut sok).await;
     assert!(matches!(rok, FinishReason::Length));
     assert_eq!(toks, vec![5, 6, 7]);
@@ -125,7 +125,7 @@ async fn im4_protocol_invariants_hold_with_memory() {
     let (engine, _stats) = mem_core(2, 64, 0.1, 2);
 
     // 事件序：Accepted → Token×3 → Finished(Length) → 关流
-    let (_a, mut sa) = engine.submit(vec![9, 9], 3, Default::default());
+    let (_a, mut sa) = engine.submit(vec![9, 9], 3, Default::default()).expect("engine alive");
     assert!(matches!(next(&mut sa).await, EngineEvent::Accepted));
     assert!(matches!(next(&mut sa).await, EngineEvent::Token(5)));
     assert!(matches!(next(&mut sa).await, EngineEvent::Token(6)));
@@ -141,7 +141,7 @@ async fn im4_protocol_invariants_hold_with_memory() {
         memory: Some(MemConfig { block_size: 2, num_blocks: 64, low_watermark: 0.1 }),
     };
     let (engine, stats) = EngineCore::spawn(cfg);
-    let (b, mut sb_stream) = engine.submit(vec![1], 50, Default::default());
+    let (b, mut sb_stream) = engine.submit(vec![1], 50, Default::default()).expect("engine alive");
     assert!(matches!(next(&mut sb_stream).await, EngineEvent::Accepted));
     assert!(matches!(next(&mut sb_stream).await, EngineEvent::Token(5)));
     engine.cancel(b);
@@ -160,7 +160,7 @@ async fn im4_protocol_invariants_hold_with_memory() {
     assert_eq!(stats.cancelled_count(), 1);
 
     // 块真的释放了：后续请求照常（DeferredRelease 闭环）
-    let (_c, mut sc) = engine.submit(vec![2, 2], 4, Default::default());
+    let (_c, mut sc) = engine.submit(vec![2, 2], 4, Default::default()).expect("engine alive");
     let (toks, r) = run_to_end(&mut sc).await;
     assert!(matches!(r, FinishReason::Length));
     assert_eq!(toks.len(), 4);

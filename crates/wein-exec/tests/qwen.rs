@@ -112,7 +112,7 @@ async fn q6_engine_integration() {
     let Some(ex) = exec(&dir) else { return };
     let (handle, stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
-    let (_id, mut rx) = handle.submit(prompt.clone(), 8, SamplingParams::default());
+    let (_id, mut rx) = handle.submit(prompt.clone(), 8, SamplingParams::default()).expect("engine alive");
     let mut toks = Vec::new();
     while let Some(ev) = rx.recv().await {
         match ev {

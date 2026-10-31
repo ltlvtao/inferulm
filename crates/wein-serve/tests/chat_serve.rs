@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use common::client;
 use serde_json::{json, Value};
-use wein_engine::{CoreConfig, EngineCore};
+use wein_engine::EngineCore;
 use wein_serve::{spawn_server, ChatMessage, ServeState, Tokenizer};
 
 /// 模板化 stub：render 输出确定形态 `[role]content`（与占位
@@ -43,11 +43,11 @@ impl Tokenizer for TplTok {
 /// EngineCore（脚本执行器 pieces 0..7）+ 自定义 tokenizer 起服务
 async fn start_tok(tok: TplTok) -> String {
     let (engine, _stats) = EngineCore::spawn(common::default_core());
-    let state = ServeState {
-        model_id: "mock-model".into(),
-        tokenizer: Arc::new(tok),
+    let state = ServeState::new(
+        "mock-model",
+        Arc::new(tok),
         engine,
-    };
+    );
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     format!("http://{addr}")
 }

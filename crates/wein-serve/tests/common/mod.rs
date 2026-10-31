@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::Value;
-use wein_engine::{CoreConfig, EngineCore, EngineStats, MockEngine, MockScript, MockState};
-use wein_serve::{spawn_server, ServeState};
+use wein_engine::{CoreConfig, EngineCore, EngineStats, Executor, MockEngine, MockState};
+use wein_serve::{spawn_server, spawn_server_guarded, ServeState, Server};
 
+pub use wein_engine::MockScript;
 pub use wein_serve::MockTokenizer;
 
 pub struct TestServer {
@@ -19,11 +20,7 @@ pub struct TestServer {
 
 pub async fn start(script: MockScript, tok: MockTokenizer) -> TestServer {
     let (engine, mock) = MockEngine::spawn(script);
-    let state = ServeState {
-        model_id: "mock-model".into(),
-        tokenizer: Arc::new(tok),
-        engine,
-    };
+    let state = ServeState::new("mock-model", Arc::new(tok), engine);
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     TestServer { base: format!("http://{addr}"), mock }
 }
@@ -121,11 +118,7 @@ pub struct TestCore {
 /// serve 层验收对引擎实现完全无感知——协议锚的兑现。
 pub async fn start_core(cfg: CoreConfig, tok: MockTokenizer) -> TestCore {
     let (engine, stats) = EngineCore::spawn(cfg);
-    let state = ServeState {
-        model_id: "mock-model".into(),
-        tokenizer: Arc::new(tok),
-        engine,
-    };
+    let state = ServeState::new("mock-model", Arc::new(tok), engine);
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     TestCore { base: format!("http://{addr}"), stats }
 }
@@ -133,4 +126,29 @@ pub async fn start_core(cfg: CoreConfig, tok: MockTokenizer) -> TestCore {
 /// 与 MockScript::default() 输出对齐的 core 配置（pieces 0..7 循环，1ms 步进）
 pub fn default_core() -> CoreConfig {
     CoreConfig::scripted(vec![0, 1, 2, 3, 4, 5, 6, 7], Duration::from_millis(1))
+}
+
+/// 注入式执行器：EngineCore + 自定义 `Executor`（恢复类用例要"毒请求"）。
+/// 返回 (base, stats)；`exec` 由调用方提供（`Send + 'static`）。
+pub async fn start_core_with(
+    cfg: CoreConfig,
+    exec: impl Executor + 'static,
+    tok: impl wein_serve::Tokenizer + 'static,
+) -> TestCore {
+    let (engine, stats) = EngineCore::spawn_with(cfg, Box::new(exec));
+    let state = ServeState::new("mock-model", Arc::new(tok), engine);
+    let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    TestCore { base: format!("http://{addr}"), stats }
+}
+
+/// 可优雅退出的服务（SIGTERM/drain 用例）：返回句柄（`addr`/`shutdown`）与
+/// 引擎统计。被测的就是 CLI 用的同一入口（`spawn_server_guarded`）。
+pub async fn start_guarded(
+    script: MockScript,
+    tok: MockTokenizer,
+) -> (Server, Arc<MockState>) {
+    let (engine, mock) = MockEngine::spawn(script);
+    let state = ServeState::new("mock-model", Arc::new(tok), engine);
+    let server = spawn_server_guarded(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    (server, mock)
 }

@@ -17,7 +17,7 @@
 //! 走 eager。空桶集 = NONE（x 系保持每步分配的 eager 直发）
 use std::collections::HashMap;
 
-use wein_engine::Executor;
+use wein_engine::{Executor, StepError};
 use wein_kernel::cuda::{DevBuf, GraphExec};
 use wein_kernel::ops::{
     AddOp, EmbedOp, GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormOp, RopeOp, SiluOp,
@@ -27,6 +27,9 @@ use wein_memory::pool::BlockPool;
 use wein_sched::{ReqId, StepPlan};
 
 use crate::device::{pin, DeviceSession};
+
+/// paged_attn 位置表 / 图档缓冲的绝对位置上界（toy 与 qwen 同一 M0 栅格）
+const MAX_POS: usize = 256;
 
 /// toy 形状（默认 = 一次 4090 上的轻量全路径冒烟）
 #[derive(Debug, Clone)]
@@ -238,6 +241,9 @@ pub struct ToyExecutor {
     free_rows: Vec<u32>,
     /// 可分配块表行上限（图档让出末行作 sink——NONE 时 = max_rows）
     row_capacity: u32,
+    /// 非 panic 的执行失败（页池/行耗尽 = Capacity → length；词表越界 =
+    /// Invalid → error），engine 的 `settle_failures` 取走并终结该请求
+    failures: Vec<(ReqId, StepError)>,
     // 派生常量（validate 后缓存）
     q_elems: usize,
     kv_elems: usize,
@@ -313,6 +319,7 @@ impl ToyExecutor {
             next_row: 0,
             free_rows: Vec::new(),
             row_capacity,
+            failures: Vec::new(),
             q_elems: qe,
             kv_elems: ke,
             t_max,
@@ -411,8 +418,13 @@ impl ToyExecutor {
     /// 单行即纯 decode 形状——图档下走桶回放（w1 用它做位级对拍）。
     /// 返回该位置 logits（bf16 存储 → f32）
     pub fn forward_one(&mut self, id: ReqId, token: u32, pos: u32) -> Vec<f32> {
-        let row = self.reqs.get(&id).map(|s| s.row).unwrap_or_else(|| panic!("forward_one：未知请求 {id}"));
-        self.ensure_pages(id, pos as usize);
+        let Some(row) = self.reqs.get(&id).map(|s| s.row) else {
+            eprintln!("[exec][toy] forward_one：未知请求 {id}");
+            return Vec::new();
+        };
+        if self.ensure_pages(id, pos as usize).is_err() {
+            return Vec::new(); // 页池耗尽：可恢复失败（不 panic）
+        }
         self.forward_rows(&[(row, token, pos)], true)
     }
 
@@ -421,7 +433,15 @@ impl ToyExecutor {
     /// 内部 reset 后用请求 id=1
     pub fn generate(&mut self, prompt: &[u32], max_tokens: u32) -> Vec<u32> {
         self.reset();
+        self.failures.clear();
         self.admitted(1, prompt);
+        if !self.failures.is_empty() {
+            // 准入即失败（词表越界 / 行耗尽）：直跑面直接返回空，不 panic
+            self.failures.clear();
+            return Vec::new();
+        }
+        // 位置表上界：超出的步数直接截断（旧实现 assert 越界即 panic）
+        let max_tokens = max_tokens.min(MAX_POS.saturating_sub(prompt.len()) as u32);
         if max_tokens == 0 {
             return Vec::new();
         }
@@ -440,7 +460,9 @@ impl ToyExecutor {
                 .map(|j| (row, self.reqs[&1].seq[start + j], (start + j) as u32))
                 .collect();
             self.reqs.get_mut(&1).unwrap().forwarded += take;
-            self.ensure_pages(1, (start + take - 1) as usize);
+            if self.ensure_pages(1, (start + take - 1) as usize).is_err() {
+                break; // 页池耗尽：提前收尾（不 panic）
+            }
             let logits = self.forward_batch(&batch);
             if start + take == self.reqs[&1].seq.len() {
                 let last = &logits[(take - 1) * self.cfg.vocab as usize..];
@@ -460,7 +482,9 @@ impl ToyExecutor {
             let tok_in = st.seq[pos];
             let next = {
                 self.reqs.get_mut(&1).unwrap().forwarded += 1;
-                self.ensure_pages(1, pos);
+                if self.ensure_pages(1, pos).is_err() {
+                    return out; // 页池耗尽：提前收尾（不 panic）
+                }
                 let logits = self.forward_rows(&[(row, tok_in, pos as u32)], true);
                 crate::argmax(&logits)
             };
@@ -483,22 +507,43 @@ impl ToyExecutor {
         self.free_rows.clear();
     }
 
-    /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）
-    fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) {
+    /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）。池空 = **可恢复失败**
+    /// （旧实现 panic 会带走整个引擎任务）；已分配页照常挂上，请求由 engine
+    /// 以 length 终结
+    fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) -> Result<(), StepError> {
         let need = upto_pos / self.cfg.block_size as usize + 1;
         let row = match self.reqs.get_mut(&id) {
             Some(st) if st.blocks.len() < need => st.row as usize,
-            _ => return,
+            _ => return Ok(()),
         };
         let bpr = self.bpr;
+        let mut short = false;
         let st = self.reqs.get_mut(&id).unwrap();
         while st.blocks.len() < need {
-            let b = self
-                .pool
-                .alloc()
-                .unwrap_or_else(|| panic!("页池耗尽（{} 页）——toy 配置须保证容量", self.pool.total()));
-            self.bt_host[row * bpr + st.blocks.len()] = b;
-            st.blocks.push(b);
+            match self.pool.alloc() {
+                Some(b) => {
+                    self.bt_host[row * bpr + st.blocks.len()] = b;
+                    st.blocks.push(b);
+                }
+                None => {
+                    short = true;
+                    break;
+                }
+            }
+        }
+        if short {
+            return Err(StepError::Capacity(format!(
+                "页池耗尽（{} 页，请求需 {} 页）",
+                self.pool.total(),
+                need
+            )));
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, id: ReqId, e: StepError) {
+        if !self.failures.iter().any(|(k, _)| *k == id) {
+            self.failures.push((id, e));
         }
     }
 
@@ -508,9 +553,11 @@ impl ToyExecutor {
         // context 线程局部：engine 任务可在 worker 间迁移，进入设备路径先绑
         self.session.gpu().bind_thread();
         let t = rows.len();
-        assert!(t > 0 && t <= self.t_max, "批大小 {t} 超前向缓冲上限 {}", self.t_max);
-        for &(_, _, pos) in rows {
-            assert!((pos as usize) < 256, "位置 {pos} 超 paged_attn M0 上限 256");
+        // 内部合同（serve 侧 ctx_limit 前置校验 + `step` 的 killed 过滤保证）：
+        // 违约时空步返回，不 panic 带走引擎任务
+        if t == 0 || t > self.t_max || rows.iter().any(|&(_, _, pos)| (pos as usize) >= MAX_POS) {
+            eprintln!("[exec][toy] 前向批合同违约（t={t}，上限 {}/{MAX_POS}），本步作废", self.t_max);
+            return Vec::new();
         }
         let gpu = self.session.gpu();
         let stream = self.session.stream();
@@ -617,9 +664,9 @@ impl ToyExecutor {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
             (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row, self.cfg.q_heads as usize)
         };
-        assert!(m > 0 && m <= b, "桶路由合同：m {m} ≤ 桶 {b}");
-        for &(_, _, pos) in rows {
-            assert!((pos as usize) < 256, "位置 {pos} 超 paged_attn M0 上限 256");
+        if m == 0 || m > b || rows.iter().any(|&(_, _, pos)| (pos as usize) >= MAX_POS) {
+            eprintln!("[exec][toy] 图档合同违约（m={m}/桶 {b}，位置上限 {MAX_POS}），本步作废");
+            return Vec::new();
         }
         // host 组装：b_max 全量（默认值 = sink 吸收行），前 m 行写真数据
         let mut ids = vec![0u32; cap];
@@ -658,20 +705,36 @@ impl Executor for ToyExecutor {
         self.row_capacity as usize
     }
 
+    /// 硬上下文长度（serve 侧 `max_tokens` 缺省与越界前置校验的来源）
+    fn ctx_limit(&self) -> usize {
+        MAX_POS
+    }
+
+    /// 取走非 panic 失败（Capacity → length；Invalid → error）
+    fn take_failures(&mut self) -> Vec<(ReqId, StepError)> {
+        std::mem::take(&mut self.failures)
+    }
+
     fn admitted(&mut self, id: ReqId, prompt: &[u32]) -> usize {
-        assert!(
-            prompt.iter().all(|&t| t < self.cfg.vocab),
-            "toy 词表越界（vocab {}）",
-            self.cfg.vocab
-        );
+        // 越界/行耗尽从 assert 改成**可恢复失败**（不 panic 带走引擎任务）
+        if let Some(&bad) = prompt.iter().find(|&&t| t >= self.cfg.vocab) {
+            self.fail(id, StepError::Invalid(format!("toy token {bad} 越界（vocab {}）", self.cfg.vocab)));
+            return 0;
+        }
         // 空 prompt → BOS(0)：调度器看长度 0 直接 decode，首步前向 BOS
         let seq = if prompt.is_empty() { vec![0u32] } else { prompt.to_vec() };
-        let row = self.free_rows.pop().unwrap_or_else(|| {
-            assert!(self.next_row < self.row_capacity, "toy 行耗尽");
-            let r = self.next_row;
-            self.next_row += 1;
-            r
-        });
+        let row = match self.free_rows.pop() {
+            Some(r) => r,
+            None => {
+                if self.next_row >= self.row_capacity {
+                    self.fail(id, StepError::Capacity(format!("toy 行耗尽（{}）", self.row_capacity)));
+                    return 0;
+                }
+                let r = self.next_row;
+                self.next_row += 1;
+                r
+            }
+        };
         self.reqs.insert(id, ReqState { seq, forwarded: 0, row, blocks: Vec::new() });
         0 // toy 无前缀缓存
     }
@@ -719,14 +782,50 @@ impl Executor for ToyExecutor {
         if batch.is_empty() {
             return Vec::new();
         }
-        // 3. 页保证（每请求最大 pos）——先于 scatter
+        // 3. 页保证（每请求最大 pos）——先于 scatter。页池耗尽 / 位置上界从
+        //    panic 改成**可恢复失败**：该请求退出本步批、以 length 结束
+        let mut killed: std::collections::HashSet<ReqId> = std::collections::HashSet::new();
+        for r in &batch {
+            if (r.pos as usize) >= MAX_POS {
+                killed.insert(r.id);
+            }
+        }
+        for id in killed.iter().copied().collect::<Vec<_>>() {
+            self.fail(id, StepError::Capacity(format!("前向位置越界（上限 {MAX_POS}）")));
+        }
         let mut need: HashMap<ReqId, usize> = HashMap::new();
         for r in &batch {
+            if killed.contains(&r.id) {
+                continue;
+            }
             let e = need.entry(r.id).or_insert(0);
             *e = (*e).max(r.pos as usize);
         }
         for (id, upto) in need {
-            self.ensure_pages(id, upto);
+            if let Err(e) = self.ensure_pages(id, upto) {
+                self.fail(id, e);
+                killed.insert(id);
+            }
+        }
+        if !killed.is_empty() {
+            // 失败请求的行摘掉并重映射采样下标（表/行一致性）
+            let mut remap = vec![usize::MAX; batch.len()];
+            let mut kept = Vec::with_capacity(batch.len());
+            for (i, r) in batch.into_iter().enumerate() {
+                if killed.contains(&r.id) {
+                    continue;
+                }
+                remap[i] = kept.len();
+                kept.push(r);
+            }
+            samples = samples
+                .into_iter()
+                .filter_map(|(id, i)| (remap[i] != usize::MAX).then_some((id, remap[i])))
+                .collect();
+            batch = kept;
+        }
+        if batch.is_empty() {
+            return Vec::new(); // 全批失败：本步空步（失败请求已被标记）
         }
         // 4. 前向 + 贪心（采样行各自的 logits 行）。prefill 空 = 纯 decode
         //    步（每行独立请求）→ 图档候选；否则 eager

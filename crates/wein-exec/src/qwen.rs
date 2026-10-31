@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 /// 对拍钩子的 run_forward 调用计数（s1=预填批，s2..=解码步）
 static TRACE_STEP: AtomicU32 = AtomicU32::new(0);
 
-use wein_engine::{Executor, SampleParams};
+use wein_engine::{Executor, SampleParams, StepError};
 use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
@@ -92,6 +92,11 @@ const SPEC_ANCHOR_IDLE: u32 = 8;
 /// KV 页池页数（全注意力层共用一个池容量）
 const NUM_PAGES: u32 = 512;
 const BLOCK: u32 = 16;
+
+/// 对外可查的 KV 池几何（块大小 / 页数）：cli/serve 侧要按同一把尺子装配
+/// 水位准入模型——这里导出让"exec 的池"与"engine 的容量模型"不各写一份魔数
+pub const KV_BLOCK: u32 = BLOCK;
+pub const KV_PAGES: u32 = NUM_PAGES;
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
@@ -716,6 +721,10 @@ pub struct Qwen35Executor {
     /// seed 缺省时的派生计数器（单调递增）：不同请求互不相关，同请求的
     /// seed 一旦定死就不再变（同 seed ⇒ 同序列）
     seed_seq: u64,
+    /// 请求级失败表（`Executor::take_failures` 的载体）：页池耗尽、行耗尽、
+    /// 位置/vocab 越界都是**记录**而不是 panic——panic 会让 engine 任务整体
+    /// 消失（在飞请求全 Aborted、之后 submit 全失败 = 服务假死）
+    failures: Vec<(ReqId, StepError)>,
     session: DeviceSession,
 }
 
@@ -1056,6 +1065,7 @@ impl Qwen35Executor {
             // 采样参数表默认空 = 全 greedy；派生种子从 1 起（0 留作"未设"）
             sample_cfg: HashMap::new(),
             seed_seq: 1,
+            failures: Vec::new(),
             session,
         })
     }
@@ -1237,7 +1247,7 @@ impl Qwen35Executor {
     }
 
     /// 单 token 前向探针（不动 forwarded——q5 逐步对拍用）：返回该位全词表
-    /// logits（bf16 存储 → f32）
+    /// logits（bf16 存储 → f32）。页池耗尽返回空表（探针不 panic）
     pub fn forward_one(&mut self, id: ReqId, token: u32, pos: u32) -> Vec<f32> {
         let row = self
             .reqs
@@ -1245,25 +1255,31 @@ impl Qwen35Executor {
             .map(|s| s.row)
             .unwrap_or_else(|| panic!("forward_one：未知请求 {id}"));
         let state_row = self.reqs.get(&id).map(|s| s.state_row).unwrap();
-        self.ensure_pages(id, pos as usize);
+        if self.ensure_pages(id, pos as usize).is_err() {
+            return Vec::new();
+        }
         self.forward_batch(&[(row, state_row, token, pos)], &[]);
         let bits: Vec<u16> = self.scr.logits.read_to_vec();
         let voc = self.cfg.vocab_size as usize;
         bits[..voc].iter().map(|&b| reference::bf16_to_f32(b)).collect()
     }
 
-    /// 直跑完整生成（测试/serve CLI 便利面；不经过调度器）。
-    /// 语义与 step 合同一致：追平段尾采样，之后逐 token decode
+    /// 直跑完整生成（测试/CLI 便利面；不经过调度器）。
+    /// 语义与 step 合同一致：追尾段采样，之后逐 token decode。
+    /// 容量类失败（超位置上限/页池耗尽）→ **提前收尾返回已生成部分**，
+    /// 不 panic（serve 路径不经过这里，但同一把纪律：执行器不炸进程）
     pub fn generate(&mut self, prompt: &[u32], max_tokens: u32) -> Vec<u32> {
         self.reset();
         self.admitted(1, prompt);
-        if max_tokens == 0 {
+        // admitted 的失败（vocab 越界/行耗尽）记在失败表里——直跑路径自己消化
+        self.failures.clear();
+        if max_tokens == 0 || !self.reqs.contains_key(&1) {
             return Vec::new();
         }
-        assert!(
-            prompt.len() + max_tokens as usize <= MAX_POS,
-            "序列长超 paged_attn M0 上限 {MAX_POS}"
-        );
+        if prompt.len() >= MAX_POS {
+            return Vec::new();
+        }
+        let max_tokens = max_tokens.min((MAX_POS - prompt.len()) as u32);
         let mut out = Vec::new();
         let mut first_tok = None;
         loop {
@@ -1278,7 +1294,9 @@ impl Qwen35Executor {
                 .map(|j| (row, srow, self.reqs[&1].seq[start + j], (start + j) as u32))
                 .collect();
             self.reqs.get_mut(&1).unwrap().forwarded += take;
-            self.ensure_pages(1, start + take - 1);
+            if self.ensure_pages(1, start + take - 1).is_err() {
+                break; // 页池耗尽：提前收尾（不 panic）
+            }
             if start + take == self.reqs[&1].seq.len() {
                 first_tok = Some(self.forward_batch(&batch, &[take as u32 - 1])[0]);
                 break;
@@ -1292,11 +1310,11 @@ impl Qwen35Executor {
             let Some(st) = self.reqs.get(&1) else { break };
             let (row, srow, pos) = (st.row, st.state_row, st.forwarded);
             let tok_in = st.seq[pos];
-            let next = {
-                self.reqs.get_mut(&1).unwrap().forwarded += 1;
-                self.ensure_pages(1, pos);
-                self.forward_rows(&[(row, srow, tok_in, pos as u32)], &[0], true, &[])[0]
-            };
+            self.reqs.get_mut(&1).unwrap().forwarded += 1;
+            if self.ensure_pages(1, pos).is_err() {
+                break; // 页池耗尽：提前收尾（不 panic）
+            }
+            let next = self.forward_rows(&[(row, srow, tok_in, pos as u32)], &[0], true, &[])[0];
             out.push(next);
             self.reqs.get_mut(&1).unwrap().seq.push(next);
         }
@@ -1354,12 +1372,15 @@ impl Qwen35Executor {
     /// **无害**：因果注意力只读 pos' ≤ 当前 pos 的槽，后续步从
     /// forwarded+a+1 起算并覆写同一槽位；块账户（blocks）只多不少，无需回缩。
     pub fn spec_verify(&mut self, id: ReqId, drafts: &[u32]) -> Option<SpecRound> {
-        assert!(
-            drafts.iter().all(|&t| t < self.cfg.vocab_size),
-            "草稿 token 越界（vocab {}）",
-            self.cfg.vocab_size
+        // 越界草稿钳到词表内（投机只是提示：被钳的位必然验证不过，输出不受
+        // 影响）；不再 assert——一次构造错误不该炸掉整个 engine 任务
+        let voc = self.cfg.vocab_size;
+        debug_assert!(
+            drafts.iter().all(|&t| t < voc),
+            "草稿 token 越界（vocab {voc}）"
         );
-        self.spec_commit_batch(&[(id, drafts.to_vec())]).pop().flatten()
+        let drafts: Vec<u32> = drafts.iter().map(|&t| t.min(voc - 1)).collect();
+        self.spec_commit_batch(&[(id, drafts)]).pop().flatten()
     }
 
     /// 一批链的验证 + 接受（批化的 `spec_verify`）：**一条目标前向**覆盖全部
@@ -1454,6 +1475,11 @@ impl Qwen35Executor {
                 self.spec_reanchor(*id);
                 state_row = bt;
             }
+            // 页保证先做（失败 → 该链本步退化，行还没借，不会泄漏）
+            if self.ensure_pages(*id, start + cnt as usize - 1).is_err() {
+                fails.push(*id);
+                continue;
+            }
             let Some((head, borrowed)) = self.spec_chain_rows(state_row, n) else {
                 fails.push(*id);
                 continue;
@@ -1466,7 +1492,6 @@ impl Qwen35Executor {
                 self.spec_copyins += 1;
                 self.push_copy_row_state_ops(state_row, head, &mut copy_ops);
             }
-            self.ensure_pages(*id, start + cnt as usize - 1);
             jobs.push(ChainJob {
                 id: *id,
                 bt,
@@ -2078,22 +2103,44 @@ impl Qwen35Executor {
         tmp.read_to_vec()
     }
 
-    /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）
-    fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) {
+    /// 页保证：请求的块表行长到覆盖 `upto_pos`（含）。
+    ///
+    /// 页池耗尽 = **可恢复失败**（旧实现是 `panic!("页池耗尽")` —— 一次就带走
+    /// engine 任务）：已分配的新页照常挂上（请求随即终结，`retain` 统一归还），
+    /// 返回 `Err(Capacity)` 由引擎把该请求以 `length` 结束。
+    fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) -> Result<(), StepError> {
         let need = upto_pos / BLOCK as usize + 1;
         if !matches!(self.reqs.get(&id), Some(st) if st.blocks.len() < need) {
-            return;
+            return Ok(());
         }
         let bpr = self.bpr;
         let row = self.reqs.get(&id).unwrap().row as usize;
         let have = self.reqs.get(&id).unwrap().blocks.len();
         // 先攒本地（alloc_page 可能驱逐 radix，须避开 st 的借用）
-        let news: Vec<u32> = (have..need).map(|_| self.alloc_page()).collect();
+        let mut news: Vec<u32> = Vec::with_capacity(need - have);
+        let mut short = false;
+        for _ in have..need {
+            match self.alloc_page() {
+                Some(b) => news.push(b),
+                None => {
+                    short = true;
+                    break;
+                }
+            }
+        }
         let st = self.reqs.get_mut(&id).unwrap();
         for b in news {
             self.bt_host[row * bpr + st.blocks.len()] = b;
             st.blocks.push(b);
         }
+        if short {
+            return Err(StepError::Capacity(format!(
+                "页池耗尽（{} 页，请求需 {} 页）",
+                self.pool.total(),
+                need
+            )));
+        }
+        Ok(())
     }
 
     /// 行状态零化（回收/抢占）：linear + conv 状态行的区间清零（流序）
@@ -2172,8 +2219,9 @@ impl Qwen35Executor {
         self.snap_free.pop()
     }
 
-    /// 页分配（耗尽时 LRU 驱逐 radix 腾页——槽随块联动回收）
-    fn alloc_page(&mut self) -> u32 {
+    /// 页分配（耗尽时 LRU 驱逐 radix 腾页——槽随块联动回收）。
+    /// 仍无页 → `None`（调用方转成 `StepError::Capacity`，**不 panic**）
+    fn alloc_page(&mut self) -> Option<u32> {
         if self.pool.free_now() == 0 {
             let freed = self.radix.evict_blocks(&mut self.pool, 8);
             for b in freed {
@@ -2183,9 +2231,15 @@ impl Qwen35Executor {
             }
             self.pool.recycle();
         }
-        self.pool
-            .alloc()
-            .unwrap_or_else(|| panic!("页池耗尽（{} 页）——I1 配置须保证容量", self.pool.total()))
+        self.pool.alloc()
+    }
+
+    /// 记一次请求级失败（去重：同一请求同一步只留第一条——后续处理都基于
+    /// "该请求即将离场"的前提）
+    fn fail(&mut self, id: ReqId, e: StepError) {
+        if !self.failures.iter().any(|(k, _)| *k == id) {
+            self.failures.push((id, e));
+        }
     }
 
     /// 批前向 + 设备端采样。rows: (块表行, token, 位置)；samples: 采样行
@@ -2274,11 +2328,14 @@ impl Qwen35Executor {
         // context 线程局部：engine 任务可在 worker 间迁移，进设备路径先绑
         self.session.gpu().bind_thread();
         let t = rows.len();
-        assert!(t > 0 && t <= T_MAX, "批大小 {t} 超前向缓冲上限 {T_MAX}");
-        self.last_t = t;
-        for &(_, _, _, pos) in rows {
-            assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
+        // 批形与位置上界是**内部账目合同**（serve 侧 ctx_limit 前置校验 + `step`
+        // 的 killed 过滤保证不违约）。违约时宁可本步空转也不 panic 带走引擎：
+        // 空步由调度器下轮重试（`step` 已把越界请求标成失败，不会死循环）
+        if t == 0 || t > T_MAX || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= MAX_POS) {
+            eprintln!("[exec] 前向批合同违约（t={t}，上限 {T_MAX}/{MAX_POS}），本步作废");
+            return Vec::new();
         }
+        self.last_t = t;
         // ---- span 构造：普通段（一请求一段）+ 链段（一链一段）----
         let mut row_start: Vec<u32> = Vec::new();
         let mut row_count: Vec<u32> = Vec::new();
@@ -2817,21 +2874,40 @@ impl Qwen35Executor {
         self.pool.recycle();
     }
 
-    /// 页保证：草稿链 `row` 的块表行长到覆盖 `pos`（含）
-    fn ensure_mtp_pages(&mut self, row: u32, pos: u32) {
+    /// 页保证：草稿链 `row` 的块表行长到覆盖 `pos`（含）。
+    /// 页池耗尽 → `Err(Capacity)`（调用方把该链的草稿作废，本步退化为普通
+    /// decode 行；绝不 panic）
+    fn ensure_mtp_pages(&mut self, row: u32, pos: u32) -> Result<(), StepError> {
         let need = pos as usize / BLOCK as usize + 1;
         let have = self.mtp_chains.get(&row).map_or(0, |v| v.len());
         if have >= need {
-            return;
+            return Ok(());
         }
         // 先攒本地（alloc_page 可能驱逐 radix，须避开链表借用）
-        let news: Vec<u32> = (have..need).map(|_| self.alloc_page()).collect();
+        let mut news: Vec<u32> = Vec::with_capacity(need - have);
+        let mut short = false;
+        for _ in have..need {
+            match self.alloc_page() {
+                Some(b) => news.push(b),
+                None => {
+                    short = true;
+                    break;
+                }
+            }
+        }
         let base = row as usize * self.bpr;
         let chain = self.mtp_chains.entry(row).or_default();
         for b in news {
             self.mtp_bt[base + chain.len()] = b;
             chain.push(b);
         }
+        if short {
+            return Err(StepError::Capacity(format!(
+                "草稿链页耗尽（{} 页）",
+                self.pool.total()
+            )));
+        }
+        Ok(())
     }
 
     /// 草稿前向：一批项一次前向，返回每项 argmax（预测位置 p+2 的 token）。
@@ -2853,30 +2929,39 @@ impl Qwen35Executor {
         assert!(t <= T_MAX, "MTP 批 {t} 超前向缓冲上限 {T_MAX}");
         let voc = self.cfg.vocab_size;
         assert!(self.mtp.is_some(), "mtp_draft：checkpoint 无 MTP 权重");
+        // 逐项上限检查从 assert 改为**钳制 + debug_assert**：投机只是提示，
+        // 越界的草稿会被下一轮贪心验证拒绝（不产生错误输出），但绝不能因为
+        // 一次越界 panic 掉整个 engine 任务（= 所有在飞请求一起死）
         for it in items {
-            assert!(
+            debug_assert!(
                 (it.kv_page_row as usize) < MTP_CHAINS,
                 "草稿链行 {} 超上限 {MTP_CHAINS}",
                 it.kv_page_row
             );
-            assert!((it.pos as usize) < MAX_POS, "MTP 位置 {} 超 paged_attn 上限 {MAX_POS}", it.pos);
-            // 草稿批的 hidden 行 = 链槽号（本轮显式写进 scr.x 该行），与主前向
-            // 的 last_t 无关——行空间是整个 T_MAX
-            assert!(
+            debug_assert!(
+                (it.pos as usize) < MAX_POS,
+                "MTP 位置 {} 超 paged_attn 上限 {MAX_POS}",
+                it.pos
+            );
+            debug_assert!(
                 (it.h as usize) < T_MAX,
                 "hidden 行 {} 超 scratch 行数 {T_MAX}",
                 it.h
             );
-            assert!(it.next_tok < voc, "MTP token {} 越界（vocab {voc}）", it.next_tok);
-            self.ensure_mtp_pages(it.kv_page_row, it.pos);
+            debug_assert!(it.next_tok < voc, "MTP token {} 越界（vocab {voc}）", it.next_tok);
+            // 链页耗尽 → 本轮草稿直接作废（返回全 0 占位，必然被验证拒绝）；
+            // 该请求本步退化成普通 decode 行，同批其他请求不受影响
+            if self.ensure_mtp_pages(it.kv_page_row, it.pos).is_err() {
+                return vec![0u32; t];
+            }
         }
         self.session.gpu().bind_thread();
         let gpu = self.session.gpu();
         let stream = self.session.stream();
-        let ids: Vec<u32> = items.iter().map(|i| i.next_tok).collect();
-        let pos: Vec<u32> = items.iter().map(|i| i.pos).collect();
+        let ids: Vec<u32> = items.iter().map(|i| i.next_tok.min(voc - 1)).collect();
+        let pos: Vec<u32> = items.iter().map(|i| i.pos.min(MAX_POS as u32 - 1)).collect();
         let seqs: Vec<u32> = items.iter().map(|i| i.kv_page_row).collect();
-        let hrows: Vec<u32> = items.iter().map(|i| i.h).collect();
+        let hrows: Vec<u32> = items.iter().map(|i| i.h.min(T_MAX as u32 - 1)).collect();
         let (iq, ig) = qg_split_ids(t, self.cfg.num_heads as usize);
         let (d_ids, d_pos, d_rope_pos, d_seqs, d_hrows, d_bt, d_iq, d_ig) = (
             gpu.alloc_from_slice(&ids),
@@ -3108,11 +3193,12 @@ impl Qwen35Executor {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
             (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row)
         };
-        assert!(m > 0 && m <= b, "桶路由合同：m {m} ≤ 桶 {b}");
-        self.last_t = m;
-        for &(_, _, _, pos) in rows {
-            assert!((pos as usize) < MAX_POS, "位置 {pos} 超 paged_attn M0 上限 {MAX_POS}");
+        // 同 `forward_batch_mixed`：合同违约不 panic（图档桶路由 + 位置上界）
+        if m == 0 || m > b || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= MAX_POS) {
+            eprintln!("[exec] 图档合同违约（m={m}/桶 {b}，位置上限 {MAX_POS}），本步作废");
+            return Vec::new();
         }
+        self.last_t = m;
         // 本步是否有采样行（逐行参数表可能短于样本行——缺省 = greedy）
         let row_smp: Vec<SampleParams> =
             (0..m).map(|j| smp.get(j).copied().unwrap_or_default()).collect();
@@ -3242,12 +3328,29 @@ impl Executor for Qwen35Executor {
         }
     }
 
+    /// 硬上下文长度（serve 侧 `max_tokens` 缺省与越界前置校验的唯一来源）。
+    /// = paged_attn 的绝对位置上界 `MAX_POS`（KV 池几何 512 页 × 16 只是容量，
+    /// 位置表与图档缓冲按 MAX_POS 分配）
+    fn ctx_limit(&self) -> usize {
+        MAX_POS
+    }
+
+    /// 取走本步的非 panic 失败（页池/行耗尽 = Capacity → length；token 越界等
+    /// = Invalid → error）。engine 的 `settle_failures` 据此终结该请求
+    fn take_failures(&mut self) -> Vec<(ReqId, StepError)> {
+        std::mem::take(&mut self.failures)
+    }
+
     fn admitted(&mut self, id: ReqId, prompt: &[u32]) -> usize {
-        assert!(
-            prompt.iter().all(|&t| t < self.cfg.vocab_size),
-            "token 越界（vocab {}）",
-            self.cfg.vocab_size
-        );
+        // 越界/耗尽从 assert（panic 会带走整个引擎任务）改成**可恢复失败**：
+        // 记进 failures，pump 后续 settle_failures 让该请求以 Error/Length 结束
+        if let Some(&bad) = prompt.iter().find(|&&t| t >= self.cfg.vocab_size) {
+            self.fail(
+                id,
+                StepError::Invalid(format!("token {bad} 越界（vocab {}）", self.cfg.vocab_size)),
+            );
+            return 0;
+        }
         let seq = if prompt.is_empty() { vec![0u32] } else { prompt.to_vec() };
         let row = match self.free_rows.pop() {
             // 回收行零化挪到领用时做（链的 arena 借出行归还时不再扫一遍）：
@@ -3257,11 +3360,16 @@ impl Executor for Qwen35Executor {
                 r
             }
             None => {
-                assert!(
-                    self.next_row < self.row_capacity,
-                    "块表行耗尽（{}，图档含 sink 让位 1 行）——I1 并发上限",
-                    self.row_capacity
-                );
+                if self.next_row >= self.row_capacity {
+                    self.fail(
+                        id,
+                        StepError::Capacity(format!(
+                            "块表行耗尽（{}，图档含 sink 让位 1 行）",
+                            self.row_capacity
+                        )),
+                    );
+                    return 0;
+                }
                 let r = self.next_row;
                 self.next_row += 1;
                 r
@@ -3358,6 +3466,27 @@ impl Executor for Qwen35Executor {
             pos: u32,
             /// 该行是 prefill（prompt）token——决定用哪条快照栅格
             pref: bool,
+        }
+        /// 把失败请求的行从本步批里摘掉，并重映射采样行下标（表/行的一致性）
+        fn prune_rows(
+            batch: Vec<RowIn>,
+            samples: Vec<(ReqId, usize)>,
+            killed: &HashSet<ReqId>,
+        ) -> (Vec<RowIn>, Vec<(ReqId, usize)>) {
+            let mut remap = vec![usize::MAX; batch.len()];
+            let mut out: Vec<RowIn> = Vec::with_capacity(batch.len());
+            for (i, r) in batch.into_iter().enumerate() {
+                if killed.contains(&r.id) {
+                    continue;
+                }
+                remap[i] = out.len();
+                out.push(r);
+            }
+            let keep = samples
+                .into_iter()
+                .filter_map(|(id, i)| (remap[i] != usize::MAX).then_some((id, remap[i])))
+                .collect();
+            (out, keep)
         }
         let mut batch: Vec<RowIn> = Vec::new();
         let mut samples: Vec<(ReqId, usize)> = Vec::new();
@@ -3467,14 +3596,45 @@ impl Executor for Qwen35Executor {
         if batch.is_empty() && spec_ready.is_empty() {
             return Vec::new();
         }
-        // 3. 页保证（每请求最大 pos）——先于 scatter
+        // 3. 页保证（每请求最大 pos）——先于 scatter。页池耗尽 / 位置上界从
+        //    panic 改成**可恢复失败**：该请求退出本步批、以 length 结束，
+        //    同批其他请求照常（绝不 panic 带走引擎任务）
+        let mut killed: HashSet<ReqId> = HashSet::new();
+        for r in &batch {
+            if (r.pos as usize) >= MAX_POS {
+                killed.insert(r.id);
+            }
+        }
+        for id in killed.iter().copied().collect::<Vec<_>>() {
+            self.fail(
+                id,
+                StepError::Capacity(format!("前向位置越界（paged_attn 上限 {MAX_POS}）")),
+            );
+        }
+        if !killed.is_empty() {
+            let (b2, s2) = prune_rows(batch, samples, &killed);
+            batch = b2;
+            samples = s2;
+            spec_ready.retain(|(id, _)| !killed.contains(id));
+        }
         let mut need: HashMap<ReqId, usize> = HashMap::new();
         for r in &batch {
             let e = need.entry(r.id).or_insert(0);
             *e = (*e).max(r.pos as usize);
         }
+        let mark = self.failures.len();
         for (id, upto) in need {
-            self.ensure_pages(id, upto);
+            if let Err(e) = self.ensure_pages(id, upto) {
+                self.fail(id, e);
+            }
+        }
+        if self.failures.len() > mark {
+            let fresh: HashSet<ReqId> = self.failures[mark..].iter().map(|(id, _)| *id).collect();
+            killed.extend(fresh.iter().copied());
+            let (b2, s2) = prune_rows(batch, samples, &fresh);
+            batch = b2;
+            samples = s2;
+            spec_ready.retain(|(id, _)| !fresh.contains(id));
         }
         // 4. 批组装：普通行（prefill / decode）+ 链行（每链 cnt 行）同一条前向。
         //    链的 state 行在此分配（在主批行之后：段表 row_start 指进同一 rows）
@@ -3483,11 +3643,22 @@ impl Executor for Qwen35Executor {
         // 混进同一批（不再单独发一次前向），只喂 pending token、出 1 个 token
         for id in ch_fails {
             self.spec_fallbacks += 1;
-            let Some(st) = self.reqs.get_mut(&id) else { continue };
-            if st.forwarded >= st.seq.len() {
+            let (forwarded, seqlen) = match self.reqs.get(&id) {
+                Some(st) => (st.forwarded, st.seq.len()),
+                None => continue,
+            };
+            if forwarded >= seqlen {
                 continue;
             }
-            let pos = st.forwarded;
+            if forwarded >= MAX_POS {
+                self.fail(
+                    id,
+                    StepError::Capacity(format!("前向位置越界（paged_attn 上限 {MAX_POS}）")),
+                );
+                continue;
+            }
+            let pos = forwarded;
+            let Some(st) = self.reqs.get_mut(&id) else { continue };
             let (row, state_row, tok) = (st.row, st.state_row, st.seq[pos]);
             st.forwarded += 1;
             batch.push(RowIn {
@@ -3702,31 +3873,54 @@ impl Executor for Qwen35Executor {
         if let Some(slot) = self.reqs.get(&id).and_then(|st| st.mtp_chain) {
             self.mtp_drop_chain(slot);
         }
-        if let Some(st) = self.reqs.get_mut(&id) {
-            let (row, srow) = (st.row, st.state_row);
-            // 快照槽全数作废回池（行即将零化；重放重新落槽）
-            for (_, slot) in st.snaps.drain(..) {
-                self.snap_free.push(slot);
-            }
-            // 去共享：命中块换新私有页——重放覆盖写有 ulp 漂移（跨批
-            // 形状 GEMM algo 差），共享页不可重写（污染缓存/他人）
-            let shared = st.shared;
-            if self.radix_on && shared > 0 {
-                let head: Vec<u32> = st.seq[..shared * BLOCK as usize].to_vec();
-                self.radix.unpin(&mut self.pool, &head, shared);
-                let bpr = self.bpr;
-                let base = row as usize * bpr;
-                let news: Vec<u32> = (0..shared).map(|_| self.alloc_page()).collect();
-                let st2 = self.reqs.get_mut(&id).unwrap();
-                for (j, b) in news.into_iter().enumerate() {
-                    self.bt_host[base + j] = b;
-                    st2.blocks[j] = b;
-                }
-                st2.shared = 0;
-            }
-            let stream = self.session.stream();
-            self.zero_row_state(srow, stream); // 重放从 pos 0 起步：递推状态必须归零
-            self.reqs.get_mut(&id).unwrap().forwarded = 0;
+        // 状态搬出表：下面要 `alloc_page`（借 `self`），留着 `get_mut` 会撞借用；
+        // 换页失败时原样放回——请求由 engine 以 length 终结，不再重放
+        let mut st = match self.reqs.remove(&id) {
+            Some(st) => st,
+            None => return,
+        };
+        let (row, srow) = (st.row, st.state_row);
+        // 快照槽全数作废回池（行即将零化；重放重新落槽）
+        for (_, slot) in st.snaps.drain(..) {
+            self.snap_free.push(slot);
         }
+        // 去共享：命中块换新私有页——重放覆盖写有 ulp 漂移（跨批
+        // 形状 GEMM algo 差），共享页不可重写（污染缓存/他人）
+        let shared = st.shared;
+        if self.radix_on && shared > 0 {
+            // 先凑齐替换页再拆共享：页池不够就整笔退回，避免块表半途出现空洞
+            let mut news: Vec<u32> = Vec::with_capacity(shared);
+            while news.len() < shared {
+                match self.alloc_page() {
+                    Some(b) => news.push(b),
+                    None => {
+                        for b in news.drain(..) {
+                            self.pool.release(b);
+                        }
+                        self.fail(
+                            id,
+                            StepError::Capacity(format!(
+                                "重放换私页失败：页池耗尽（{} 页）",
+                                self.pool.total()
+                            )),
+                        );
+                        self.reqs.insert(id, st);
+                        return;
+                    }
+                }
+            }
+            let head: Vec<u32> = st.seq[..shared * BLOCK as usize].to_vec();
+            self.radix.unpin(&mut self.pool, &head, shared);
+            let base = row as usize * self.bpr;
+            for (j, b) in news.into_iter().enumerate() {
+                self.bt_host[base + j] = b;
+                st.blocks[j] = b;
+            }
+            st.shared = 0;
+        }
+        let stream = self.session.stream();
+        self.zero_row_state(srow, stream); // 重放从 pos 0 起步：递推状态必须归零
+        st.forwarded = 0;
+        self.reqs.insert(id, st);
     }
 }

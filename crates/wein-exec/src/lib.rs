@@ -16,7 +16,7 @@ pub mod reference;
 pub mod toy;
 
 pub use device::DeviceSession;
-pub use qwen::{MtpItem, Qwen35Executor, SpecRound};
+pub use qwen::{KV_BLOCK, KV_PAGES, MtpItem, Qwen35Executor, SpecRound};
 pub use qwen_ref::QwenMirror;
 pub use toy::{ToyConfig, ToyExecutor, ToyWeights};
 

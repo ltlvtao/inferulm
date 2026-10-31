@@ -89,10 +89,17 @@ pub struct EngineRequest {
 pub enum FinishReason {
     /// 命中停止条件（自然停止或 stop 参数）
     Stop,
-    /// 达到 max_tokens
+    /// 达到 max_tokens，或**容量类**执行失败（页/行/位置上限——请求装不下，
+    /// 语义上等价于"到头了"，见 `Executor::take_failures`）
     Length,
     /// 被取消（客户端断开等）
     Aborted,
+    /// 请求级执行失败（执行器拒绝/真异常：vocab 越界、采样参数不可满足等）。
+    ///
+    /// OpenAI 协议里没有 error 这个 finish_reason——serve 侧的兼容取舍见
+    /// `wein-serve` 的 `finish_reason_str`：body 里仍写 `"error"`，并额外给
+    /// `wein_finish` 判别字段/响应头，客户端不会把它误读成正常结束。
+    Error,
 }
 
 #[derive(Debug, Clone)]

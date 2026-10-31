@@ -32,7 +32,9 @@ start_wein () {
   ./target/release/wein-cli --port "$PORT" --engine core --exec qwen \
       --model "$DIR" --token-delay-ms 0 ${WEIN_EXTRA_FLAGS:-} >/dev/null 2>&1 &
   PID=$!
-  until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$DIR"; do sleep 0.5; done
+  # 就绪探针 = /health（引擎活即 ok）；旧探针用 /v1/models 的模型 id，
+  # 引擎任务死掉后 /v1/models 仍回 200，探针会假绿
+  until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.5; done
 }
 start_vllm () {
   source ~/venvs/vllm/bin/activate
@@ -60,6 +62,8 @@ start_vllm () {
       --hf-overrides '{"architectures": ["Qwen3_5ForCausalLM"]}' >/dev/null 2>&1 &
   PID=$!
   # vLLM 就绪慢（加载+编译图）；上限 10 分钟
+  # 注意：这一侧**必须**继续用 /v1/models——vLLM 没有 /health 路由（会 404），
+  # 换成 /health 会让 vLLM 侧永远等不到就绪。wein 侧才用 /health。
   for _ in $(seq 600); do
     curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$TEXT_DIR" && return
     sleep 1

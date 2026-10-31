@@ -114,7 +114,7 @@ async fn e5_exec_row_capacity_clamps_admission() {
 
     let mut streams = Vec::new();
     for _ in 0..5 {
-        let (_id, s) = _engine.submit(vec![1], 2, Default::default());
+        let (_id, s) = _engine.submit(vec![1], 2, Default::default()).expect("engine alive");
         streams.push(s);
     }
     let mut finished = 0;
@@ -158,7 +158,7 @@ async fn e6_prefix_hit_applies_before_planning() {
     let max_tokens = 5u32;
     let mut streams = Vec::new();
     for _ in 0..3 {
-        let (_id, s) = engine.submit(vec![1; prompt_len], max_tokens, Default::default());
+        let (_id, s) = engine.submit(vec![1; prompt_len], max_tokens, Default::default()).expect("engine alive");
         streams.push(s);
     }
     let mut tokens = 0;

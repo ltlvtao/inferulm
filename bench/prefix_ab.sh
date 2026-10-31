@@ -16,7 +16,7 @@ echo "=== prefix A/B · $TAG ($MODE) ==="
 env "${ENVV[@]}" "$BIN/wein-cli" --port "$PORT" --engine core --exec qwen --model "$DIR" \
     --token-delay-ms 0 ${CHUNK:+--chunk-size $CHUNK} >/tmp/prefix-$TAG.log 2>&1 &
 pid=$!
-until curl -s "localhost:$PORT/v1/models" 2>/dev/null | grep -qF "$DIR"; do sleep 0.2; done
+until curl -s "localhost:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; do sleep 0.2; done
 python3 bench/prefix_probe.py "http://127.0.0.1:$PORT" "$DIR" "${WORDS:-130}"
 kill "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true

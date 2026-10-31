@@ -72,11 +72,11 @@ async fn q11_real_model_http_serves_paris() {
     // 引擎自跑真前向——脚本件/节拍不参与（与 CLI --exec qwen 同构）
     let (engine, _stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
-    let state = ServeState {
-        model_id: "Qwen3.5-4B".into(),
-        tokenizer: Arc::new(HfServing { tok: hf, tpl: None }),
+    let state = ServeState::new(
+        "Qwen3.5-4B",
+        Arc::new(HfServing { tok: hf, tpl: None }),
         engine,
-    };
+    );
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     let base = format!("http://{addr}");
 
@@ -139,11 +139,11 @@ async fn q12_chat_endpoint_template_end_to_end() {
 
     let (engine, _stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
-    let state = ServeState {
-        model_id: "Qwen3.5-4B".into(),
-        tokenizer: Arc::new(HfServing { tok: hf, tpl: Some(tpl) }),
+    let state = ServeState::new(
+        "Qwen3.5-4B",
+        Arc::new(HfServing { tok: hf, tpl: Some(tpl) }),
         engine,
-    };
+    );
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     let base = format!("http://{addr}");
 
@@ -211,11 +211,11 @@ async fn q13_multi_turn_chat_prefix_reuse() {
     };
     let (engine, _stats) =
         EngineCore::spawn_with(CoreConfig::scripted(vec![], Duration::ZERO), Box::new(ex));
-    let state = ServeState {
-        model_id: "Qwen3.5-4B".into(),
-        tokenizer: Arc::new(HfServing { tok: hf, tpl: Some(tpl) }),
+    let state = ServeState::new(
+        "Qwen3.5-4B",
+        Arc::new(HfServing { tok: hf, tpl: Some(tpl) }),
         engine,
-    };
+    );
     let addr = spawn_server(state, "127.0.0.1:0".parse().unwrap()).await.unwrap();
     let base = format!("http://{addr}");
     let client = reqwest::Client::builder()
