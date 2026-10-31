@@ -47,6 +47,7 @@ use wein_memory::radix::RadixCache;
 use wein_model::{LayerType, Qwen35Config, WeightStore};
 use wein_sched::{ReqId, StepPlan};
 
+use crate::ctx;
 use crate::device::{pin, DeviceSession};
 
 /// 批前向 scratch 行数上限（对齐调度 token_budget=512）。
@@ -61,10 +62,8 @@ const MAX_ROWS: usize = 128;
 /// 定尺 = decode 桶上限 `MAX_ROWS`(128) 的两倍，给混合步的 prefill span 数
 /// 留足余量；与 `T_MAX` 解绑（prefill chunk 再长也不放大 logits 表）
 const LG_CAP: usize = 256;
-/// 序列长上限（paged_attn M0 单线程两遍扫的栈上分母数组；W2 flash 移除）
-const MAX_POS: usize = 256;
 /// 投机草稿的单轮上限：k 步草稿 + 1 个待喂位必须落在绝对位置上限内
-/// （MAX_POS=256）且 MTP 前向批 ≤ T_MAX；k ≤ 8 是两者下的保守上界
+/// （ctx::max_pos()=256）且 MTP 前向批 ≤ T_MAX；k ≤ 8 是两者下的保守上界
 /// （每次草稿 = 一次 MTP kernel 序，k=8 = 8 次 launch，仍远小于主步成本）
 const SPEC_K_MAX: u32 = 8;
 
@@ -97,14 +96,15 @@ const SPEC_K_COLD: u32 = 2;
 /// 步数 ⇒ 不白搬；稳定关掉的请求 ~8 步后搬一次
 const SPEC_ANCHOR_IDLE: u32 = 8;
 
-/// KV 页池页数（全注意力层共用一个池容量）
-const NUM_PAGES: u32 = 512;
-const BLOCK: u32 = 16;
-
 /// 对外可查的 KV 池几何（块大小 / 页数）：cli/serve 侧要按同一把尺子装配
-/// 水位准入模型——这里导出让"exec 的池"与"engine 的容量模型"不各写一份魔数
-pub const KV_BLOCK: u32 = BLOCK;
-pub const KV_PAGES: u32 = NUM_PAGES;
+/// 水位准入模型——这里导出让"exec 的池"与"engine 的容量模型"不各写一份
+/// 魔数。值来自启动期配置 [`crate::ctx`]（默认 16 / 512 = 原常量）
+pub fn kv_block() -> u32 {
+    ctx::block()
+}
+pub fn kv_pages() -> u32 {
+    ctx::kv_pages()
+}
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
@@ -709,6 +709,9 @@ pub struct Qwen35Executor {
     /// decode 侧快照栅格（0 = 不落）。decode 边界快照只在"共享同一续写"
     /// 场景有用（多轮对话的下一轮 prompt 含前轮生成 token），故默认稀疏
     snap_grid_dec: usize,
+    /// prompt 侧快照栅格（token）：默认 = block（逐块快照，旧行为）；
+    /// 长上下文抬高它（`ctx::snap_stride`）换"槽够用"——命中粒度随之变粗
+    snap_stride: usize,
     reqs: HashMap<ReqId, ReqState>,
     bt_host: Vec<u32>,
     next_row: u32,
@@ -782,6 +785,7 @@ impl Qwen35Executor {
     }
 
     fn open_with_tune(dir: &Path, tune_m: &[u32]) -> Result<Self, String> {
+        ctx::check()?; // 上下文容量组合须可满足（不带病启动）
         let session = DeviceSession::open_tuned(tune_m)?;
         let gpu = session.gpu();
         let cfg = Qwen35Config::load(dir).map_err(|e| format!("config：{e}"))?;
@@ -816,7 +820,7 @@ impl Qwen35Executor {
             let wd = up(&format!("{base}mlp.down_proj.weight"))?;
             let attn = match cfg.layer_type(i as u32) {
                 LayerType::Full => {
-                    let bytes = NUM_PAGES as usize * BLOCK as usize
+                    let bytes = ctx::kv_pages() as usize * ctx::block() as usize
                         * (cfg.num_kv_heads * cfg.head_dim) as usize
                         * 2;
                     k_pool.push(pin!(gpu.alloc_bytes(bytes)));
@@ -885,7 +889,7 @@ impl Qwen35Executor {
                 wd: up(&format!("{ml}mlp.down_proj.weight"))?,
             };
             let kv = k_pool.len();
-            let bytes = NUM_PAGES as usize * BLOCK as usize
+            let bytes = ctx::kv_pages() as usize * ctx::block() as usize
                 * (cfg.num_kv_heads * cfg.head_dim) as usize
                 * 2;
             k_pool.push(pin!(gpu.alloc_bytes(bytes)));
@@ -907,7 +911,7 @@ impl Qwen35Executor {
 
         // ---- rope 表：HF 收 bf16 再用（.to(x.dtype)）——executor/镜像同表 ----
         let rot_half = (cfg.rot_dim() / 2) as usize;
-        let (mut cos, mut sin) = reference::rope_table(MAX_POS, rot_half, cfg.rope_theta);
+        let (mut cos, mut sin) = reference::rope_table(ctx::max_pos(), rot_half, cfg.rope_theta);
         for v in cos.iter_mut().chain(sin.iter_mut()) {
             *v = reference::bf16_to_f32(reference::f32_to_bf16(*v));
         }
@@ -1020,8 +1024,8 @@ impl Qwen35Executor {
         let dgrid = std::env::var("WEIN_SNAP_GRID_DEC")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * BLOCK as usize);
-        let snap_grid_dec = dgrid.div_ceil(BLOCK as usize) * BLOCK as usize;
+            .unwrap_or((4 * ctx::block() as usize).max(ctx::snap_stride()));
+        let snap_grid_dec = dgrid.div_ceil(ctx::block() as usize) * ctx::block() as usize;
         let (snap_lin, snap_conv, snap_free) = if radix_on {
             let mut sl = Vec::with_capacity(lin_state.len());
             let mut sc = Vec::with_capacity(conv_state.len());
@@ -1063,7 +1067,7 @@ impl Qwen35Executor {
             scr,
             mix,
             cfg,
-            pool: BlockPool::new(NUM_PAGES, 0.5),
+            pool: BlockPool::new(ctx::kv_pages(), 0.5),
             radix: RadixCache::new(),
             snap_lin,
             snap_conv,
@@ -1072,6 +1076,7 @@ impl Qwen35Executor {
             radix_on,
             radix_dbg,
             snap_grid_dec,
+            snap_stride: ctx::snap_stride(),
             reqs: HashMap::new(),
             bt_host: vec![0u32; MAX_ROWS * bpr_of()],
             next_row: 0,
@@ -1360,10 +1365,10 @@ impl Qwen35Executor {
         if max_tokens == 0 || !self.reqs.contains_key(&1) {
             return Vec::new();
         }
-        if prompt.len() >= MAX_POS {
+        if prompt.len() >= ctx::max_pos() {
             return Vec::new();
         }
-        let max_tokens = max_tokens.min((MAX_POS - prompt.len()) as u32);
+        let max_tokens = max_tokens.min((ctx::max_pos() - prompt.len()) as u32);
         let mut out = Vec::new();
         let mut first_tok = None;
         loop {
@@ -1522,7 +1527,7 @@ impl Qwen35Executor {
 
     /// 链行分配：逐条链占 cnt+1 连续 state 行（链首 = 请求自己的 state 行
     /// 优先，免 25.2MB 拷入）。返回 (链作业, 失败请求)——失败 = 请求不在 /
-    /// 尾位置超 `MAX_POS` / 池里无连续行。
+    /// 尾位置超 `ctx::max_pos()` / 池里无连续行。
     fn spec_chain_alloc(
         &mut self,
         items: &[(ReqId, Vec<u32>)],
@@ -1539,7 +1544,7 @@ impl Qwen35Executor {
                 continue;
             };
             let (bt, mut state_row, start) = (st.row, st.state_row, st.forwarded);
-            if cnt as usize > T_MAX || start + cnt as usize > MAX_POS {
+            if cnt as usize > T_MAX || start + cnt as usize > ctx::max_pos() {
                 fails.push(*id);
                 continue;
             }
@@ -1936,8 +1941,8 @@ impl Qwen35Executor {
     /// **这是近似：影响的是接受率，不是正确性**——草稿只是猜测，`spec_verify`
     /// 的贪心验证 + 逐位置 state 回滚保证输出分布与普通 decode 逐位相同。
     ///
-    /// k 上限：`MAX_POS`（绝对位置）与 `T_MAX`（批）约束下取 ≤ SPEC_K_MAX = 8，
-    /// 越界直接 clamp。链尾越界（`start + k + 1 > MAX_POS`）→ 返回空（不投机，
+    /// k 上限：`ctx::max_pos()`（绝对位置）与 `T_MAX`（批）约束下取 ≤ SPEC_K_MAX = 8，
+    /// 越界直接 clamp。链尾越界（`start + k + 1 > ctx::max_pos()`）→ 返回空（不投机，
     /// 调用方退化为普通步）。
     ///
     /// 链间隔离：槽 c 的 hidden 落 `scr.x` 第 c 行、KV 走 `mtp_bt` 第 c 行
@@ -1973,7 +1978,7 @@ impl Qwen35Executor {
             let (Some(slot), true) = (st.mtp_chain, st.hid.is_some()) else { continue };
             let Some(&tok) = st.seq.get(st.forwarded) else { continue };
             let start = st.forwarded as u32;
-            let k = k.min(MAX_POS.saturating_sub(start as usize + 1) as u32);
+            let k = k.min(ctx::max_pos().saturating_sub(start as usize + 1) as u32);
             if k == 0 {
                 continue;
             }
@@ -2193,7 +2198,7 @@ impl Qwen35Executor {
     /// engine 任务）：已分配的新页照常挂上（请求随即终结，`retain` 统一归还），
     /// 返回 `Err(Capacity)` 由引擎把该请求以 `length` 结束。
     fn ensure_pages(&mut self, id: ReqId, upto_pos: usize) -> Result<(), StepError> {
-        let need = upto_pos / BLOCK as usize + 1;
+        let need = upto_pos / ctx::block() as usize + 1;
         if !matches!(self.reqs.get(&id), Some(st) if st.blocks.len() < need) {
             return Ok(());
         }
@@ -2415,8 +2420,8 @@ impl Qwen35Executor {
         // 批形与位置上界是**内部账目合同**（serve 侧 ctx_limit 前置校验 + `step`
         // 的 killed 过滤保证不违约）。违约时宁可本步空转也不 panic 带走引擎：
         // 空步由调度器下轮重试（`step` 已把越界请求标成失败，不会死循环）
-        if t == 0 || t > T_MAX || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= MAX_POS) {
-            eprintln!("[exec] 前向批合同违约（t={t}，上限 {T_MAX}/{MAX_POS}），本步作废");
+        if t == 0 || t > T_MAX || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= ctx::max_pos()) {
+            eprintln!("[exec] 前向批合同违约（t={t}，上限 {T_MAX}/{}），本步作废", ctx::max_pos());
             return Vec::new();
         }
         self.last_t = t;
@@ -2757,12 +2762,12 @@ impl Qwen35Executor {
                     self.prof_mark("kv");
                     tb.kv_scatter.run(
                         &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[full_i],
-                        &self.v_pool[full_i], self.bpr as u32, BLOCK, he, t32, stream,
+                        &self.v_pool[full_i], self.bpr as u32, ctx::block(), he, t32, stream,
                     );
                     self.prof_mark("attn");
                     tb.paged_attn.run(
                         &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt, inp.seqs,
-                        inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh,
+                        inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh,
                         hd, t32, stream,
                     );
                     self.prof_mark("eltw");
@@ -3025,7 +3030,7 @@ impl Qwen35Executor {
     /// 页池耗尽 → `Err(Capacity)`（调用方把该链的草稿作废，本步退化为普通
     /// decode 行；绝不 panic）
     fn ensure_mtp_pages(&mut self, row: u32, pos: u32) -> Result<(), StepError> {
-        let need = pos as usize / BLOCK as usize + 1;
+        let need = pos as usize / ctx::block() as usize + 1;
         let have = self.mtp_chains.get(&row).map_or(0, |v| v.len());
         if have >= need {
             return Ok(());
@@ -3092,9 +3097,10 @@ impl Qwen35Executor {
                 it.kv_page_row
             );
             debug_assert!(
-                (it.pos as usize) < MAX_POS,
-                "MTP 位置 {} 超 paged_attn 上限 {MAX_POS}",
-                it.pos
+                (it.pos as usize) < ctx::max_pos(),
+                "MTP 位置 {} 超 paged_attn 上限 {}",
+                it.pos,
+                ctx::max_pos()
             );
             debug_assert!(
                 (it.h as usize) < T_MAX,
@@ -3112,7 +3118,7 @@ impl Qwen35Executor {
         let gpu = self.session.gpu();
         let stream = self.session.stream();
         let ids: Vec<u32> = items.iter().map(|i| i.next_tok.min(voc - 1)).collect();
-        let pos: Vec<u32> = items.iter().map(|i| i.pos.min(MAX_POS as u32 - 1)).collect();
+        let pos: Vec<u32> = items.iter().map(|i| i.pos.min(ctx::max_pos() as u32 - 1)).collect();
         let seqs: Vec<u32> = items.iter().map(|i| i.kv_page_row).collect();
         let hrows: Vec<u32> = items.iter().map(|i| i.h.min(T_MAX as u32 - 1)).collect();
         let (iq, ig) = qg_split_ids(t, self.cfg.num_heads as usize);
@@ -3206,11 +3212,11 @@ impl Qwen35Executor {
         tb.rope_pt.run(&self.scr.kh, &self.cos, &self.sin, inp.rope_pos, &self.scr.kh, rd, hd, kvh, t32, stream);
         tb.kv_scatter.run(
             &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
-            &self.v_pool[w.kv], self.bpr as u32, BLOCK, he, t32, stream,
+            &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
         );
         tb.paged_attn.run(
             &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
-            &self.scr.attn, self.q_scale, self.bpr as u32, BLOCK, qh_n, kvh, hd, t32, stream,
+            &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32, stream,
         );
         tb.sigmul.run(&self.scr.attn, &self.scr.gate, &self.scr.agated, t32 * qh_n * hd, stream);
         tb.gemm.run_wt(&self.scr.agated, &a.o, &self.scr.o, t32, h, qh_n * hd, stream);
@@ -3359,8 +3365,8 @@ impl Qwen35Executor {
             (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row)
         };
         // 同 `forward_batch_mixed`：合同违约不 panic（图档桶路由 + 位置上界）
-        if m == 0 || m > b || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= MAX_POS) {
-            eprintln!("[exec] 图档合同违约（m={m}/桶 {b}，位置上限 {MAX_POS}），本步作废");
+        if m == 0 || m > b || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= ctx::max_pos()) {
+            eprintln!("[exec] 图档合同违约（m={m}/桶 {b}，位置上限 {}），本步作废", ctx::max_pos());
             return Vec::new();
         }
         self.last_t = m;
@@ -3457,7 +3463,7 @@ fn u32b(n: usize) -> usize {
 }
 
 fn bpr_of() -> usize {
-    MAX_POS.div_ceil(BLOCK as usize)
+    ctx::max_pos().div_ceil(ctx::block() as usize)
 }
 
 /// 线性层递推状态**单行**字节数 [v_heads, v_dim, k_dim] f32（池 = ×MAX_ROWS）
@@ -3489,17 +3495,17 @@ impl Executor for Qwen35Executor {
     /// 旧版逐位一致（A/B 基线）
     fn prefix_align(&self) -> usize {
         if self.radix_on {
-            BLOCK as usize
+            ctx::block() as usize
         } else {
             1
         }
     }
 
     /// 硬上下文长度（serve 侧 `max_tokens` 缺省与越界前置校验的唯一来源）。
-    /// = paged_attn 的绝对位置上界 `MAX_POS`（KV 池几何 512 页 × 16 只是容量，
-    /// 位置表与图档缓冲按 MAX_POS 分配）
+    /// = paged_attn 的绝对位置上界 `ctx::max_pos()`（KV 池几何 512 页 × 16 只是容量，
+    /// 位置表与图档缓冲按 ctx::max_pos() 分配）
     fn ctx_limit(&self) -> usize {
-        MAX_POS
+        ctx::max_pos()
     }
 
     /// 取走本步的非 panic 失败（页池/行耗尽 = Capacity → length；token 越界等
@@ -3564,7 +3570,7 @@ impl Executor for Qwen35Executor {
                 let keep = (0..m.blocks.len())
                     .rev()
                     .find(|&i| {
-                        ((i + 1) * BLOCK as usize) < seq.len()
+                        ((i + 1) * ctx::block() as usize) < seq.len()
                             && self.snap_of_block.contains_key(&m.blocks[i])
                     })
                     .map_or(0, |i| i + 1);
@@ -3588,10 +3594,10 @@ impl Executor for Qwen35Executor {
                 "[radix] admit seq={} keep_blocks={} hit_tokens={}",
                 seq.len(),
                 shared,
-                shared * BLOCK as usize
+                shared * ctx::block() as usize
             );
         }
-        let forwarded = shared * BLOCK as usize;
+        let forwarded = shared * ctx::block() as usize;
         // 采样 RNG 槽（= 请求行）回到"未初始化"：新请求的随机流只由 seed 决定，
         // 不继承上一个占用该行的请求的 RNG 位置（同 seed ⇒ 同序列的前提，
         // qs14 钉死）。抢占重准入不走这里（prompt 已消费），流得以续接
@@ -3768,14 +3774,14 @@ impl Executor for Qwen35Executor {
         //    同批其他请求照常（绝不 panic 带走引擎任务）
         let mut killed: HashSet<ReqId> = HashSet::new();
         for r in &batch {
-            if (r.pos as usize) >= MAX_POS {
+            if (r.pos as usize) >= ctx::max_pos() {
                 killed.insert(r.id);
             }
         }
         for id in killed.iter().copied().collect::<Vec<_>>() {
             self.fail(
                 id,
-                StepError::Capacity(format!("前向位置越界（paged_attn 上限 {MAX_POS}）")),
+                StepError::Capacity(format!("前向位置越界（paged_attn 上限 {}）", ctx::max_pos())),
             );
         }
         if !killed.is_empty() {
@@ -3817,10 +3823,10 @@ impl Executor for Qwen35Executor {
             if forwarded >= seqlen {
                 continue;
             }
-            if forwarded >= MAX_POS {
+            if forwarded >= ctx::max_pos() {
                 self.fail(
                     id,
-                    StepError::Capacity(format!("前向位置越界（paged_attn 上限 {MAX_POS}）")),
+                    StepError::Capacity(format!("前向位置越界（paged_attn 上限 {}）", ctx::max_pos())),
                 );
                 continue;
             }
@@ -3876,7 +3882,7 @@ impl Executor for Qwen35Executor {
         // 点；每请求逐边界各借一槽、完成时随块移交）。流序：批
         // 量 memcpy 排在前向 kernel 之后，读到的是落定状态；全步段表攒齐
         // 一次发行（逐段 async 在 WSL 约 4µs/次驱动开销）。栅格按相位分：
-        // prompt 侧 = BLOCK（命中粒度 = 块），decode 侧默认 64（快照 25MB/
+        // prompt 侧 = ctx::block()（命中粒度 = 块），decode 侧默认 64（快照 25MB/
         // 行/份，16 栅格在 c=100 满负荷 +1.4ms/步，decode 命中场景稀疏）
         if self.radix_on {
             let mut last_pos: HashMap<ReqId, (usize, bool)> = HashMap::new();
@@ -3889,10 +3895,10 @@ impl Executor for Qwen35Executor {
             // 槽位决策先做完（耗尽驱逐会动 radix/snap_free），再攒段表
             let mut snaps: Vec<(u32, u32)> = Vec::new();
             for (id, (p, pref)) in last_pos {
-                let nb = (p + 1) / BLOCK as usize;
-                // prompt 侧恒按 BLOCK（块边界才可共享/可恢复；密度由调度
+                let nb = (p + 1) / ctx::block() as usize;
+                // prompt 侧恒按 ctx::block()（块边界才可共享/可恢复；密度由调度
                 // 侧 chunk 对齐到块边界决定）；decode 侧按 snap_grid_dec
-                let grid = if pref { BLOCK as usize } else { self.snap_grid_dec };
+                let grid = if pref { self.snap_stride } else { self.snap_grid_dec };
                 if nb == 0 || grid == 0 || (p + 1) % grid != 0 {
                     continue;
                 }
@@ -3968,13 +3974,13 @@ impl Executor for Qwen35Executor {
                 // 前缀缓存移交：本请求写过的完整私有块串挂 radix（所有权
                 // 转移，rc 不变）；沿途边界快照随块挂（槽内容 = 该块末的
                 // 位拷贝——恢复点与共享前缀严格对齐才有效）
-                let full = (st.forwarded / BLOCK as usize).min(st.blocks.len());
+                let full = (st.forwarded / ctx::block() as usize).min(st.blocks.len());
                 let shared = st.shared.min(full);
                 // 逐块移交：块进树则槽随块（snap_of_block），未进树/冗余段的
                 // 槽回池。多槽是常态——prompt 侧每个 chunk 尾各一份
                 let mut kept: Vec<u32> = Vec::new();
                 if self.radix_on && full > shared {
-                    let tok_end = full * BLOCK as usize;
+                    let tok_end = full * ctx::block() as usize;
                     // 树既有覆盖深度（>= shared：命中段被 pin 不可逐）。
                     // [shared..d) 私有块与树重叠 = 冗余页，释放；只把分叉
                     // 后新段 [d..full) 交 insert（blocks 契约 = 分叉点对齐）
@@ -4076,7 +4082,7 @@ impl Executor for Qwen35Executor {
                     }
                 }
             }
-            let head: Vec<u32> = st.seq[..shared * BLOCK as usize].to_vec();
+            let head: Vec<u32> = st.seq[..shared * ctx::block() as usize].to_vec();
             self.radix.unpin(&mut self.pool, &head, shared);
             let base = row as usize * self.bpr;
             for (j, b) in news.into_iter().enumerate() {

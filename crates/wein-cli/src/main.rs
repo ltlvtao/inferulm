@@ -101,6 +101,29 @@ fn main() {
                 }
             }
         };
+        // 上下文容量（W2 B2）：`--ctx-len` / `--kv-pages` / `--snap-stride`
+        // 覆盖环境变量兜底（WEIN_CTX_LEN / WEIN_KV_PAGES / WEIN_SNAP_STRIDE），
+        // 默认 256/512/16 = 原编译期常量。exec 的池、块表宽度、rope 表、
+        // serve 的 `ctx_limit` 全部读这一份
+        {
+            let mut c = wein_exec::CtxConfig::from_env();
+            let mut take = |flag: &str, dst: &mut usize, name: &str| {
+                if let Some(v) = arg_opt(&args, flag) {
+                    *dst = v.parse().unwrap_or_else(|_| {
+                        eprintln!("{flag} 须为正整数：{v}");
+                        std::process::exit(1)
+                    });
+                }
+                let _ = name;
+            };
+            take("--ctx-len", &mut c.max_pos, "max_pos");
+            take("--kv-pages", &mut c.kv_pages, "kv_pages");
+            take("--snap-stride", &mut c.snap_stride, "snap_stride");
+            wein_exec::ctx::set(c).unwrap_or_else(|e| {
+                eprintln!("上下文容量配置无效：{e}");
+                std::process::exit(1)
+            });
+        }
         let (engine, tok): (EngineHandle, Arc<dyn Tokenizer>) = if use_qwen {
             let dir = PathBuf::from(&model);
             let ex = if use_graph {
@@ -153,8 +176,8 @@ fn main() {
                     // 批内仅剩自己才 abort（engine/core.rs 的 forced 路径）
                     if args.iter().any(|a| a == "--memory") {
                         cfg.memory = Some(wein_memory::state::MemConfig {
-                            block_size: wein_exec::KV_BLOCK,
-                            num_blocks: wein_exec::KV_PAGES,
+                            block_size: wein_exec::kv_block(),
+                            num_blocks: wein_exec::kv_pages(),
                             low_watermark: 0.1,
                         });
                     }

@@ -26,10 +26,8 @@ use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
 use wein_sched::{ReqId, StepPlan};
 
+use crate::ctx;
 use crate::device::{pin, DeviceSession};
-
-/// paged_attn 位置表 / 图档缓冲的绝对位置上界（toy 与 qwen 同一 M0 栅格）
-const MAX_POS: usize = 256;
 
 /// toy 形状（默认 = 一次 4090 上的轻量全路径冒烟）
 #[derive(Debug, Clone)]
@@ -64,7 +62,7 @@ impl Default for ToyConfig {
             // 量 exec 的账，不制造池耗尽噪声
             num_pages: 1024,
             block_size: 16,
-            max_pos: 256, // paged_attn M0 上限（序列长 ≤ 256，W2 flash 分块移除）
+            max_pos: ctx::max_pos() as u32, // 与 qwen 同一启动期栅格（默认 256）
             seed: 42,
             eps: 1e-6,
             graph_buckets: Vec::new(),
@@ -82,8 +80,12 @@ impl ToyConfig {
         if self.head_dim % 2 != 0 {
             return Err("head_dim 须为偶数（rope half-split）".into());
         }
-        if self.max_pos == 0 || self.max_pos > 256 {
-            return Err(format!("max_pos {} 超出 paged_attn M0 上限 256", self.max_pos));
+        if self.max_pos == 0 || self.max_pos as usize > ctx::max_pos() {
+            return Err(format!(
+                "max_pos {} 超出启动期上下文上限 {}（ctx::max_pos）",
+                self.max_pos,
+                ctx::max_pos()
+            ));
         }
         if self.vocab < 2 {
             return Err("vocab 至少 2".into());
@@ -441,7 +443,7 @@ impl ToyExecutor {
             return Vec::new();
         }
         // 位置表上界：超出的步数直接截断（旧实现 assert 越界即 panic）
-        let max_tokens = max_tokens.min(MAX_POS.saturating_sub(prompt.len()) as u32);
+        let max_tokens = max_tokens.min(ctx::max_pos().saturating_sub(prompt.len()) as u32);
         if max_tokens == 0 {
             return Vec::new();
         }
@@ -555,8 +557,8 @@ impl ToyExecutor {
         let t = rows.len();
         // 内部合同（serve 侧 ctx_limit 前置校验 + `step` 的 killed 过滤保证）：
         // 违约时空步返回，不 panic 带走引擎任务
-        if t == 0 || t > self.t_max || rows.iter().any(|&(_, _, pos)| (pos as usize) >= MAX_POS) {
-            eprintln!("[exec][toy] 前向批合同违约（t={t}，上限 {}/{MAX_POS}），本步作废", self.t_max);
+        if t == 0 || t > self.t_max || rows.iter().any(|&(_, _, pos)| (pos as usize) >= ctx::max_pos()) {
+            eprintln!("[exec][toy] 前向批合同违约（t={t}，上限 {}/{}），本步作废", self.t_max, ctx::max_pos());
             return Vec::new();
         }
         let gpu = self.session.gpu();
@@ -664,8 +666,8 @@ impl ToyExecutor {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
             (g.buckets[b_idx] as usize, g.b_max as usize, rows.len(), g.sink_row, self.cfg.q_heads as usize)
         };
-        if m == 0 || m > b || rows.iter().any(|&(_, _, pos)| (pos as usize) >= MAX_POS) {
-            eprintln!("[exec][toy] 图档合同违约（m={m}/桶 {b}，位置上限 {MAX_POS}），本步作废");
+        if m == 0 || m > b || rows.iter().any(|&(_, _, pos)| (pos as usize) >= ctx::max_pos()) {
+            eprintln!("[exec][toy] 图档合同违约（m={m}/桶 {b}，位置上限 {}），本步作废", ctx::max_pos());
             return Vec::new();
         }
         // host 组装：b_max 全量（默认值 = sink 吸收行），前 m 行写真数据
@@ -707,7 +709,7 @@ impl Executor for ToyExecutor {
 
     /// 硬上下文长度（serve 侧 `max_tokens` 缺省与越界前置校验的来源）
     fn ctx_limit(&self) -> usize {
-        MAX_POS
+        ctx::max_pos()
     }
 
     /// 取走非 panic 失败（Capacity → length；Invalid → error）
@@ -786,12 +788,12 @@ impl Executor for ToyExecutor {
         //    panic 改成**可恢复失败**：该请求退出本步批、以 length 结束
         let mut killed: std::collections::HashSet<ReqId> = std::collections::HashSet::new();
         for r in &batch {
-            if (r.pos as usize) >= MAX_POS {
+            if (r.pos as usize) >= ctx::max_pos() {
                 killed.insert(r.id);
             }
         }
         for id in killed.iter().copied().collect::<Vec<_>>() {
-            self.fail(id, StepError::Capacity(format!("前向位置越界（上限 {MAX_POS}）")));
+            self.fail(id, StepError::Capacity(format!("前向位置越界（上限 {}）", ctx::max_pos())));
         }
         let mut need: HashMap<ReqId, usize> = HashMap::new();
         for r in &batch {

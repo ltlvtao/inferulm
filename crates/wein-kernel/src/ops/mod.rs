@@ -116,7 +116,8 @@ impl OpTable<'_> {
         let paged_attn = PagedAttnCuda {
             gpu,
             f: m.func("paged_attn"),
-            scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * 258 * 4),
+            scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * (ATTN_SLOT_CAP + 2) * 4),
+            slot_cap: ATTN_SLOT_CAP as u32,
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -134,7 +135,7 @@ impl OpTable<'_> {
         let deltanet = DeltanetCuda {
             gpu,
             f: m.func("deltanet"),
-            scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * 1024 * 4),
+            scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * DELTA_SLOTS_PER_BLOCK * 4),
         };
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
@@ -241,8 +242,22 @@ pub trait RmsNormZcOp {
 /// 块归约 scratch 行容量：满批 q-norm 128×16=2048 行，×4 余量
 const REDUCE_ROWS_CAP: usize = 8192;
 
-/// E2 warp 归约块容量：满批 rows(128)×v_heads(32)，每块 kvm/o 两区 1024 f32
+/// E2 warp 归约块容量：满批 rows(128)×v_heads(32)
 const DELTA_BLOCK_CAP: usize = 4096;
+/// E2 的 block 宽（线程数）：32 的倍数 = warp 数，vd=128 行按 warp 等分。
+/// 窄 = 4 warp × 32 行（批 16 行 ⇒ 2 批/token、4 道屏障）；
+/// 宽 = 8 warp × 16 行（批 16 行 ⇒ 1 批/token、2 道屏障，并行 warp 翻倍）。
+/// 行内算术与折叠树两者全同（v 行彼此独立）——只有"哪条 warp 吃哪几行"变。
+const DELTA_BLOCK_DIM: usize = 128;
+const DELTA_WIDE_BLOCK_DIM: usize = 256;
+/// 宽块的门：块数少 = 并行度饥饿（单请求预填 32 块，全卡只 128 warp）时加宽；
+/// 块数多（满负荷 decode 3200 块）时窄块给 3 块/SM × 4 warp = 12 warp/SM 的
+/// 占用率，宽块掉到 1 块/SM × 8 warp。实测：预填 delta −23%（宽），
+/// 满负荷 decode 走窄块不变
+const DELTA_WIDE_GRID_MAX: usize = 64;
+/// 每块 scratch 槽数 = 2 区 × warp 数 × 16 行批 × 32 lane（与 kernel 侧
+/// `bid * nwarps * 1024` 同构）；按宽块（warp 多）预留
+const DELTA_SLOTS_PER_BLOCK: usize = (DELTA_WIDE_BLOCK_DIM / 32) * 1024;
 
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
@@ -480,7 +495,7 @@ pub trait DeltanetOp {
 pub struct DeltanetCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
-    /// E2 warp 归约 scratch：[DELTA_BLOCK_CAP, 1024] f32（kvm/o 两区），
+    /// E2 warp 归约 scratch：[DELTA_BLOCK_CAP, 4096] f32（kvm/o 两区各 2048），
     /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
     scratch: DevBuf<'a>,
 }
@@ -522,7 +537,14 @@ impl DeltanetOp for DeltanetCuda<'_> {
             assert!(n_rows as usize * v_heads as usize <= DELTA_BLOCK_CAP,
                 "deltanet 块数 {} 超 scratch 容量 {DELTA_BLOCK_CAP}", n_rows * v_heads);
         }
-        let (grid, bdim) = (n_rows * v_heads, if e2 { 128 } else { v_dim });
+        let grid = n_rows * v_heads;
+        let bdim = if !e2 {
+            v_dim
+        } else if (grid as usize) <= DELTA_WIDE_GRID_MAX {
+            DELTA_WIDE_BLOCK_DIM as u32
+        } else {
+            DELTA_BLOCK_DIM as u32
+        };
         self.gpu.launch(&self.f, grid, bdim, &args, stream);
     }
     fn name(&self) -> &'static str {
@@ -883,13 +905,28 @@ pub trait PagedAttnOp {
 pub struct PagedAttnCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
-    /// 块归约 scratch：[ATTN_BLOCK_CAP, 258] f32（分值/p + 分母槽），
+    /// 块归约 scratch：[ATTN_BLOCK_CAP, ATTN_SLOT_CAP+2] f32（分值/p + 分母槽），
     /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
     scratch: DevBuf<'a>,
+    /// 每块分值槽宽（kernel 的 `slot_cap`）：pos+1 ≤ 此值走直路（四相位），
+    /// 超出走位级同的流式路——容量只影响 scratch 用量，不再是序列长上限
+    slot_cap: u32,
 }
 
 /// attn 块数容量上限：T_MAX(512) × q_heads(32)——超容显式 assert
 const ATTN_BLOCK_CAP: usize = 16384;
+/// 分值槽宽（每块 f32 槽数）：256 保 M0 默认路径逐字节不变；更长的位置
+/// 由流式路承担。抬到 `max_pos` 可让长上下文也走直路（scratch = 块数 ×
+/// (cap+2) × 4B：cap=4096 时 ≈ 256MB——默认不付这份显存）
+const ATTN_SLOT_CAP: usize = 256;
+
+impl PagedAttnCuda<'_> {
+    /// 分值槽宽覆盖（测试/容量档口用；只能缩小——分配按 ATTN_SLOT_CAP 一次）
+    pub fn set_slot_cap(&mut self, cap: usize) {
+        assert!(cap + 2 <= ATTN_SLOT_CAP + 2, "slot_cap {cap} 超分配容量 {ATTN_SLOT_CAP}");
+        self.slot_cap = cap as u32;
+    }
+}
 
 impl PagedAttnOp for PagedAttnCuda<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -915,7 +952,8 @@ impl PagedAttnOp for PagedAttnCuda<'_> {
         assert!(n as usize <= ATTN_BLOCK_CAP,
             "paged_attn 块数 {n} 超 scratch 容量 {ATTN_BLOCK_CAP}");
         let args = crate::kernel_args![*q, *k_cache, *v_cache, *block_table, *seq_ids, *positions,
-            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, self.scratch];
+            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, self.slot_cap,
+            self.scratch];
         // 一 block 一 (t,qh)、block=head_dim 线程（四相位块协作——kernel 同构）
         self.gpu.launch(&self.f, n, head_dim, &args, stream);
     }

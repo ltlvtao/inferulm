@@ -9,6 +9,7 @@
 //!
 //! M0 边界：贪心采样在 host（采样位置的开放问题 02 §13，倾向 exec 图尾）；
 //! 图捕获 NONE 档起步（W2）。
+pub mod ctx;
 pub mod device;
 pub mod qwen;
 pub mod qwen_ref;
@@ -16,7 +17,8 @@ pub mod reference;
 pub mod toy;
 
 pub use device::DeviceSession;
-pub use qwen::{KV_BLOCK, KV_PAGES, MtpItem, Qwen35Executor, SpecRound};
+pub use ctx::CtxConfig;
+pub use qwen::{kv_block, kv_pages, MtpItem, Qwen35Executor, SpecRound};
 pub use qwen_ref::QwenMirror;
 pub use toy::{ToyConfig, ToyExecutor, ToyWeights};
 

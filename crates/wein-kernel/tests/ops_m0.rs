@@ -618,3 +618,109 @@ fn o24_paged_attn_latency_canary() {
         drop((dkc, dvc, dbt, dsi, dpo));
     }
 }
+
+/// o28 · paged_attn 无序列长上限（W2）：`slot_cap` 收窄 → 流式路（两遍、
+/// chunk=j 升序复算分值），与直路（四相位、分值落 scratch）**逐位同**；
+/// pos=255/300/32 三行同时入批，pos 300 正是旧形态"整块静默不写"的错区
+#[test]
+fn o28_paged_attn_stream_bitwise() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let mut t = table(&gpu);
+    let (q_heads, kv_heads, head_dim, block_size) = (8usize, 2usize, 64usize, 16usize);
+    let positions: Vec<u32> = vec![255, 300, 32];
+    let tokens = positions.len();
+    let bpr = (*positions.iter().max().unwrap() as usize + 1).div_ceil(block_size);
+    // 每行独占 bpr 页：行 r 的页 id = r·bpr .. r·bpr+bpr-1（页表间接寻址真实）
+    let mut block_table: Vec<u32> = Vec::new();
+    for r in 0..tokens {
+        for p in 0..bpr {
+            block_table.push((r * bpr + p) as u32);
+        }
+    }
+    let seq_ids: Vec<u32> = (0..tokens as u32).collect();
+    let he = kv_heads * head_dim;
+    let slots = tokens * bpr * block_size;
+    let k_cache = vec_bf16(0x51ab, slots * he, 1.0);
+    let v_cache = vec_bf16(0x62cd, slots * he, 1.0);
+    let qn = tokens * q_heads * head_dim;
+    let q = vec_bf16(0x73ef, qn, 2.0);
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let expect = reference::paged_attn(&q, &k_cache, &v_cache, &block_table, &seq_ids,
+        &positions, q_scale, bpr, block_size, q_heads, kv_heads, head_dim);
+    let (dq, dkc, dvc) = (gpu.alloc_from_slice(&q), gpu.alloc_from_slice(&k_cache),
+        gpu.alloc_from_slice(&v_cache));
+    let (dbt, dsi, dpo) = (gpu.alloc_from_slice(&block_table), gpu.alloc_from_slice(&seq_ids),
+        gpu.alloc_from_slice(&positions));
+    let dout = gpu.alloc_bytes(qn * 2);
+    let run = |t: &mut OpTable<'_>, cap: usize| -> Vec<u16> {
+        t.paged_attn.set_slot_cap(cap);
+        t.paged_attn.run(&dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale,
+            bpr as u32, block_size as u32, q_heads as u32, kv_heads as u32,
+            head_dim as u32, tokens as u32, &stream);
+        stream.sync();
+        dout.read_to_vec()
+    };
+    let direct = run(&mut t, 256);  // pos+1 ≤ 256 走直路，300 走流式（chunk 256+44）
+    let streamed = run(&mut t, 64); // 全行走流式（chunk 64：255→4 块、300→5 块、32→1 块）
+    assert_bits("paged_attn 直路/slot_cap=256", &direct, &expect);
+    assert_bits("paged_attn 流式/slot_cap=64", &streamed, &expect);
+    assert_bits("流式 ≡ 直路（位级）", &streamed, &direct);
+    // 旧形态静默不写的错区：pos 300 行必须真有输出（非零且 = 参考）
+    let row_bytes = q_heads * head_dim;
+    let row300 = &direct[row_bytes..2 * row_bytes];
+    assert!(row300.iter().any(|&b| b != 0), "pos 300 行未写——静默错回归");
+}
+
+/// o29 · paged_attn 长序列单发耗时（流式路，pos > slot_cap 256）：
+/// 1k / 4k / 8k 的 Qwen3.5-4B full 层形状（1 token × 32 q 头 / 16 kv 头 / hd 128）
+#[test]
+fn o29_paged_attn_long_seq_timing() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    let (q_heads, kv_heads, head_dim, block_size, tokens) =
+        (32usize, 16usize, 128usize, 16usize, 1usize);
+    let he = kv_heads * head_dim;
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let qn = tokens * q_heads * head_dim;
+    let q = vec_bf16(0x7a11, qn, 2.0);
+    let dq = gpu.alloc_from_slice(&q);
+    let dout = gpu.alloc_bytes(qn * 2);
+    for &pos in &[1023usize, 4095, 8191] {
+        let bpr = (pos + 1).div_ceil(block_size);
+        let npages = tokens * bpr;
+        let slots = npages * block_size;
+        let block_table: Vec<u32> = (0..npages as u32).collect();
+        let seq_ids = vec![0u32; tokens];
+        let positions = vec![pos as u32; tokens];
+        let (dkc, dvc) = (gpu.alloc_from_slice(&vec_bf16(0x7b33, slots * he, 1.0)),
+            gpu.alloc_from_slice(&vec_bf16(0x7c55, slots * he, 1.0)));
+        let (dbt, dsi, dpo) = (gpu.alloc_from_slice(&block_table), gpu.alloc_from_slice(&seq_ids),
+            gpu.alloc_from_slice(&positions));
+        let run = || {
+            t.paged_attn.run(&dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale,
+                bpr as u32, block_size as u32, q_heads as u32, kv_heads as u32,
+                head_dim as u32, tokens as u32, &stream);
+        };
+        for _ in 0..3 {
+            run();
+        }
+        stream.sync();
+        let (e0, e1) = (gpu.event(), gpu.event());
+        e0.record_on(&stream);
+        for _ in 0..10 {
+            run();
+        }
+        e1.record_on(&stream);
+        stream.sync();
+        let per = e1.elapsed_ms(&e0) / 10.0;
+        // 带宽地板：每 (t,qh) 读一遍 K/V = pos+1 个槽 × he × 2 × 2B；32 块并行
+        let bytes = (pos + 1) as f64 * he as f64 * 2.0 * 2.0 * q_heads as f64;
+        let floor_us = (bytes / 1.0e12 * 1.0e6) as f32; // @1TB/s
+        eprintln!("o29 paged_attn pos={pos}：{per:.3} ms/launch（10 拍均值；8.2KB/token 地板 {floor_us:.0}µs，{:.1}× 地板）",
+            per * 1e3 / floor_us);
+    }
+}
