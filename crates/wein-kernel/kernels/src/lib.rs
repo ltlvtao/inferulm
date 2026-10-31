@@ -1081,15 +1081,38 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
             let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
             let qb = (g * k_heads as usize + kh) * kd;
+            // l2norm（j 升序 128 项平方和 → +eps → sqrt → 倒数）：**和树不动**。
+            // 平方和不是精确和（加法非结合），换归约树必改末位——实测两级
+            // 折叠 42525/49152 组位不同，故仍是 j 升序单链。这里只把 128 次
+            // 标量 u16 载入合并成 32 次 u64 整载（一次拿 4 个 bf16，与 :1130
+            // 的 kw/qw 同手法）并把每组的 4 项展开：sq/sk 两条链的加法序仍
+            // 是 j 升序且 acc 在前（`v*v + acc` 逐字同式），逐位不变；拿掉的
+            // 只是每元素一次的地址运算与循环回边依赖。
             let mut sq = 0.0f32;
             let mut sk = 0.0f32;
             let mut j = 0usize;
             while j < kd {
-                let qv = bf16_to_f32(*q.add(qb + j));
-                let kv = bf16_to_f32(*k.add(qb + j));
-                sq = qv * qv + sq;
-                sk = kv * kv + sk;
-                j += 1;
+                let qw4 = *(q.add(qb + j) as *const u64);
+                let kw4 = *(k.add(qb + j) as *const u64);
+                let (qlo4, qhi4) = (qw4 as u32, (qw4 >> 32) as u32);
+                let (klo4, khi4) = (kw4 as u32, (kw4 >> 32) as u32);
+                let qa = f32::from_bits(qlo4 << 16);
+                let qb2 = f32::from_bits(qlo4 & 0xffff_0000);
+                let qc = f32::from_bits(qhi4 << 16);
+                let qd = f32::from_bits(qhi4 & 0xffff_0000);
+                let ka = f32::from_bits(klo4 << 16);
+                let kb2 = f32::from_bits(klo4 & 0xffff_0000);
+                let kc = f32::from_bits(khi4 << 16);
+                let kd2 = f32::from_bits(khi4 & 0xffff_0000);
+                sq = qa * qa + sq;
+                sq = qb2 * qb2 + sq;
+                sq = qc * qc + sq;
+                sq = qd * qd + sq;
+                sk = ka * ka + sk;
+                sk = kb2 * kb2 + sk;
+                sk = kc * kc + sk;
+                sk = kd2 * kd2 + sk;
+                j += 4;
             }
             let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
             let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
@@ -1103,34 +1126,73 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             let (q0, q1) = (f32::from_bits(qlo << 16), f32::from_bits(qlo & 0xffff_0000));
             let (q2, q3) = (f32::from_bits(qhi << 16), f32::from_bits(qhi & 0xffff_0000));
             let obase = (g * vh + h) * vd;
-            let mut vrow = w * 32; // warp 行段游标（批 4 行步进）
-            // 批内单行：kvm 折叠→delta→更新趟（读 S0 写 S2）→o 部分和。
-            // 元素级表达式/算术序与 dn_row128 逐字同（位对齐合同不变），
-            // 变的只是归约树（两级折叠）与块↔工作的调度映射
+            // 32 项 u 升序串行折叠，下标全 literal：32 次 LDG 一起发（同一切片
+            // 区内 128B 连续——一次 sector 组），只剩 32 深入 f32 加法链。
+            // 逐项序与滚动 `while u < 32` 完全一致（u 升序、acc = v + acc），
+            // **位同**；拿掉的只是循环回边（滚动版里每次 LDG 都串在回边上、
+            // 吃满一次 L1 时延——本刀 prefill delta 92.36→64.39ms 的主项）
+            macro_rules! fold32 {
+                ($base:expr) => {{
+                    let p = $base;
+                    let mut acc = 0.0f32;
+                    acc = *p.add(0) + acc;
+                    acc = *p.add(1) + acc;
+                    acc = *p.add(2) + acc;
+                    acc = *p.add(3) + acc;
+                    acc = *p.add(4) + acc;
+                    acc = *p.add(5) + acc;
+                    acc = *p.add(6) + acc;
+                    acc = *p.add(7) + acc;
+                    acc = *p.add(8) + acc;
+                    acc = *p.add(9) + acc;
+                    acc = *p.add(10) + acc;
+                    acc = *p.add(11) + acc;
+                    acc = *p.add(12) + acc;
+                    acc = *p.add(13) + acc;
+                    acc = *p.add(14) + acc;
+                    acc = *p.add(15) + acc;
+                    acc = *p.add(16) + acc;
+                    acc = *p.add(17) + acc;
+                    acc = *p.add(18) + acc;
+                    acc = *p.add(19) + acc;
+                    acc = *p.add(20) + acc;
+                    acc = *p.add(21) + acc;
+                    acc = *p.add(22) + acc;
+                    acc = *p.add(23) + acc;
+                    acc = *p.add(24) + acc;
+                    acc = *p.add(25) + acc;
+                    acc = *p.add(26) + acc;
+                    acc = *p.add(27) + acc;
+                    acc = *p.add(28) + acc;
+                    acc = *p.add(29) + acc;
+                    acc = *p.add(30) + acc;
+                    acc = *p.add(31) + acc;
+                    acc
+                }};
+            }
+            // 批内单行：kvm 折叠→delta→更新趟（旧行值 S0 → 新值，原位回写
+            // 该 lane 的 j 切片 u64）→o 部分和。元素级表达式/算术序与
+            // dn_row128 逐字同（位对齐合同不变），变的只是归约树（两级折叠）
+            // 与块↔工作的调度映射；返回值 = 新 S0 的 u64 字（供调用处回写）
             macro_rules! dn_e2 {
-                ($ww:expr, $b:literal) => {{
-                    let mut kvm = 0.0f32;
-                    let mut u = 0usize;
-                    while u < 32 {
-                        kvm = *wslot.add($b * 32 + u) + kvm;
-                        u += 1;
-                    }
-                    let vin = bf16_to_f32(*v.add(obase + vrow + $b));
+                ($ww:expr, $vr:expr, $b:literal) => {{
+                    let kvm = fold32!(wslot.add($b * 32));
+                    let vin = bf16_to_f32(*v.add($vr));
                     let delta = (vin - kvm) * beta;
                     let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
                     let r0 = f32_to_bf16_hi((k0 * invk) * delta + (f32::from_bits(lo << 16) * decay));
                     let r1 = f32_to_bf16_hi((k1 * invk) * delta + (f32::from_bits(lo & 0xffff_0000) * decay));
                     let r2 = f32_to_bf16_hi((k2 * invk) * delta + (f32::from_bits(hi << 16) * decay));
                     let r3 = f32_to_bf16_hi((k3 * invk) * delta + (f32::from_bits(hi & 0xffff_0000) * decay));
-                    // lane0 ← r0>>16；lane1 已在位；lane2 ← r2<<16；lane3 ← r3<<32
-                    *(sbase.add((vrow + $b) * kd + s * 4) as *mut u64) =
-                        (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32;
                     let mut o = 0.0f32;
                     o = f32::from_bits(r0) * ((q0 * invq) / kd_sqrt) + o;
                     o = f32::from_bits(r1) * ((q1 * invq) / kd_sqrt) + o;
                     o = f32::from_bits(r2) * ((q2 * invq) / kd_sqrt) + o;
                     o = f32::from_bits(r3) * ((q3 * invq) / kd_sqrt) + o;
                     *oslot.add($b * 32 + s) = o;
+                    // 新状态回寄存器：lane0 ← r0>>16；lane1 已在位；
+                    // lane2 ← r2<<16；lane3 ← r3<<32（与原存储字逐位同）
+                    (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32
                 }};
             }
             // 批内单行的 kvm 部分和（切片内 j 升序）→ 槽
@@ -1145,29 +1207,40 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     *wslot.add($b * 32 + s) = kvm;
                 }};
             }
+            // 批 4 行：kvm 趟 →（屏障）→ 更新趟 + o 部分和（屏障）→ o 折叠
+            // + core_out。scratch 槽位是批内行号 0..3（warp 私有区只有 4×32
+            // 槽），屏障位置与原来逐批 2 道、每 token 16 道完全一致
+            macro_rules! dn_batch {
+                ($vr:expr) => {{
+                    let vrow = $vr;
+                    let w0 = *(sbase.add((vrow + 0) * kd + s * 4) as *const u64);
+                    let w1 = *(sbase.add((vrow + 1) * kd + s * 4) as *const u64);
+                    let w2 = *(sbase.add((vrow + 2) * kd + s * 4) as *const u64);
+                    let w3 = *(sbase.add((vrow + 3) * kd + s * 4) as *const u64);
+                    kvm4e!(w0, 0); kvm4e!(w1, 1); kvm4e!(w2, 2); kvm4e!(w3, 3);
+                    _syncthreads();
+                    *(sbase.add((vrow + 0) * kd + s * 4) as *mut u64) =
+                        dn_e2!(w0, obase + vrow + 0, 0);
+                    *(sbase.add((vrow + 1) * kd + s * 4) as *mut u64) =
+                        dn_e2!(w1, obase + vrow + 1, 1);
+                    *(sbase.add((vrow + 2) * kd + s * 4) as *mut u64) =
+                        dn_e2!(w2, obase + vrow + 2, 2);
+                    *(sbase.add((vrow + 3) * kd + s * 4) as *mut u64) =
+                        dn_e2!(w3, obase + vrow + 3, 3);
+                    _syncthreads();
+                    // o 两级折叠第二级 + core_out 落点：**只由 lane s 折自己那行**
+                    // （原版 32 个 lane 各把 4 行都折一遍、只留 b==s 的一个——3/4
+                    // 是纯冗余）。本 lane 折的行 = 批内行 s 的 32 槽，u 升序同序
+                    // ⇒ 位同
+                    if s < 4 {
+                        let o = fold32!(oslot.add(s * 32));
+                        *core_out.add(obase + vrow + s) = f32_to_bf16(o);
+                    }
+                }};
+            }
+            let mut vrow = w * 32;
             while vrow < (w + 1) * 32 {
-                let w0 = *(sbase.add((vrow + 0) * kd + s * 4) as *const u64);
-                let w1 = *(sbase.add((vrow + 1) * kd + s * 4) as *const u64);
-                let w2 = *(sbase.add((vrow + 2) * kd + s * 4) as *const u64);
-                let w3 = *(sbase.add((vrow + 3) * kd + s * 4) as *const u64);
-                kvm4e!(w0, 0); kvm4e!(w1, 1); kvm4e!(w2, 2); kvm4e!(w3, 3);
-                _syncthreads();
-                dn_e2!(w0, 0); dn_e2!(w1, 1); dn_e2!(w2, 2); dn_e2!(w3, 3);
-                _syncthreads();
-                // o 两级折叠第二级 + core_out 落点（lane b 写批内行 b）
-                let mut b = 0usize;
-                while b < 4 {
-                    let mut o = 0.0f32;
-                    let mut u = 0usize;
-                    while u < 32 {
-                        o = *oslot.add(b * 32 + u) + o;
-                        u += 1;
-                    }
-                    if s == b {
-                        *core_out.add(obase + vrow + b) = f32_to_bf16(o);
-                    }
-                    b += 1;
-                }
+                dn_batch!(vrow);
                 vrow += 4;
             }
             i += 1;
