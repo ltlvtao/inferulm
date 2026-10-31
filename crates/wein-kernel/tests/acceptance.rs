@@ -77,10 +77,12 @@ fn k1_ptx_artifact_structure() {
     // 长序列分块 attention（KV 复用几何）两入口
     assert!(ptx.contains(".entry paged_attn_tile("), "paged_attn_tile 入口缺失/被改名");
     assert!(ptx.contains(".entry attn_combine("), "attn_combine 入口缺失/被改名");
+    // deltanet 的 q/k l2norm 前置小 kernel（invq/invk 去重）
+    assert!(ptx.contains(".entry dn_qk_l2norm("), "dn_qk_l2norm 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        22,
-        "导出 kernel 数应为 22（多了说明编译单元混入了别的入口）"
+        23,
+        "导出 kernel 数应为 23（多了说明编译单元混入了别的入口）"
     );
 }
 

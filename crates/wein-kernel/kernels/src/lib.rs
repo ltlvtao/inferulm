@@ -1270,8 +1270,9 @@ unsafe fn dn_row128(
 /// （一块 = (行, v 头) × 4 warp，warp 顺序吃 v 行、lane 持 j 切片 u64
 /// 全合并——见 E2 分支内注释）；其余一块 = (请求行, v 头)，一线程一 v 维
 /// （线程私有 state 行 S[v][0..k_dim]，全局内存 L1 驻留）。
-/// 每 token：q/k 逐头 l2norm（f32，eps=1e-6）→ q 再除 √k_dim →
-/// 存取走 u64 整载/整存（4×bf16，ld/st.global.b64——同 paged_attn 习语），
+/// 每 token：q/k 的 l2norm 倒数（f32，eps=1e-6）由前置 kernel
+/// `dn_qk_l2norm` 逐 (token, k 头) 算一次（本 kernel 只读）→ q 再除 √k_dim →
+/// 存取走 u64 整载/整存（4×bf16，ld.global.b64——同 paged_attn 习语），
 /// 抽取/打包全在 u32 双车道域——deltanet 状态池 bf16 的存侧；
 /// kd%4==0 时行内偏移按 8B 对齐（cuMemAlloc ≥256B 底座）；kd=128 时
 /// 整行 S0 驻 32×u64 寄存器（见 token 循环内注释）
@@ -1284,6 +1285,76 @@ fn f32_to_bf16_hi(x: f32) -> u32 {
     let bits = x.to_bits();
     let lsb = (bits >> 16) & 1;
     (bits + 0x7fff + lsb) & 0xffff_0000
+}
+
+/// q/k 的逐 (token, k 头) l2norm 倒数——deltanet 的前置小 kernel（每层一次）。
+///
+/// 去重的对象：同一 (状态行, v 头) 有 `vsplit` 个块、每块 `nwarps` 个 warp，
+/// 早先**每个 warp 各把 q/k 的 k_dim 维扫一遍**求同一份 invq/invk（生产几何
+/// vsplit=8 × 2 warp ⇒ 同一份数被算 16 遍）；而 k[j]/q[j] 对整条 v 维共享。
+/// 这一刀把它变成每 (token, k 头) 算一次，主 kernel 只读 2 个 f32。
+///
+/// **归约树照抄主 kernel 原文**（不是"新的归约"）：平方和不是精确和（加法
+/// 非结合），换树必改末位——这里只是把同一条 j 升序单链从"每 warp 算一遍"
+/// 挪到"每 (token, 头) 算一遍"。kd%4==0 走 32 次 u64 整载 + 4 项展开（与
+/// 主 kernel E2 l2norm 循环逐字同式，逐位同）；否则走标量 j++ 链（与通用
+/// 路径同式）。ε 在加法后、sqrt 前（同式同位）。
+/// inv[(token·k_heads+kh)·2] = invq、+1 = invk（f32 原样落，无舍入）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn dn_qk_l2norm(
+    q: *const u16, // [tokens, k_heads, k_dim]
+    k: *const u16, // [tokens, k_heads, k_dim]
+    inv: *mut f32, // [tokens*k_heads, 2]
+    tokens: u32,
+    k_heads: u32,
+    k_dim: u32,
+    l2_eps: f32,
+) {
+    let kd = k_dim as usize;
+    let i = tid() as usize;
+    if i >= tokens as usize * k_heads as usize {
+        return;
+    }
+    let qb = i * kd;
+    let mut sq = 0.0f32;
+    let mut sk = 0.0f32;
+    if kd % 4 == 0 {
+        let mut j = 0usize;
+        while j < kd {
+            let qw4 = *(q.add(qb + j) as *const u64);
+            let kw4 = *(k.add(qb + j) as *const u64);
+            let (qlo4, qhi4) = (qw4 as u32, (qw4 >> 32) as u32);
+            let (klo4, khi4) = (kw4 as u32, (kw4 >> 32) as u32);
+            let qa = f32::from_bits(qlo4 << 16);
+            let qb2 = f32::from_bits(qlo4 & 0xffff_0000);
+            let qc = f32::from_bits(qhi4 << 16);
+            let qd = f32::from_bits(qhi4 & 0xffff_0000);
+            let ka = f32::from_bits(klo4 << 16);
+            let kb2 = f32::from_bits(klo4 & 0xffff_0000);
+            let kc = f32::from_bits(khi4 << 16);
+            let kd2 = f32::from_bits(khi4 & 0xffff_0000);
+            sq = qa * qa + sq;
+            sq = qb2 * qb2 + sq;
+            sq = qc * qc + sq;
+            sq = qd * qd + sq;
+            sk = ka * ka + sk;
+            sk = kb2 * kb2 + sk;
+            sk = kc * kc + sk;
+            sk = kd2 * kd2 + sk;
+            j += 4;
+        }
+    } else {
+        let mut j = 0usize;
+        while j < kd {
+            let qv = bf16_to_f32(*q.add(qb + j));
+            let kv = bf16_to_f32(*k.add(qb + j));
+            sq = qv * qv + sq;
+            sk = kv * kv + sk;
+            j += 1;
+        }
+    }
+    *inv.add(i * 2) = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
+    *inv.add(i * 2 + 1) = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
 }
 
 /// S·=exp(g)；kv_mem=ΣS·k_n；delta=(v−kv_mem)·β；S+=k_n⊗delta；
@@ -1317,7 +1388,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     v_heads: u32,
     k_dim: u32,
     v_dim: u32,
-    l2_eps: f32,
+    inv: *const f32, // [tokens*k_heads, 2]——q/k l2norm 倒数（前置 kernel `dn_qk_l2norm` 写，本 kernel 只读）
     scratch: *mut f32, // [块, 1024]——E2 kvm/o 两级折叠槽（op 预分配，块按 blockIdx 私有）
     specs: *const u32, // [rows] 逐 span：0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
     vsplit: u32, // E2 chunked：v 行切分数（1 = 不切；grid = rows×v_heads×vsplit）
@@ -1345,8 +1416,10 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     // 表达式、批内槽位算术序全部逐字不变 ⇒ 位级输出与不切块同（v 行彼此
     // 独立、归约在 warp 内的 32 lane 上，块边界不切任何一条依赖链）。
     // 状态读/写按行私有（state[v][kd]），块间不共享 ⇒ 无 scratch 广播、
-    // 无重复状态读；唯一的重复读是块内每 token 各载一次的 q/k 切片与
-    // l2norm（每块 2×kd bf16 + 256 flop），vsplit 倍于不切块时的量。
+    // 无重复状态读。q/k 切片仍是每块每 token 各载一次（每块 2×kd bf16，
+    // vsplit 倍于不切块时的量，全在 L2），但**l2norm 已不再按块重复**：
+    // 它在前置 kernel `dn_qk_l2norm` 里逐 (token, k 头) 算一次（同一条
+    // j 升序平方和链），本 kernel 只读 invq/invk 两个 f32。
     if kd == 128 && vd == 128 {
         let bid = _block_idx_x() as usize;
         let nsp = if vsplit == 0 { 1 } else { vsplit as usize };
@@ -1382,7 +1455,13 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32);
             let stride = vh * vd * kd; // 一行 state 的 bf16 单元数
             let mut sbase = state.add((*row_id.add(r) as usize * vh + h) * vd * kd);
-            let wslot = scratch.add(bid * nwarps * 256 + w * 128);
+            // 块私有槽基址与 spec==0 路径**同一块步长**（`bid·nwarps·1024`）：
+            // 两条路径的块在同一 grid 里按 bid 交错（普通行在前、链段在后），
+            // 块步长不一致时后者的槽区会落进前者的槽区——跨块偶发覆写
+            // （qs11 混合批 sp=2/4 的位分叉即此）。本路径只用 4 行 × 32 lane
+            // = 128 槽/warp，块内相对槽址（w·128、o 区 +nwarps·128）不变
+            // ⇒ 归约树与落点逐字不变。
+            let wslot = scratch.add(bid * nwarps * 1024 + w * 128);
             let oslot = wslot.add(nwarps * 128);
             let mut i = 0usize;
             while i < cnt {
@@ -1390,18 +1469,10 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                 let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
                 let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
                 let qb = (g * k_heads as usize + kh) * kd;
-                let mut sq = 0.0f32;
-                let mut sk = 0.0f32;
-                let mut j = 0usize;
-                while j < kd {
-                    let qv = bf16_to_f32(*q.add(qb + j));
-                    let kv = bf16_to_f32(*k.add(qb + j));
-                    sq = qv * qv + sq;
-                    sk = kv * kv + sk;
-                    j += 1;
-                }
-                let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
-                let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
+                // invq/invk 由前置 kernel 逐 (token, k 头) 算一次（本块只读
+                // 2 个 f32）——同一条 j 升序平方和链，位同
+                let invq = *inv.add((g * k_heads as usize + kh) * 2);
+                let invk = *inv.add((g * k_heads as usize + kh) * 2 + 1);
                 let kw = *(k.add(qb + s * 4) as *const u64);
                 let qw = *(q.add(qb + s * 4) as *const u64);
                 let (klo, khi) = (kw as u32, (kw >> 32) as u32);
@@ -1507,41 +1578,13 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
             let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
             let qb = (g * k_heads as usize + kh) * kd;
-            // l2norm（j 升序 128 项平方和 → +eps → sqrt → 倒数）：**和树不动**。
-            // 平方和不是精确和（加法非结合），换归约树必改末位——实测两级
-            // 折叠 42525/49152 组位不同，故仍是 j 升序单链。这里只把 128 次
-            // 标量 u16 载入合并成 32 次 u64 整载（一次拿 4 个 bf16，与 :1130
-            // 的 kw/qw 同手法）并把每组的 4 项展开：sq/sk 两条链的加法序仍
-            // 是 j 升序且 acc 在前（`v*v + acc` 逐字同式），逐位不变；拿掉的
-            // 只是每元素一次的地址运算与循环回边依赖。
-            let mut sq = 0.0f32;
-            let mut sk = 0.0f32;
-            let mut j = 0usize;
-            while j < kd {
-                let qw4 = *(q.add(qb + j) as *const u64);
-                let kw4 = *(k.add(qb + j) as *const u64);
-                let (qlo4, qhi4) = (qw4 as u32, (qw4 >> 32) as u32);
-                let (klo4, khi4) = (kw4 as u32, (kw4 >> 32) as u32);
-                let qa = f32::from_bits(qlo4 << 16);
-                let qb2 = f32::from_bits(qlo4 & 0xffff_0000);
-                let qc = f32::from_bits(qhi4 << 16);
-                let qd = f32::from_bits(qhi4 & 0xffff_0000);
-                let ka = f32::from_bits(klo4 << 16);
-                let kb2 = f32::from_bits(klo4 & 0xffff_0000);
-                let kc = f32::from_bits(khi4 << 16);
-                let kd2 = f32::from_bits(khi4 & 0xffff_0000);
-                sq = qa * qa + sq;
-                sq = qb2 * qb2 + sq;
-                sq = qc * qc + sq;
-                sq = qd * qd + sq;
-                sk = ka * ka + sk;
-                sk = kb2 * kb2 + sk;
-                sk = kc * kc + sk;
-                sk = kd2 * kd2 + sk;
-                j += 4;
-            }
-            let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
-            let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
+            // invq/invk 由前置 kernel `dn_qk_l2norm` 逐 (token, k 头) 算一次。
+            // **和树没动**：那套 j 升序 128 项平方和单链（32 次 u64 整载 + 4
+            // 项展开、acc 在前）逐字搬进了前置 kernel，本 kernel 只读 2 个
+            // f32——早先本块的每个 warp 都各扫一遍同一份 q/k（vsplit×nwarps
+            // 倍重复），那是切块后剩下的重复账。
+            let invq = *inv.add((g * k_heads as usize + kh) * 2);
+            let invk = *inv.add((g * k_heads as usize + kh) * 2 + 1);
             // k/q 的 j 切片每 token 载一次（u64 全合并），整段 32 行复用
             let kw = *(k.add(qb + s * 4) as *const u64);
             let qw = *(q.add(qb + s * 4) as *const u64);
@@ -1726,20 +1769,11 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         // β 先收 bf16（HF b.sigmoid() 在 bf16 张量上、recurrent 内再展 f32）
         let decay = expf(0.0 - big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb));
         let beta = bf16_to_f32(f32_to_bf16(1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h))))));
-        // q/k l2norm：各线程顺序扫（j 升序同参考）
+        // q/k l2norm 的倒数：前置 kernel 逐 (token, k 头) 算一次（j 升序
+        // 单链，与这里原来那圈逐字同式），本线程只读 2 个 f32
         let qb = (g * k_heads as usize + kh) * kd;
-        let mut sq = 0.0f32;
-        let mut sk = 0.0f32;
-        let mut j = 0usize;
-        while j < kd {
-            let qv = bf16_to_f32(*q.add(qb + j));
-            let kv = bf16_to_f32(*k.add(qb + j));
-            sq = qv * qv + sq;
-            sk = kv * kv + sk;
-            j += 1;
-        }
-        let invq = 1.0f32 / core::intrinsics::sqrt::<f32>(sq + l2_eps);
-        let invk = 1.0f32 / core::intrinsics::sqrt::<f32>(sk + l2_eps);
+        let invq = *inv.add((g * k_heads as usize + kh) * 2);
+        let invk = *inv.add((g * k_heads as usize + kh) * 2 + 1);
         // kvm 趟 + 更新趟（读 S0 写 S2）。kd=128 走 dn_row128（宏展开·行驻
         // 寄存器：32×u64 组元组，无循环、恒定索引，SROA 必拆 SSA 驻寄存器；
         // 更新趟零重读——状态访存 3 趟 → 2 趟）。通用路径：装载即展宽（存储值

@@ -260,8 +260,11 @@ fn o20_deltanet_golden_bitwise() {
     // ——逐位必须同上（切块只改"哪个块负责哪几行"，行内算术一个字不动）
     o20_case(4, 8, 128, 128, 4);
     o20_case(4, 8, 128, 128, 2);
-    // 8 块 = 生产 prefill 几何（16 行/块 × 2 warp × 8 行 = 批 8）
+    // 8 块 = 上一档生产 prefill 几何（16 行/块 × 2 warp × 8 行 = 批 8）
     o20_case(4, 8, 128, 128, 8);
+    // 16 块 = invq/invk 去重后的生产 prefill 几何（8 行/块 × 2 warp × 4 行 =
+    // 批 4；单 span 长 prefill 的"块数 ≈ 512"配比就落在这档）
+    o20_case(4, 8, 128, 128, 16);
 }
 
 fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize, vsplit: u32) {
@@ -304,8 +307,8 @@ fn o20_case(k_heads: usize, v_heads: usize, k_dim: usize, v_dim: usize, vsplit: 
     let (drs, drc, dri) = (gpu.alloc_from_slice(&row_start), gpu.alloc_from_slice(&row_count), gpu.alloc_from_slice(&row_id));
     let dspec0 = gpu.alloc_from_slice(&vec![0u32; n_rows]); // 非投机路径：全 0 常量数组
     t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6, &dspec0,
-        vsplit, &stream);
+        n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32,
+        tokens as u32, 1e-6, &dspec0, vsplit, &stream);
     stream.sync();
     assert_bits(&format!("{tag} core_out"), &dout.read_to_vec(), &expect_out);
     assert_bits(&format!("{tag} state"), &dstate.read_to_vec(), &expect_state);
@@ -472,16 +475,16 @@ fn o22_deltanet_latency_canary() {
     for _ in 0..3 {
         // 热身（JIT/缓存就位）；状态每拍原地演化——形状与访存量不变
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6,
-            &dspec0, 1, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32,
+            tokens as u32, 1e-6, &dspec0, 1, &stream);
     }
     stream.sync();
     let (e0, e1) = (gpu.event(), gpu.event());
     e0.record_on(&stream);
     for _ in 0..20 {
         t.deltanet.run(&dq, &dk, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &dri,
-            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32, 1e-6,
-            &dspec0, 1, &stream);
+            n_rows as u32, k_heads as u32, v_heads as u32, k_dim as u32, v_dim as u32,
+            tokens as u32, 1e-6, &dspec0, 1, &stream);
     }
     e1.record_on(&stream);
     stream.sync();

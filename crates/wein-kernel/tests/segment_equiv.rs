@@ -209,7 +209,8 @@ fn o16_deltanet_segment_equivalence() {
         let dspec0 = gpu.alloc_from_slice(&vec![0u32; rows]); // 非投机路径：全 0 常量数组
         t.deltanet.run(
             &dq, &dk_, &dv, &da, &db, &da_log, &ddtb, &dstate, &dout, &drs, &drc, &drid,
-            rows as u32, kh_n as u32, vh_n as u32, kd as u32, vd as u32, eps, &dspec0, 1, &stream,
+            rows as u32, kh_n as u32, vh_n as u32, kd as u32, vd as u32, tokens as u32, eps,
+            &dspec0, 1, &stream,
         );
         stream.sync();
         // GPU 输出同为批内全局 token 轴——同法重排

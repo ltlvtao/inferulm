@@ -140,7 +140,9 @@ impl OpTable<'_> {
         let deltanet = DeltanetCuda {
             gpu,
             f: m.func("deltanet"),
+            l2f: m.func("dn_qk_l2norm"),
             scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * DELTA_SLOTS_PER_BLOCK * 4),
+            inv: gpu.alloc_bytes(DELTA_L2_TOKENS_CAP * DELTA_L2_KHEADS_CAP * 2 * 4),
         };
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
@@ -263,21 +265,35 @@ const DELTA_WIDE_GRID_MAX: usize = 64;
 /// 每块 scratch 槽数 = 2 区 × warp 数 × 16 行批 × 32 lane（与 kernel 侧
 /// `bid * nwarps * 1024` 同构）；按宽块（warp 多）预留
 const DELTA_SLOTS_PER_BLOCK: usize = (DELTA_WIDE_BLOCK_DIM / 32) * 1024;
-/// B 档 chunked（保守档）的 v 行切分数：块从 (行, v 头) 扩成 (行, v 头, v 行块)，
-/// 每块只吃 vd/vsplit 个连续 v 行 ⇒ 块数 ×vsplit、每块依赖链 ÷vsplit。
-/// vd=128、单 span prefill ⇒ 16 行/块、grid 32→256。实测（250 token）：不切
-/// 44.5ms、切 4 + 128 线程 23.9ms、切 8 + 64 线程 20.9ms、切 16 21.0ms（重复
-/// l2norm 变大吃掉收益）⇒ 取 8。
+/// B 档 chunked（保守档）的 v 行切分数上限：块从 (行, v 头) 扩成
+/// (行, v 头, v 行块)，每块只吃 vd/vsplit 个连续 v 行 ⇒ 块数 ×vsplit、每块
+/// 依赖链 ÷vsplit。**具体档位由 `DELTA_SPLIT_TARGET_BLOCKS` 按块数配比**
+/// （invq/invk 去重后 16 才吃到肉：早先每块重复算 l2norm，切 16 的重复账
+/// 把收益吃掉了）。
 /// **行内算术一个字不动**：切块只改"哪个块负责哪几行"（v 行彼此独立、归约在
 /// warp 内 32 lane 上），故位级输出与不切块同（o20/o25 钉住）。
-const DELTA_SPLIT: usize = 8;
+const DELTA_SPLIT: usize = 16;
+/// 切块的目标块数（= 128 SM × 4 块/SM）：`s = min(目标/base, 上限)`，
+/// base = 行数 × v 头。实测（250/256 token 的 prefill，每 token 每层 µs，
+/// invq/invk 去重后）：1 行(s=16) 2.70、2 行(s=8) 3.52、4 行(s=4) 6.85、
+/// 8 行(s=2) 11.8、100 行(s=1) 310µs/launch——最优点恒在"块数 ≈ 512"附近，
+/// 行数再多就回到"铺满即不切"
+const DELTA_SPLIT_TARGET_BLOCKS: usize = 512;
 /// 切块时的块宽（线程数）：64 = 2 warp（行/warp 加倍、每 token 的屏障减半）；
 /// 128 = 4 warp。行内算术全同，只改 warp 数与批大小（屏障密度）；实测同 split
 /// 下两者的 delta 反向不定（split4：128 线程 23.9 vs 64 线程 27.5），故靠测量选
 const DELTA_SPLIT_BLOCK_DIM: usize = 64;
 /// 切块门 ②：块数已达此值即视为铺满（128 SM × 4 块）——此时再切只加重复读
-/// （每块每 token 各算一遍 q/k l2norm），不加并行
+/// （每块每 token 各载一遍 q/k 切片），不加并行
 const DELTA_SPLIT_MAX_BLOCKS: usize = 512;
+/// 前置 l2norm kernel（`dn_qk_l2norm`）的缓冲容量：tokens × k 头。
+/// tokens 取 exec 的 T_MAX（512），k 头留到 64（真模型 16）——用不满的段
+/// 不碰（缓冲 512×64×2 f32 = 256KB，一次性分配）。超容即断言（不静默截）
+const DELTA_L2_TOKENS_CAP: usize = 512;
+const DELTA_L2_KHEADS_CAP: usize = 64;
+/// 前置 l2norm kernel 的块宽（一线程一 (token, k 头)，各持一条 j 升序
+/// 平方和链——无跨线程归约，宽窄只影响占用率）
+const DELTA_L2_BLOCK_DIM: u32 = 128;
 
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
@@ -480,7 +496,13 @@ impl ConvStateRollOp for ConvStateRollCuda<'_> {
 
 /// gated deltanet 递推：grid = rows×v_heads×vsplit；block = v_dim（kd=vd=128 时
 /// 128 线程走 E2 warp 重映射）。状态池属 executor（[rows, v_heads, v_dim,
-/// k_dim] bf16，行号经 row_id 间接）
+/// k_dim] bf16，行号经 row_id 间接）。
+///
+/// 前置一小 kernel `dn_qk_l2norm`（q/k 的逐 (token, k 头) l2norm 倒数，
+/// 主 kernel 只读）——早先每个 (行, 头) 的 vsplit 个块 × 每块 nwarps 个 warp
+/// 都在重复算同一份 invq/invk，k[j]/q[j] 却对整条 v 维共享。**一次 run 两次
+/// launch**（前置小 kernel 依赖本层的 q/k，且主 kernel 必须等它写完 ⇒ 跨块
+/// 同步在 nvptx 后端无安全机制，只能分 launch）。
 pub trait DeltanetOp {
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -502,6 +524,9 @@ pub trait DeltanetOp {
         v_heads: u32,
         k_dim: u32,
         v_dim: u32,
+        // 本步 token 总数（q/k 的行数，= Σ row_count）：前置 l2norm kernel 按
+        // [tokens, k_heads] 逐对算倒数；deltanet 的 g 就是该缓冲的行号
+        tokens: u32,
         l2_eps: f32,
         // [rows] 逐 span 标志：0 = 逐段单行状态（现有语义）；1 = 逐位置行
         // （token i 读行 row_id[r]+i、写行 +i+1——MTP 验证链的零拷贝回滚；
@@ -518,9 +543,17 @@ pub trait DeltanetOp {
 pub struct DeltanetCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// 前置 l2norm kernel（`dn_qk_l2norm`）
+    l2f: Func,
     /// E2 warp 归约 scratch：[DELTA_BLOCK_CAP, 4096] f32（kvm/o 两区各 2048），
     /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
     scratch: DevBuf<'a>,
+    /// invq/invk 缓冲：[DELTA_L2_TOKENS_CAP × DELTA_L2_KHEADS_CAP, 2] f32
+    /// （= 每 token 每层 2×k_heads 个 f32：kh=16 时 128 B/token/层，250 token
+    /// 一个 prefill 步 = 32KB；24 层复用同一块，不按层乘）。resolve 一次
+    /// 预分配——capture 期零分配，跨层复用（前置 kernel 每层全量覆写本层
+    /// tokens×k_heads 段后才被主 kernel 读，无别名风险）
+    inv: DevBuf<'a>,
 }
 
 impl DeltanetOp for DeltanetCuda<'_> {
@@ -544,11 +577,26 @@ impl DeltanetOp for DeltanetCuda<'_> {
         v_heads: u32,
         k_dim: u32,
         v_dim: u32,
+        tokens: u32,
         l2_eps: f32,
         specs: &DevBuf,
         vsplit: u32,
         stream: &Stream,
     ) {
+        // ── 前置：q/k 的逐 (token, k 头) l2norm 倒数（一次 launch）──
+        // 主 kernel 的每个 (行, 头) 有 vsplit 个块、每块 nwarps 个 warp，
+        // 早先各自把 q/k 的 k_dim 维扫一遍求同一份 invq/invk——k[j]/q[j]
+        // 对整条 v 维共享，这份重复是切块后剩下的主项。归约树（j 升序单链）
+        // 原样搬进前置 kernel，位级不变。
+        assert!(
+            tokens as usize <= DELTA_L2_TOKENS_CAP
+                && k_heads as usize <= DELTA_L2_KHEADS_CAP,
+            "deltanet l2norm 前置：tokens={tokens} × k_heads={k_heads} 超缓冲容量 \
+             {DELTA_L2_TOKENS_CAP}×{DELTA_L2_KHEADS_CAP}"
+        );
+        let n = tokens * k_heads;
+        let l2args = crate::kernel_args![*q, *k, self.inv, tokens, k_heads, k_dim, l2_eps];
+        self.gpu.launch(&self.l2f, n.div_ceil(DELTA_L2_BLOCK_DIM), DELTA_L2_BLOCK_DIM, &l2args, stream);
         // 块几何自带：kd=vd=128 走 E2（一块=(行, v 头)×128 线程=4 warp，
         // warp 顺序吃 v 行、lane 持 j 切片 u64——warp 指令 256B 全合并；
         // kvm/o 归约走 scratch 两级折叠）；其余一块 = (行, v 头)、
@@ -557,7 +605,7 @@ impl DeltanetOp for DeltanetCuda<'_> {
         // ── B 档 chunked 的自适应门（仅 E2）──
         // ① 容量：块数 rows×v_heads×vsplit ≤ DELTA_BLOCK_CAP（块私有 scratch 槽）
         // ② 铺满：块数已 ≥ DELTA_SPLIT_MAX_BLOCKS 时切块只加重复读（每块每
-        //    token 各自算一遍 q/k l2norm + 再读一遍 k/q 切片），不加并行
+        //    token 各载一遍 q/k 切片），不加并行
         // ③ 几何：vd 可被 vsplit 整除，且每 warp 行数 = vd/(vsplit·nwarps) 是
         //    kernel 侧批 4 的整数倍（rows_pw % 4 == 0）
         let sp = if !e2 {
@@ -565,7 +613,11 @@ impl DeltanetOp for DeltanetCuda<'_> {
         } else {
             let base = (n_rows as usize * v_heads as usize).max(1);
             let cap = DELTA_BLOCK_CAP / base;
-            let mut s = (vsplit as usize).clamp(1, DELTA_SPLIT);
+            // 档位 = min(目标块数/base, 调用方给的上限)：`vsplit` 是**上限**
+            // （解码门控给 1 即永远不切），实际切多少看铺满程度
+            let mut s = (DELTA_SPLIT_TARGET_BLOCKS / base)
+                .min(vsplit as usize)
+                .clamp(1, DELTA_SPLIT);
             // kernel 侧批大小 = min(16, rows_pw)、步进按 4 的整数倍 ⇒ rows_pw ∈
             // {4, 8, 16, 32}（vd=128 与 2 幂 warp 数下必为 2 幂）
             let ok = |s: usize| {
@@ -585,7 +637,7 @@ impl DeltanetOp for DeltanetCuda<'_> {
         };
         let sp = sp as u32; // 活过 launch 的 place（kernel_args! 取地址，临时值会被栈槽复用）
         let args = crate::kernel_args![*q, *k, *v, *a, *b, *a_log, *dt_bias, *state, *core_out,
-            *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, l2_eps,
+            *row_start, *row_count, *row_id, n_rows, k_heads, v_heads, k_dim, v_dim, self.inv,
             self.scratch, *specs, sp];
         let grid = n_rows * v_heads * sp;
         if e2 {

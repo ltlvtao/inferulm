@@ -2835,12 +2835,14 @@ impl Qwen35Executor {
                     // 才切 v 行。判据 = 本步 token 总数 > 行数（有任一行吃了多
                     // token ⇒ 该行的状态行在块内串行递推、依赖链即延迟）；纯
                     // decode（每行 1 token）仍走不切块的现有几何（实测无退化，
-                    // 见 bench 报告）。容量/铺满/几何的上限钳制在 op 内做
-                    let dn_split = if t32 > n_rows { 8 } else { 1 };
+                    // 见 bench 报告）。这里给的是**上限**（invq/invk 去重后 16
+                    // 也划算），实际档位由 op 按"块数 ≈ 512"配比 + 容量/铺满/
+                    // 几何三门钳制
+                    let dn_split = if t32 > n_rows { 16 } else { 1 };
                     tb.deltanet.run(
                         &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
                         &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
-                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, L2_EPS, inp.specs,
+                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, t32, L2_EPS, inp.specs,
                         dn_split, stream,
                     );
                     if trace {

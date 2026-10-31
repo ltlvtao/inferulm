@@ -152,7 +152,7 @@ fn o27_deltanet_spec_rows() {
                   split: u32| {
         t.deltanet.run(
             &dq, &dk, &dv, &da, &db, &da_log, &ddtb, dstate, &dout, &drs, &drc, &drid, 1,
-            kh as u32, vh as u32, kd as u32, vd as u32, eps, specs, split, &stream,
+            kh as u32, vh as u32, kd as u32, vd as u32, cnt as u32, eps, specs, split, &stream,
         );
     };
 
