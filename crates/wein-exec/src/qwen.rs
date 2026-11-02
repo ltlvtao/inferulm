@@ -107,14 +107,18 @@ pub fn kv_pages() -> u32 {
 }
 
 /// 单遍 attention 的 A/B 旋钮（`WEIN_ATTN_CFG`／`WEIN_ATTN_CFG_DEC`）：每线程维数（nd）、每线程
-/// q 行数（rpt）、单块 token 片（ntok）、池 dtype（kv）。别名：
+/// q 行数（rpt）、单块 token 片 **= BR**（块内 q 行数 = BR×group，也可写 `br=`）、
+/// 池 dtype（kv）。别名：
 /// `baseline`｜`n8`｜`n16`｜`r2`｜`r4`｜`n8r4`｜`f32`｜`f32n8`｜`f32r4`｜
 /// `f32r2`；也可写逗号分隔的原子项（`nd=8,rpt=4,ntok=4,f32`）。
-/// 默认：prefill 形（t>4 行）= `n8r4`（8 维 × 4 行/线程，bdim 128）、
+/// 默认：prefill 形（t>4 行）= `r4`（4 维 × 4 行/线程，bdim 256）、
 /// decode 形（t≤4 行）= `r2`（4 维 × 2 行/线程，bdim 512）——A/B 实测见
-/// `examples/attn_ab_probe.rs`：RPT 是唯一有效的流量杠杆，但 RPT=4 在
-/// decode 形会把 bdim 压到 1 warp（块数不够 → 反而更慢），故按形状分档。
-/// 两档**逐位同值**（每条分值仍由单线程按 d 升序算完），故形状切换无风险。
+/// `examples/attn_ab_probe.rs` 与 `bench/attn_br_sweep.sh`：rpt 是流量杠杆，
+/// 但 decode 形 rpt=4 会把 bdim 压到 1 warp（块数不够 → 反而更慢），故按形状
+/// 分档；prefill 形 `r4` 优于 `n8r4`（nd=4 在 128 regs 档上把常驻线程从
+/// 256/SM 抬到 512/SM，nd=8 要 168 regs ⇒ 只有 256/SM）。
+/// 两档**逐位同值**（每线程按 d 升序算完各自的分值，RPT/ND 只改"哪个线程
+/// 载 K"），故形状/档位切换无风险——实测各档贪心逐 token 一致。
 fn attn_cfg_from_env(var: &str, dflt: wein_kernel::ops::AttnCfg) -> wein_kernel::ops::AttnCfg {
     use wein_kernel::ops::{AttnCfg, KvDtype};
     let mut cfg = dflt;
@@ -141,6 +145,9 @@ fn attn_cfg_from_env(var: &str, dflt: wein_kernel::ops::AttnCfg) -> wein_kernel:
                     cfg.rpt = v.parse().expect("WEIN_ATTN_CFG rpt=");
                 } else if let Some(v) = tok.strip_prefix("ntok=") {
                     cfg.ntok_max = v.parse().expect("WEIN_ATTN_CFG ntok=");
+                } else if let Some(v) = tok.strip_prefix("br=") {
+                    // BR = 一块覆盖的 q token 数 = ntok（行数 = BR×group）
+                    cfg.ntok_max = v.parse().expect("WEIN_ATTN_CFG br=");
                 } else {
                     panic!("未知 WEIN_ATTN_CFG 项：{tok}（见 attn_cfg_from_env）");
                 }
@@ -898,7 +905,7 @@ impl Qwen35Executor {
         // attention 的 A/B 旋钮（prefill/decode 两档）；kv 池字节密度只在分配处生效
         let attn_cfg = attn_cfg_from_env(
             "WEIN_ATTN_CFG",
-            wein_kernel::ops::AttnCfg { nd: 8, rpt: 4, ..wein_kernel::ops::AttnCfg::baseline() },
+            wein_kernel::ops::AttnCfg { rpt: 4, ..wein_kernel::ops::AttnCfg::baseline() },
         );
         let attn_cfg_dec = attn_cfg_from_env(
             "WEIN_ATTN_CFG_DEC",

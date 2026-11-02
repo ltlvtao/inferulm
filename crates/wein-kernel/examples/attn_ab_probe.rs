@@ -53,28 +53,44 @@ fn case(tokens: usize, pos0: usize, q_heads: usize, kv_heads: usize, hd: usize, 
     }
 }
 
+/// Br 扫档矩阵：(名字, nd, rpt, ntok_max=Br)。同一份 `online_body` 家族，
+/// Br 只改"一块覆盖几个 q token"⇒ KV 前缀的块内重读次数 ∝ 1/Br。
+const TIERS: &[(&str, usize, usize, usize)] = &[
+    ("r4 br4 (默认)", 4, 4, 4),
+    ("r4 br1", 4, 4, 1),
+    ("r4 br2", 4, 4, 2),
+    ("r4 br8", 4, 4, 8),
+    ("r4 br16", 4, 4, 16),
+    ("n8r4 br4 (旧默认)", 8, 4, 4),
+    ("n8r4 br8", 8, 4, 8),
+    ("n8r4 br16", 8, 4, 16),
+    ("n16r4 br8", 16, 4, 8),
+    ("n16r4 br16", 16, 4, 16),
+    ("n16r4 br32", 16, 4, 32),
+    ("n16r2 br8", 16, 2, 8),
+    ("n16r2 br16", 16, 2, 16),
+    ("n16r2 br32", 16, 2, 32),
+];
+
 fn cfgs() -> Vec<(&'static str, AttnCfg)> {
-    let mut out = Vec::new();
-    let mut add = |name: &'static str, nd: usize, rpt: usize, kv: KvDtype| {
-        out.push((name, AttnCfg { nd, rpt, ntok_max: 4, bdim_max: 1024, kv }));
-    };
-    add("baseline", 4, 1, KvDtype::Bf16);
-    add("A1 n8", 8, 1, KvDtype::Bf16);
-    add("A1 n16", 16, 1, KvDtype::Bf16);
-    add("A r2", 4, 2, KvDtype::Bf16);
-    add("A r4", 4, 4, KvDtype::Bf16);
-    add("A n8r4", 8, 4, KvDtype::Bf16);
-    add("B f32", 4, 1, KvDtype::F32);
-    add("B f32n8", 8, 1, KvDtype::F32);
-    add("AB f32r2", 4, 2, KvDtype::F32);
-    add("AB f32r4", 4, 4, KvDtype::F32);
-    // nt=8 档（rows_nom = 8×group = 32 = ROWS_CAP）：块数再减半、屏障更少
-    let mk = |name: &'static str, nd: usize, rpt: usize| {
-        (name, AttnCfg { nd, rpt, ntok_max: 8, bdim_max: 512, kv: KvDtype::Bf16 })
-    };
-    out.push(mk("A1 n16 nt8", 16, 1));
-    out.push(mk("A n8r4 nt8", 8, 4));
-    out
+    TIERS
+        .iter()
+        .map(|&(n, nd, rpt, nt)| {
+            (n, AttnCfg { nd, rpt, ntok_max: nt, bdim_max: 512, kv: KvDtype::Bf16 })
+        })
+        .collect()
+}
+
+/// 该档在该形状下能否落地（`online_geom` 会 panic，探针先自己筛）
+fn landable(cfg: AttnCfg, q_heads: usize, kv_heads: usize, hd: usize, tokens: usize) -> bool {
+    let group = q_heads / kv_heads;
+    let nv = hd / cfg.nd;
+    let cap = 65536 / wein_kernel::ops::attn_regs_of(cfg);
+    let cap = (if cap > 512 { 512 } else { cap }) / 32 * 32;
+    (1..=cfg.ntok_max.min(tokens)).rev().any(|nt| {
+        let (rows, bdim) = (nt * group, (nt * group / cfg.rpt) * nv);
+        nt * group % cfg.rpt == 0 && bdim <= cap && bdim % 32 == 0 && bdim >= 32 && rows <= 128
+    })
 }
 
 fn main() {
@@ -85,22 +101,31 @@ fn main() {
     let (bs, q_heads, kv_heads, hd) = (16usize, 16usize, 4usize, 256usize);
     let q_scale = 1.0 / (hd as f32).sqrt();
     let group = q_heads / kv_heads;
+    // 该形状下能落地的档（t=256）：其余在 `online_geom` 里会 panic
+    let prefill_tiers: Vec<(&'static str, AttnCfg)> =
+        cfgs().into_iter().filter(|(_, c)| landable(*c, q_heads, kv_heads, hd, 256)).collect();
 
-    println!("形状：q_heads={q_heads} kv_heads={kv_heads} hd={hd} block={bs}");
-    println!("\n| 档 | nd | rpt | regs | bdim | ntok | ntile | jsplt |");
-    println!("|---|---|---|---|---|---|---|---|");
-    for (name, cfg) in cfgs() {
+    println!("形状：q_heads={q_heads} kv_heads={kv_heads} hd={hd} block={bs}（t=256 prefill 形）");
+    println!("\n| 档 | nd | rpt | regs | Br | rows | bdim | 块数 | ntile | jsplt | 线程/SM |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    for (name, cfg) in prefill_tiers {
         let g = wein_kernel::ops::PagedAttnCuda::online_geom(cfg, q_heads as u32, kv_heads as u32, hd as u32, 256);
+        let nblk = kv_heads * g.ntile * g.jsplit;
+        // 常驻线程/SM：块数 × bdim 摊到 128 个 SM（受寄存器档夹住）
+        let per_sm = (nblk * g.bdim) as f64 / 128.0;
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} |",
             name,
             cfg.nd,
             cfg.rpt,
             wein_kernel::ops::attn_regs_of(cfg),
-            g.bdim,
             g.ntok,
+            g.rows_nom,
+            g.bdim,
+            nblk,
             g.ntile,
-            g.jsplit
+            g.jsplit,
+            if per_sm > 512.0 { 512.0 } else { per_sm }
         );
     }
 
@@ -117,10 +142,15 @@ fn main() {
         "\n| 工作点 | 档 | ms | ms/基线 | KV读 MB | 独占 MB | 放大 | GB/s | 位差 |"
     );
     println!("|---|---|---|---|---|---|---|---|---|");
-    let mut tally: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut tally: Vec<(String, Vec<Option<f64>>)> = Vec::new();
     for (pi, (tag, tokens, pos0)) in points.iter().enumerate() {
         let tokens = *tokens;
         let pos0 = *pos0;
+        // 每个工作点只跑该形状能落地的档（decode 形 blocks 少、bdim 下限 32）
+        let tiers: Vec<(&'static str, AttnCfg)> = cfgs()
+            .into_iter()
+            .filter(|(_, c)| landable(*c, q_heads, kv_heads, hd, tokens))
+            .collect();
         let c = case(tokens, pos0, q_heads, kv_heads, hd, bs);
         let dq = gpu.alloc_from_slice(&c.q);
         let dbt = gpu.alloc_from_slice(&c.bt);
@@ -140,7 +170,7 @@ fn main() {
         let avg_l = (0..tokens).map(|i| (pos0 + i + 1) as f64).sum::<f64>() / tokens as f64;
         let mut base_ms = 1.0f64;
         let mut refout: Vec<u16> = Vec::new();
-        for (idx, (name, cfg)) in cfgs().into_iter().enumerate() {
+        for (idx, (name, cfg)) in tiers.into_iter().enumerate() {
             let (kk, vv): (&_, &_) = if cfg.kv == KvDtype::F32 {
                 (&dkf, &dvf)
             } else {
@@ -199,11 +229,11 @@ fn main() {
             let pos_t = match tally.iter().position(|(n, _)| n == name) {
                 Some(i) => i,
                 None => {
-                    tally.push((name.to_string(), vec![0.0; points.len()]));
+                    tally.push((name.to_string(), vec![None; points.len()]));
                     tally.len() - 1
                 }
             };
-            tally[pos_t].1[pi] = ms / base_ms;
+            tally[pos_t].1[pi] = Some(ms / base_ms);
         }
         // 两遍档 + f32 池：必须与两遍 bf16 位级相同（o30 的 f32 版）
         t.paged_attn.run_tile(
@@ -226,9 +256,14 @@ fn main() {
     println!("\n| 档 | dec1k | dec3k | dec8k | pf@768 | pf@1536 | pf@3072 | pf@6010 |");
     println!("|---|---|---|---|---|---|---|---|");
     for (name, v) in tally {
+        let cell = |x: &Option<f64>| match x {
+            Some(m) => format!("{m:.2}×"),
+            None => "—".into(),
+        };
         println!(
-            "| {} | {:.2}× | {:.2}× | {:.2}× | {:.2}× | {:.2}× | {:.2}× | {:.2}× |",
-            name, v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            name, cell(&v[0]), cell(&v[1]), cell(&v[2]), cell(&v[3]), cell(&v[4]),
+            cell(&v[5]), cell(&v[6])
         );
     }
     let _ = group;

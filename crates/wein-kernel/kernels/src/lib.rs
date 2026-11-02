@@ -1090,6 +1090,10 @@ online_export!(paged_attn_online_r2, 4, 2, false);
 online_export!(paged_attn_online_r4, 4, 4, false);
 /// R 档：4 行 × 8 维每线程
 online_export!(paged_attn_online_n8_r4, 8, 4, false);
+/// BR 档：4 行 × 16 维每线程——一块覆盖 2×q 行（BR=16 时 bdim 仍 512）
+online_export!(paged_attn_online_n16_r4, 16, 4, false);
+/// BR 档：2 行 × 16 维每线程（BR=16、bdim 512、acc 32 regs 的镜像档）
+online_export!(paged_attn_online_n16_r2, 16, 2, false);
 /// B 档：f32 池（无位展）
 online_export!(paged_attn_online_f32, 4, 1, true);
 /// B×A：f32 池 + 8 维每线程
@@ -1207,13 +1211,13 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     let cap = chunk as usize;
     let sb = pb.add(cap * rows_nom + rows_nom);
     let d0 = lane * ND; // 本线程的 ND 个输出维
-    let mut qb = [0usize; RPT]; // 组内每行的 q/out 行基址
+    // 组内**首行**的 q/out 行基址：组内第 k 行 = qb0 + k·hd（行相邻）。
+    // 存基址而不是 `[usize; RPT]`——数组版实测落 192B 的 `__local_depot`
+    // （qb 32B + mrun/lrun 各 16B + …，见 ptxas -v 的 stack frame），
+    // 每次取址走 ld.local；改成"基址 + 编译期常量偏移"后归零。
+    let mut qb0 = 0usize;
     if vr {
-        let mut k = 0usize;
-        while k < RPT {
-            qb[k] = ((t0 + tt) * qh_n + kh * ng + gq0 + k) * hd;
-            k += 1;
-        }
+        qb0 = ((t0 + tt) * qh_n + kh * ng + gq0) * hd;
     }
 
     // 在线状态（每行一份，跨 chunk 续）：m = 已见 j 全域 max、l = Σexp(·−m)、
@@ -1242,7 +1246,7 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
                     let ks = kv_ld::<ND, WIDE>(k_cache, kbase + d);
                     let mut k = 0usize;
                     while k < RPT {
-                        let qs = kv_ld::<ND, false>(q as *const u8, qb[k] + d);
+                        let qs = kv_ld::<ND, false>(q as *const u8, qb0 + k * hd + d);
                         let mut l = 0usize;
                         while l < ND {
                             s[k] = fma(qs[l], ks[l], s[k]);
@@ -1358,7 +1362,7 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
             if js == 1 {
                 let mut l = 0usize;
                 while l < ND {
-                    *out.add(qb[k] + d0 + l) = f32_to_bf16(acc[k][l] / lrun[k]);
+                    *out.add(qb0 + k * hd + d0 + l) = f32_to_bf16(acc[k][l] / lrun[k]);
                     l += 1;
                 }
             } else {
@@ -1381,8 +1385,19 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     }
 }
 
-/// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值
-const TILE_SLOT: usize = 2048 + 256 * 32 + 32 + 8 * 256;
+/// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
+/// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的
+/// 上界 = ROWS_CAP/group）。四项的定尺依据：
+/// · 行内 max 归约表（scm）= rows_nom × nv = bdim × rpt ≤ 512 × 4 = 2048
+/// · p 暂存 = chunk × rows_nom
+/// · den 表 = rows_nom
+/// · 槽位表 = ntok × chunk ≤ 32 × 512（host 侧 `ATTN_TILE_SLOT_TAB` 同尺，
+///   越界由 host 的 `launch_tile` assert 兜住）
+const ROWS_CAP: usize = 128;
+/// 槽位表定尺 = ntok(BR) 上限 32 × chunk 上限 512（host 侧 `ATTN_TILE_SLOT_TAB`
+/// 同值）。**两处常数必须逐值相同**：块私有槽 stride 不一致 = 块间互踩（静默错值）
+const SLOT_TAB: usize = 32 * 512;
+const TILE_SLOT: usize = 2048 + 256 * ROWS_CAP + ROWS_CAP + SLOT_TAB;
 
 /// 偏结果表的行距（head_dim 方向容量）：与 host 侧 `ops::ATTN_TILE_HD_CAP`
 /// 同值——表按 `[rows, split, PART_HD_STRIDE]` 预分配，head_dim 更小时尾部不用。

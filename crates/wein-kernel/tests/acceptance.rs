@@ -88,6 +88,8 @@ fn k1_ptx_artifact_structure() {
         "paged_attn_online_r2",
         "paged_attn_online_r4",
         "paged_attn_online_n8_r4",
+        "paged_attn_online_n16_r4",
+        "paged_attn_online_n16_r2",
         "paged_attn_online_f32",
         "paged_attn_online_f32_n8",
         "paged_attn_online_f32_r2",
@@ -100,8 +102,8 @@ fn k1_ptx_artifact_structure() {
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        35,
-        "导出 kernel 数应为 35（24 + attention A/B 档 11；多了说明编译单元混入了别的入口）"
+        37,
+        "导出 kernel 数应为 37（24 + attention A/B 档 13；多了说明编译单元混入了别的入口）"
     );
 }
 

@@ -130,6 +130,8 @@ impl OpTable<'_> {
             f_r2: m.func("paged_attn_online_r2"),
             f_r4: m.func("paged_attn_online_r4"),
             f_nd8_r4: m.func("paged_attn_online_n8_r4"),
+            f_n16_r4: m.func("paged_attn_online_n16_r4"),
+            f_n16_r2: m.func("paged_attn_online_n16_r2"),
             f_f32: m.func("paged_attn_online_f32"),
             f_f32_nd8: m.func("paged_attn_online_f32_n8"),
             f_f32_r4: m.func("paged_attn_online_f32_r4"),
@@ -1092,6 +1094,8 @@ pub struct PagedAttnCuda<'a> {
     f_r2: Func,
     f_r4: Func,
     f_nd8_r4: Func,
+    f_n16_r4: Func,
+    f_n16_r2: Func,
     f_f32: Func,
     f_f32_nd8: Func,
     f_f32_r4: Func,
@@ -1116,17 +1120,23 @@ pub const ATTN_SLOT_CAP: usize = 256;
 /// (4 kv × 128 片 × 1) = 512；(32q/16kv/128) 形的 256-token chunk 是
 /// 16 × 64 = 1024。scratch = 1024 × ATTN_TILE_SLOTS × 4B ≈ 21MB（一次分配）
 const ATTN_TILE_BLOCK_CAP: usize = 1024;
-/// 一块内 q 行数上限 = ntok × group（映射用：bdim = rows/rpt × hd/nd ≤ 512）
-const ATTN_TILE_ROWS_CAP: usize = 32;
+/// 一块内 q 行数上限 = ntok(即 **BR**，一块覆盖的 q token 数) × group。
+/// 32 → 128 是 BR 维度（前缀 KV 的块内复用）的容量前提：group=4 时 BR 可到
+/// 32（rows=128）。几何仍由 `online_geom` 的 bdim/寄存器账夹住
+/// （映射用：bdim = rows/rpt × hd/nd ≤ 512）
+const ATTN_TILE_ROWS_CAP: usize = 128;
 /// p 暂存的 j chunk 宽（每 chunk 一次屏障）
 const ATTN_TILE_CHUNK: usize = 256;
-/// 每块 scratch 槽数上限：max 归约(rows_nom×nv ≤ 32×64 = 2048) +
-/// p(chunk×rows≤8192) + den(rows≤32) + 槽位表(nt≤8 × chunk≤256)——与 kernel
-/// 侧 `TILE_SLOT` 同值。首项按 RPT>1 的 rows_nom×nv 定尺（不是 bdim）
+/// 每块 scratch 槽数上限：max 归约(rows_nom×nv = bdim×rpt ≤ 512×4 = 2048) +
+/// p(chunk×rows≤32768) + den(rows≤128) + 槽位表(ntok≤ROWS_CAP × chunk≤512
+/// = 65536)——与 kernel 侧 `TILE_SLOT` 同值。首项按 RPT>1 的 rows_nom×nv
+/// 定尺（不是 bdim）
 const ATTN_TILE_SLOTS: usize = 2048
     + ATTN_TILE_CHUNK * ATTN_TILE_ROWS_CAP
     + ATTN_TILE_ROWS_CAP
-    + 8 * ATTN_TILE_CHUNK;
+    + ATTN_TILE_SLOT_TAB;
+/// 槽位表定尺 = ntok(BR) 上限 × chunk 上限（与 kernel 侧 `SLOT_TAB` 同值）
+const ATTN_TILE_SLOT_TAB: usize = 32 * 512;
 /// j 分片数上限（decode 形：批小、块不够用时按 j 切片换并行度）
 pub const ATTN_TILE_SPLIT_CAP: usize = 16;
 /// 分片档的 q 行容量（jsplit>1 只在小批发生：rows = tokens×q_heads ≤ 1024）
@@ -1156,7 +1166,12 @@ pub enum KvDtype {
 /// · `rpt`：**每线程 q 行数**＝"每 KV 字节服务的 q 行数"，K/V 的 L2 载入次数
 ///   直接 ÷rpt（唯一有效的流量杠杆；受 group 整除与寄存器预算约束）
 /// · `nd`：每线程维数（4/8/16）＝V 段切分与载入粒度
-/// · `ntok_max`：单块 token 片上限（只改块数：流量中性，减屏障）
+/// · `ntok_max`：单块 token 片上限，即 **BR**（一块覆盖的 q token 数，
+///   行数 = BR×group）。KV 前缀的块内重读次数 ∝ 1/BR——这是"KV 前缀要流
+///   几遍"的唯一杠杆。但它同时把块数除以 BR（块数 = kv 头 × tokens/BR），
+///   而本内核的墙是"每 SM 的常驻线程数"（寄存器夹在 65536/regs）⇒ BR 抬过
+///   `SM 数 /(kv 头 × 32/group)` 之后并行度掉得比流量快，实测净负（见
+///   `bench/attn_br_sweep.sh` 与提交说明的表）
 /// · `bdim_max`：单块线程上限（实际再被寄存器账夹住）
 /// · `kv`：池 dtype
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1196,8 +1211,11 @@ const fn attn_regs(nd: usize, rpt: usize, f32_kv: bool) -> usize {
         (8, 1, false) => 86,
         (16, 1, false) => 100,
         (4, 2, false) => 128,
-        (4, 4, false) => 168,
+        // qb 由 `[usize; RPT]` 改基址+常量偏移后 r4 从 168 落到 128
+        (4, 4, false) => 128,
         (8, 4, false) => 168,
+        (16, 4, false) => 167,
+        (16, 2, false) => 159,
         (4, 1, true) => 96,
         (8, 1, true) => 96,
         (4, 2, true) => 134,
@@ -1404,6 +1422,8 @@ impl PagedAttnCuda<'_> {
             (4, 2, KvDtype::Bf16) => &self.f_r2,
             (4, 4, KvDtype::Bf16) => &self.f_r4,
             (8, 4, KvDtype::Bf16) => &self.f_nd8_r4,
+            (16, 4, KvDtype::Bf16) => &self.f_n16_r4,
+            (16, 2, KvDtype::Bf16) => &self.f_n16_r2,
             (4, 1, KvDtype::F32) => &self.f_f32,
             (8, 1, KvDtype::F32) => &self.f_f32_nd8,
             (4, 4, KvDtype::F32) => &self.f_f32_r4,
@@ -1458,6 +1478,15 @@ impl PagedAttnCuda<'_> {
                 )
             });
         let (rows_nom, bdim) = (ntok * group, (ntok * group / rpt) * nv);
+        // scratch 定尺（与 kernel 侧 `TILE_SLOT` 的三项一一对应）：p 区
+        // chunk×rows、槽位表 ntok×chunk、行内 max 表 bdim×rpt。任一越界都是
+        // 块间互踩（静默错值），故在这里显式挡死
+        assert!(
+            rows_nom <= ATTN_TILE_ROWS_CAP
+                && ntok * ATTN_TILE_CHUNK <= ATTN_TILE_SLOT_TAB
+                && bdim * rpt <= 2048,
+            "单遍档 scratch 越界：ntok={ntok} rows={rows_nom} bdim={bdim} rpt={rpt}"
+        );
         let ntile = (tokens as usize + ntok - 1) / ntok;
         let base = kv_heads as usize * ntile;
         // 同 `tile_geom`：偏结果表按 tokens×q_heads 行定尺，大 chunk 不开分片
