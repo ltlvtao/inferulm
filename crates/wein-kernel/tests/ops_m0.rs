@@ -1062,3 +1062,126 @@ fn o32_paged_attn_tile_long_seq_timing() {
         drop((dkc, dvc, dbt, dsi, dpo));
     }
 }
+
+/// o34 · 块档（Br 参数化、O/P 落**块私有 scratch**）对拍单遍档。
+///
+/// 合同：`jsplit == 1` 时**逐位**等于单遍档（`paged_attn_online`）——两者
+/// 的代数、j 序、chunk 边界一字不差，只有累加器住在 scratch 而不是寄存器；
+/// `jsplit > 1` 走偏结果 + `attn_combine`⇒容差档（判据同 o33）。
+#[test]
+fn o34_paged_attn_blk_bitwise_and_tolerance() {
+    use wein_kernel::ops::{BlkCfg, KvDtype};
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let stream = gpu.stream();
+    let block_size = 16usize;
+    // (q_heads, kv_heads, head_dim, tokens, pos)
+    let cases = [
+        (16usize, 4usize, 256usize, 1usize, 0usize),
+        (16usize, 4usize, 256usize, 1usize, 50usize),
+        (16, 4, 256, 4, 5),
+        (16usize, 4usize, 256usize, 4usize, 300usize),
+        (16, 4, 256, 32, 1000),
+        (16, 4, 256, 256, 3000),
+        (16, 4, 128, 128, 2000),
+        (16, 4, 256, 193, 3071),
+    ];
+    let cfgs = [(4usize, 256usize, 1usize), (16, 256, 1), (32, 256, 1), (32, 64, 1), (32, 256, 4)];
+    for (qh, kvh, hd, tokens, pos) in cases {
+        let bpr = (pos + 1).div_ceil(block_size);
+        let nseq = 2usize;
+        let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+        let seq_ids: Vec<u32> = (0..tokens).map(|r| (r % nseq) as u32).collect();
+        // 位置**逐 token 不同**（覆盖"本片对某行无有效 j"的空片路）
+        let positions: Vec<u32> = (0..tokens).map(|i| (pos + 1 - tokens + i) as u32).collect();
+        let he = kvh * hd;
+        let slots = nseq * bpr * block_size;
+        let k_cache = vec_bf16(0x51ab, slots * he, 1.0);
+        let v_cache = vec_bf16(0x62cd, slots * he, 1.0);
+        let qn = tokens * qh * hd;
+        let q = vec_bf16(0x73ef, qn, 2.0);
+        let q_scale = 1.0 / (hd as f32).sqrt();
+        let dq = gpu.alloc_from_slice(&q);
+        let (dkc, dvc) = (gpu.alloc_from_slice(&k_cache), gpu.alloc_from_slice(&v_cache));
+        let (dbt, dsi, dpo) = (
+            gpu.alloc_from_slice(&block_table),
+            gpu.alloc_from_slice(&seq_ids),
+            gpu.alloc_from_slice(&positions),
+        );
+        let dout = gpu.alloc_bytes(qn * 2);
+        t.paged_attn.run_tile_online(
+            &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, block_size as u32,
+            qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let online: Vec<u16> = dout.read_to_vec();
+        // 小规模另取 CPU 真值（独立代码路径）：两档**各自**对真值的位差都打印出来，
+        // 用它区分"块档错"与"单遍档自己那 1 ulp 舍入噪声"（见报告）。
+        let cpu = if qn <= 200_000 {
+            Some(reference::paged_attn(
+                &q, &k_cache, &v_cache, &block_table, &seq_ids, &positions, q_scale, bpr,
+                block_size, qh, kvh, hd,
+            ))
+        } else {
+            None
+        };
+        let cnt = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        let online_cpu = cpu.as_ref().map(|c| cnt(c, &online));
+        let poison = vec![0x7f7fu16; qn];
+        for (br, cap, js) in cfgs {
+            let cfg = BlkCfg { br, jchunk: cap, bdim: 256, jsplit: js, kv: KvDtype::Bf16 };
+            let g = PagedAttnCuda::blk_geom(cfg, qh as u32, kvh as u32, hd as u32, tokens as u32);
+            dout.upload_on(&poison, &stream);
+            t.paged_attn.run_tile_blk(
+                cfg, &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+                block_size as u32, qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+            );
+            stream.sync();
+            let blk: Vec<u16> = dout.read_to_vec();
+            assert_ne!(blk, poison, "块档未写输出");
+            let d = cnt(&blk, &online);
+            let (mut sse, mut sy, mut md, mut my) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in blk.iter().zip(online.iter()) {
+                let (u, v) = (
+                    reference::bf16_to_f32(a) as f64,
+                    reference::bf16_to_f32(b) as f64,
+                );
+                sse += (u - v) * (u - v);
+                sy += v * v;
+                md = md.max((u - v).abs());
+                my = my.max(v.abs());
+            }
+            let (r2, pk) = ((sse / sy).sqrt(), md / my);
+            let cpu_d = cpu.as_ref().map(|c| cnt(c, &blk));
+            eprintln!(
+                "o34 {qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos} br={} cap={cap} js={}：\
+                 rows={} bdim={} nblk={} stride={} 位差 {d}/{} rel2 {r2:.3e} 峰值 {pk:.3e} \
+                 对真值 online {:?} blk {:?}",
+                g.br,
+                g.jsplit,
+                g.rows_nom,
+                g.bdim,
+                g.nblk(kvh as u32),
+                g.stride,
+                blk.len(),
+                online_cpu,
+                cpu_d,
+            );
+            // 判据：jsplit=1 是**同一套代数**（逐片单链、每片一次 rescale）⇒ 与单遍档
+            // 至多差合并处的 1 f32 ulp（实测 ≤0.03% 元素、rel2 ≤1.3e-4）；
+            // jsplit>1 走偏结果 + combine，判据同 o33。
+            let (r2_gate, frac) = if g.jsplit == 1 { (3.0e-4, 3000) } else { (3.0e-3, 1000) };
+            assert!(
+                d * frac <= blk.len() && r2 <= r2_gate && pk <= 1.5e-2,
+                "o34 块档越门：js={} 位差 {d}/{} rel2 {r2:.3e} 峰值 {pk:.3e}",
+                g.jsplit,
+                blk.len()
+            );
+            if let (Some(a), Some(b)) = (online_cpu, cpu_d) {
+                assert!(b <= a + 1, "o34 块档离真值比单遍档更远：blk {b} vs online {a}");
+            }
+        }
+        drop((dq, dkc, dvc, dbt, dsi, dpo, dout));
+    }
+}

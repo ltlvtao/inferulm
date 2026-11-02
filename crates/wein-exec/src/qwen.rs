@@ -156,6 +156,36 @@ fn attn_cfg_from_env(var: &str, dflt: wein_kernel::ops::AttnCfg) -> wein_kernel:
     }
     cfg
 }
+
+/// 块档配置（`WEIN_ATTN_BLK`）解析：`br=64,chunk=512,bdim=256,js=16[,f32]`，
+/// `off`/`0` = 关（缺省）。池 dtype 默认跟 prefill 档一致（KV 池只分配一次）
+fn attn_blk_from_env(var: &str, kv: wein_kernel::ops::KvDtype) -> Option<wein_kernel::ops::BlkCfg> {
+    use wein_kernel::ops::BlkCfg;
+    let s = std::env::var(var).ok()?;
+    let mut cfg = BlkCfg { kv, ..BlkCfg::baseline() };
+    for tok in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        match tok {
+            "off" | "0" | "none" => return None,
+            "on" => cfg = BlkCfg { kv, ..BlkCfg::baseline() },
+            "f32" => cfg.kv = wein_kernel::ops::KvDtype::F32,
+            "bf16" => cfg.kv = wein_kernel::ops::KvDtype::Bf16,
+            _ => {
+                let (k, v) = tok.split_once('=').unwrap_or_else(|| {
+                    panic!("未知 WEIN_ATTN_BLK 项：{tok}（br=/chunk=/bdim=/js=）")
+                });
+                let n: usize = v.parse().expect("WEIN_ATTN_BLK 数值");
+                match k {
+                    "br" => cfg.br = n,
+                    "chunk" => cfg.jchunk = n,
+                    "bdim" => cfg.bdim = n,
+                    "js" => cfg.jsplit = n,
+                    _ => panic!("未知 WEIN_ATTN_BLK 项：{tok}（br=/chunk=/bdim=/js=）"),
+                }
+            }
+        }
+    }
+    Some(cfg)
+}
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
@@ -745,6 +775,13 @@ pub struct Qwen35Executor {
     /// 小批时 RPT=4 会把 bdim 压到 1 warp、块数不够 ⇒ 单独选。dtype 须与
     /// `attn_cfg` 一致（KV 池只分配一次）
     attn_cfg_dec: wein_kernel::ops::AttnCfg,
+    /// 块档（`paged_attn_blk`：O/P 落块私有 scratch、Br 参数化）：
+    /// **只在 prefill 且 t ≥ `attn_blk_min_t`** 时启用（`WEIN_ATTN_BLK`；
+    /// 缺省 = 关）。decode 形（t≤4）与两遍位级档（`WEIN_ATTN_ONLINE=0`）
+    /// 永不走它——这两条路的语义一字不改
+    attn_blk: Option<wein_kernel::ops::BlkCfg>,
+    /// 块档的启用门限（t = 本步 token 数；`WEIN_ATTN_BLK_T`，默认 32）
+    attn_blk_min_t: u32,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -877,6 +914,18 @@ impl Qwen35Executor {
     ) {
         // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        // 块档（Br 参数化、O/P 落块私有 scratch）：只在**单遍档 + prefill +
+        // t≥门限**时接管。decode 形（t≤4）与 `WEIN_ATTN_ONLINE=0` 的两遍
+        // 位级档在这一行下面，语义一字不改
+        if self.attn_online && t >= self.attn_blk_min_t {
+            if let Some(bc) = self.attn_blk {
+                a.run_tile_blk(
+                    bc, q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t,
+                    stream,
+                );
+                return;
+            }
+        }
         if self.attn_online {
             a.run_tile_online_cfg(
                 cfg, q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t,
@@ -1188,6 +1237,11 @@ impl Qwen35Executor {
             attn_online: std::env::var("WEIN_ATTN_ONLINE").map(|v| v != "0").unwrap_or(true),
             attn_cfg,
             attn_cfg_dec,
+            attn_blk: attn_blk_from_env("WEIN_ATTN_BLK", attn_cfg.kv),
+            attn_blk_min_t: std::env::var("WEIN_ATTN_BLK_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,

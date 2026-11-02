@@ -96,14 +96,17 @@ fn k1_ptx_artifact_structure() {
         "paged_attn_online_f32_r4",
         "paged_attn_tile_f32",
         "kv_scatter_f32",
+        // 块档（Br 参数化、O/P 落块私有 scratch）：prefill 长序列
+        "paged_attn_blk",
+        "paged_attn_blk_f32",
     ] {
         let head = format!(".entry {k}(");
         assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        37,
-        "导出 kernel 数应为 37（24 + attention A/B 档 13；多了说明编译单元混入了别的入口）"
+        39,
+        "导出 kernel 数应为 39（24 + attention A/B 档 15；多了说明编译单元混入了别的入口）"
     );
 }
 

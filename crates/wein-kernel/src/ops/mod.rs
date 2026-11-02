@@ -137,9 +137,14 @@ impl OpTable<'_> {
             f_f32_r4: m.func("paged_attn_online_f32_r4"),
             f_f32_r2: m.func("paged_attn_online_f32_r2"),
             fc: m.func("attn_combine"),
+            f_blk: m.func("paged_attn_blk"),
+            f_blk_f32: m.func("paged_attn_blk_f32"),
             tscratch: gpu.alloc_bytes(ATTN_TILE_BLOCK_CAP * ATTN_TILE_SLOTS * 4),
             pacc: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
             pml: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * 2 * 4),
+            bscratch: gpu.alloc_bytes(BLK_SCRATCH_FLOATS * 4),
+            pacc_b: gpu.alloc_bytes(BLK_PART_ROWS * BLK_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
+            pml_b: gpu.alloc_bytes(BLK_PART_ROWS * BLK_SPLIT_CAP * 2 * 4),
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -1101,11 +1106,20 @@ pub struct PagedAttnCuda<'a> {
     f_f32_r4: Func,
     f_f32_r2: Func,
     fc: Func,
+    /// 块档（**O/P 落块私有 scratch**、Br 参数化）：prefill 长序列专用入口。
+    /// bf16/f32 池两档，ABI 与单遍档只差一个 `stride`（每块 scratch 槽数）
+    f_blk: Func,
+    f_blk_f32: Func,
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
     /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
     pacc: DevBuf<'a>,
     pml: DevBuf<'a>,
+    /// 块档块私有 scratch（[BLK_BLOCK_CAP, stride] f32，stride 由几何裁决）
+    bscratch: DevBuf<'a>,
+    /// 块档 j 分片偏结果（rows 上限 BLK_PART_ROWS，比旧档大 4 倍）
+    pacc_b: DevBuf<'a>,
+    pml_b: DevBuf<'a>,
 }
 
 /// attn 块数容量上限：T_MAX(512) × q_heads(32)——超容显式 assert
@@ -1151,6 +1165,23 @@ const ATTN_TILE_TARGET_BLOCKS: usize = 128;
 /// 单遍各档 regs ≥86 ⇒ 1024 线程（需 ≤64 regs）在所有档上都不可达
 /// （见 `attn_regs` 与 A2 的 maxrregcount 实测：64 档 162 spill stores）。
 const ATTN_TILE_BDIM_CAP: usize = 512;
+
+// ── 块档（Br 参数化；O/P 落块私有 scratch）的容量账 ──
+/// 块档块私有 scratch 池上限（f32 槽数）= 256MB。定尺依据：单块 slot =
+/// rows×hd(O) + rows×cap(P) + br×cap(槽位表) + 5×rows；T=256 的 prefill chunk
+/// 上最贵的一档（Br=128、cap=1024）= 3.16MB/块，8 块 = 25MB；j 分片补并行度
+/// 时块数乘上去，池按 256MB 封顶（余量给 cap=1024 × 16 片形）
+pub const BLK_SCRATCH_FLOATS: usize = 64 << 20;
+/// 块档 j 分片偏结果的 q 行容量：prefill chunk 形 tokens×q_heads（256×16）
+pub const BLK_PART_ROWS: usize = 4096;
+/// 块档 j 分片数上限（每片至少一个 j 段；块数目标见 `BLK_TARGET_BLOCKS`）
+pub const BLK_SPLIT_CAP: usize = 16;
+/// 块档并行目标块数：Br 大 ⇒ 块少，靠 j 分片补。定尺依据是实测——128 regs
+/// ⇒ 2 块/SM（512 线程/SM）；实测 128 块（1 块/SM、8 warp）比 256 块
+/// （2 块/SM、16 warp）慢 19%（br=64/cap=256：21.2 vs 17.8 ms/步）
+pub const BLK_TARGET_BLOCKS: usize = 256;
+/// 块档线程上限：`paged_attn_blk` 实测 128 regs（0 spill）⇒ 65536/128 = 512
+const BLK_BDIM_CAP: usize = 512;
 
 // ── 单遍档的几何 / dtype 旋钮（A/B 判别仪器） ──
 
@@ -1201,6 +1232,59 @@ pub struct OnlineGeom {
     pub bdim: usize,
     pub ntile: usize,
     pub jsplit: usize,
+}
+
+/// 块档（Br 参数化、O/P 落块私有 scratch）的几何旋钮。
+/// 与单遍档的区别：累加器不再占寄存器，故 Br 只受 **scratch 与并行度** 约束。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlkCfg {
+    /// 一块覆盖的 q token 数（Br）；行数 = br × group
+    pub br: usize,
+    /// j 片宽（每片一次 rescale + 每片一次 O 往返）
+    pub jchunk: usize,
+    /// 线程/块：ngrp = bdim/nv 就是**每块内 KV 的重读次数**
+    pub bdim: usize,
+    /// j 分片数；0 = 按 `BLK_TARGET_BLOCKS` 自动补并行度
+    pub jsplit: usize,
+    pub kv: KvDtype,
+}
+
+impl BlkCfg {
+    /// 默认形态：Br=32（256 行）、j 片 256、256 线程（ngrp=4 ⇒ 4 次重读）
+    pub fn baseline() -> Self {
+        Self { br: 32, jchunk: 256, bdim: 256, jsplit: 0, kv: KvDtype::Bf16 }
+    }
+}
+
+/// 块档的落地几何（`blk_geom` 的返回值；探针/报告口径）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlkGeom {
+    pub br: usize,
+    pub nd: usize,
+    pub group: usize,
+    pub nv: usize,
+    /// 线程组数 = bdim/nv = **块内 KV 重读次数**
+    pub ngrp: usize,
+    /// 每组线程负责的 pass 数（1 pass = 1 个 token 的 group 行）
+    pub npass: usize,
+    pub rows_nom: usize,
+    pub bdim: usize,
+    pub ntile: usize,
+    pub jsplit: usize,
+    /// j 片宽（= kernel 的 `chunk`）
+    pub cap: usize,
+    /// 每块 scratch 槽数（f32）：O + P + 5×rows + 槽位表
+    pub stride: usize,
+}
+
+impl BlkGeom {
+    pub fn nblk(&self, kv_heads: u32) -> usize {
+        kv_heads as usize * self.ntile * self.jsplit
+    }
+    /// 块档 scratch 实付字节（块数 × 每块字节）
+    pub fn scratch_bytes(&self, kv_heads: u32) -> usize {
+        self.nblk(kv_heads) * self.stride * 4
+    }
 }
 
 /// 每档 kernel 的寄存器用量（ptxas -v @sm_89 实测；改 kernel 后须重测）。
@@ -1497,6 +1581,152 @@ impl PagedAttnCuda<'_> {
             }
         }
         OnlineGeom { ntok, nd, rpt, nv, rows_nom, bdim, ntile, jsplit }
+    }
+
+    /// 块档几何裁决（纯函数：探针/exec/测试共用一份算式）。
+    ///
+    /// 与 `online_geom` 的差别：累加器在块私有 scratch 里，寄存器只装
+    /// "一个 pass 的 group×nd 个 f32" ⇒ Br 不再被 65536/regs 顶死。
+    /// 约束变成三条：
+    /// · `br % ngrp == 0`（每线程组的 br/ngrp 个 token 整份）
+    /// · `jchunk % nv == 0`（j 升序拼接的前提，与旧档同）
+    /// · 块数 × 每块 slot ≤ `BLK_SCRATCH_FLOATS`（超了就**降 j 分片**）
+    pub fn blk_geom(
+        cfg: BlkCfg,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+    ) -> BlkGeom {
+        let group = (q_heads / kv_heads) as usize;
+        let hd = head_dim as usize;
+        let nd = 4usize; // 块档导出只有 nd=4（`blk_export!` 的 G/ND 定态）
+        // GQA 比也是定态（`blk_export!` 的 G=4）：别的 group 要另导实体
+        assert!(group == 4, "块档导出按 group=4 单态（Qwen3.5-4B 16q/4kv），当前 group={group}");
+        assert!(hd % nd == 0 && hd <= ATTN_TILE_HD_CAP, "块档要求 head_dim%4==0 且 ≤{ATTN_TILE_HD_CAP}");
+        let nv = hd / nd;
+        let bdim = (cfg.bdim.min(BLK_BDIM_CAP).max(nv) / nv) * nv;
+        let ngrp = bdim / nv;
+        assert!(bdim % 32 == 0, "块档线程数 {bdim} 须为 32 的倍数");
+        // br 必须是 ngrp 的整倍（组内 token 整份），且 ≤ tokens
+        let want = cfg.br.min(tokens as usize).max(ngrp);
+        let br = (want / ngrp).max(1) * ngrp;
+        let rows_nom = br * group;
+        let npass = br / ngrp;
+        let cap = cfg.jchunk;
+        assert!(cap % nv == 0 && cap >= nv, "块档 j 片宽 {cap} 须是 nv={nv} 的整倍数");
+        let ntile = (tokens as usize + br - 1) / br;
+        let base = kv_heads as usize * ntile;
+        let stride = Self::blk_stride(rows_nom, hd, br, cap);
+        // j 分片：偏结果表装不下 tokens×q_heads 时只能单片（大 chunk 的块数够）
+        let part_ok = tokens as usize * q_heads as usize <= BLK_PART_ROWS;
+        let mut jsplit = if !part_ok {
+            1
+        } else if cfg.jsplit > 0 {
+            cfg.jsplit.min(BLK_SPLIT_CAP)
+        } else {
+            ((BLK_TARGET_BLOCKS + base - 1) / base).clamp(1, BLK_SPLIT_CAP)
+        };
+        while jsplit > 1 && base * jsplit * stride > BLK_SCRATCH_FLOATS {
+            jsplit -= 1;
+        }
+        assert!(
+            base * jsplit * stride <= BLK_SCRATCH_FLOATS,
+            "块档 scratch 越界：{} 块 × {stride} 槽 > {BLK_SCRATCH_FLOATS}（降 br/jchunk）",
+            base * jsplit
+        );
+        assert!(
+            rows_nom <= BLK_PART_ROWS && br * cap <= BLK_SCRATCH_FLOATS,
+            "块档行列越界：br={br} rows={rows_nom} cap={cap}"
+        );
+        BlkGeom { br, nd, group, nv, ngrp, npass, rows_nom, bdim, ntile, jsplit, cap, stride }
+    }
+
+    /// 每块 scratch 槽数（f32）：与 kernel 侧 `blk_body` 的布局**逐项同式**
+    /// O[rows×hd] + P[rows×cap] + mch/mru/lru/scl/ech[5×rows] + sb[br×cap]
+    pub const fn blk_stride(rows_nom: usize, hd: usize, br: usize, cap: usize) -> usize {
+        rows_nom * hd + rows_nom * cap + 5 * rows_nom + br * cap
+    }
+
+    /// 块档（**O/P 落块私有 scratch、Br 参数化**）：prefill 长序列专用。
+    /// 与单遍档同一套在线 softmax 代数（每 j 片一次 rescale + 片内 max 归一），
+    /// 只是累加器从寄存器搬到 `bscratch + blk*stride`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_blk(
+        &self,
+        cfg: BlkCfg,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let g = Self::blk_geom(cfg, q_heads, kv_heads, head_dim, tokens);
+        let f = match cfg.kv {
+            KvDtype::F32 => &self.f_blk_f32,
+            KvDtype::Bf16 => &self.f_blk,
+        };
+        self.launch_blk(
+            f, &g, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        );
+    }
+
+    /// 块档装订：ABI = 单遍档 + `stride`（插在 `chunk` 之后）
+    #[allow(clippy::too_many_arguments)]
+    fn launch_blk(
+        &self,
+        f: &Func,
+        g: &BlkGeom,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_blk: tokens=0");
+        let nblk = g.nblk(kv_heads);
+        assert!(nblk * g.stride <= BLK_SCRATCH_FLOATS, "块档 scratch 越界：{nblk} 块");
+        if g.jsplit > 1 {
+            assert!(
+                tokens as usize * q_heads as usize <= BLK_PART_ROWS,
+                "块档分片行数 {} 超偏结果表 {BLK_PART_ROWS}",
+                tokens as usize * q_heads as usize
+            );
+        }
+        let (br_u, js_u, chunk_u, st_u) =
+            (g.br as u32, g.jsplit as u32, g.cap as u32, g.stride as u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc_b, self.pml_b, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, br_u, js_u, chunk_u, st_u, self.bscratch
+        ];
+        self.gpu.launch(f, nblk as u32, g.bdim as u32, &args, stream);
+        if g.jsplit > 1 {
+            let (nrows, hd_u) = (tokens * q_heads, head_dim);
+            let args = crate::kernel_args![self.pacc_b, self.pml_b, *out, nrows, js_u, hd_u];
+            self.gpu.launch(&self.fc, nrows, 256, &args, stream);
+        }
     }
 
     /// 分块档公共装订（两遍/单遍同一份 launch 账）：

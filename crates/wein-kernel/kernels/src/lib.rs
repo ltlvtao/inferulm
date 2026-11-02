@@ -1385,6 +1385,434 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     }
 }
 
+// ───────── 块档（Br 参数化）：O 累加器与 P 落块私有 global scratch ─────────
+// 为什么换存储位置：KV 前缀的**块内重读次数 = rpt**（每线程组的 q 行数）——
+// 这是唯一的流量杠杆，而 rpt 被"每线程 rpt×ND 个 f32 累加器"顶死在寄存器
+// 预算内（512 线程/SM ⇒ ≤128 regs/线程 ⇒ rpt ≤ 16 @ND=4）。把 O（rows×hd
+// 个 f32）搬到块私有 scratch 后，一个线程只需持有**一个 pass 的 G 行**累加器
+// （G×ND = 16 f32），rpt 就能到 32/64（Br=64/128）：代价是每 j 片一次 O 往返
+// （rows×hd×8B/片）与同一 j 片内各 pass 的 K/V 重读（落在 L1/L2，j 片越小越稳）。
+//
+// 分工（一 block = (kv 头, Br 个 q token 的片, j 分片)）：
+//   · B1 分值：线程 (组 rg, lane) 认领 j = c0+lane+k·nv，对 pass 的 G 行一次
+//     算 G 条 dot（K 载入一次供 G 行；q 每行一次）→ 原值落 pb
+//   · B1b 块内 max：同步后按**行**扫一遍 pb（线程=r，跨 lane 合并 —— 读侧
+//     连续寻址），再算在线合并系数 (scale, echunk) 落 scratch
+//   · B1c p = exp(分值 − 本片 max)：j 属主原地改写 pb
+//   · B2 加权 V：每 pass 认领 ND 维、j 升序全扫（V 载入一次供 G 行）；
+//     pass 内 O 在寄存器，片末 `O = O·scale + Σp·V` 落 scratch
+// 数值：与单遍档**同一套代数**（每 j 片一次 rescale + 块内 max 归一），只是
+// 把"每行单链"切成"每行每片单链"——容差档，判据同 o33。
+#[inline(always)]
+unsafe fn blk_dot<const ND: usize, const G: usize, const WIDE: bool>(
+    q: *const u16,
+    qb: usize,
+    kp: *const u8,
+    kb: usize,
+    hd: usize,
+) -> [f32; G] {
+    let mut s = [0.0f32; G];
+    let mut d = 0usize;
+    while d < hd {
+        let ks = kv_ld::<ND, WIDE>(kp, kb + d);
+        let mut k = 0usize;
+        while k < G {
+            let qs = kv_ld::<ND, false>(q as *const u8, qb + k * hd + d);
+            let mut l = 0usize;
+            while l < ND {
+                s[k] = fma(qs[l], ks[l], s[k]);
+                l += 1;
+            }
+            k += 1;
+        }
+        d += ND;
+    }
+    s
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn blk_body<const ND: usize, const G: usize, const WIDE: bool>(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    stride: u32,
+    scratch: *mut f32,
+) {
+    let hd = head_dim as usize;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let group = udiv(qh_n, kv_n);
+    let nt = ntok as usize;
+    let js = jsplit as usize;
+    let cap = chunk as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = udiv(rest, js);
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows_nom = nt * group;
+    let rows = tn * group;
+    let nv = udiv(hd, ND);
+    let ngrp = udiv(bdim, nv);
+    let rg = udiv(tau, nv);
+    let lane = urem(tau, nv);
+    let rpt = udiv(rows_nom, ngrp); // 本线程组的 q 行数 = npass × group
+    let npass = udiv(rpt, group); // 每 pass 一个 token（G 个 q 头）
+    let r0g = rg * rpt;
+    let tt0 = udiv(r0g, group); // 本组首 pass 的片内 token 序号
+    let d0 = lane * ND;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+
+    // j 轴分段（与两遍档/单遍档同式）
+    let mut pmax = 0usize;
+    let mut u = 0usize;
+    while u < tn {
+        let p = *positions.add(t0 + u) as usize;
+        pmax = if p > pmax { p } else { pmax };
+        u += 1;
+    }
+    let lspan = udiv(pmax + js, js);
+    let jmax = pmax + 1;
+    let j0 = sp * lspan;
+    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    if j0 >= j1 {
+        // 空分片：落 l=0（combine 跳过），保证 part 表被完整覆盖
+        if js > 1 {
+            let mut p = 0usize;
+            while p < npass {
+                let tt = tt0 + p;
+                if tt < tn && lane == 0 {
+                    let mut k = 0usize;
+                    while k < G {
+                        let rglob = (t0 + tt) * qh_n + kh * group + k;
+                        *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
+                        *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
+                        k += 1;
+                    }
+                }
+                p += 1;
+            }
+        }
+        return;
+    }
+
+    // 块私有 scratch 布局（host 侧 `ops::blk_slot` 同式；stride 由 host 传入）：
+    //   acc[rows_nom × hd]（O）+ pb[rows_nom × cap]（P/分值）+ mch/mru/lru/scl/ech
+    //   [rows_nom] + sb[nt × cap]（槽位表）
+    let sc = scratch.add(blk * stride as usize);
+    let acc = sc;
+    let pb = acc.add(rows_nom * hd);
+    let mch = pb.add(rows_nom * cap);
+    let mru = mch.add(rows_nom);
+    let lru = mru.add(rows_nom);
+    let scl = lru.add(rows_nom);
+    let ech = scl.add(rows_nom);
+    let sb = ech.add(rows_nom);
+
+    // ① 每行 running 状态清底 + O 清零（块内协作；rows_nom 可 > bdim）
+    let mut r = tau;
+    while r < rows_nom {
+        *mru.add(r) = f32::NEG_INFINITY;
+        *lru.add(r) = 0.0;
+        r += bdim;
+    }
+    let nacc = rows_nom * hd;
+    let mut e = tau;
+    while e < nacc {
+        *acc.add(e) = 0.0;
+        e += bdim;
+    }
+    _syncthreads();
+
+    // 每线程的常驻累加器（仅 npass == 1 时跨片复用；否则只活一个 pass）
+    let mut areg = [[0.0f32; ND]; G];
+    let mut c0 = j0;
+    while c0 < j1 {
+        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+        let cc = c1 - c0 + 1;
+        _syncthreads(); // 读侧屏障（槽位表要重填）
+        tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
+        _syncthreads();
+
+        // ── B1：分值（j 属主整条点积；K 一次载入供 G 行）→ pb 原值
+        let mut p = 0usize;
+        while p < npass {
+            let tt = tt0 + p;
+            if tt < tn {
+                let qb = ((t0 + tt) * qh_n + kh * group) * hd;
+                let pr = *positions.add(t0 + tt) as usize;
+                let jr = if pr < c1 { pr } else { c1 };
+                let mut j = c0 + lane;
+                while j <= jr {
+                    let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
+                    let s = blk_dot::<ND, G, WIDE>(q, qb, k_cache, kbase, hd);
+                    let mut k = 0usize;
+                    while k < G {
+                        *pb.add((j - c0) * rows_nom + r0g + p * group + k) = s[k] * q_scale;
+                        k += 1;
+                    }
+                    j += nv;
+                }
+            }
+            p += 1;
+        }
+        _syncthreads();
+
+        // ── B1b：本片 max（按行扫 pb —— 跨 lane 合并；跨行连续寻址）+ 在线合并
+        // 扫的边界必须是**该行自己的** j 上界（`min(pr,c1)-c0`）：超出部分 pb
+        // 可能留着上一片的旧值（本片没写），拿它算 max 会把 running 状态
+        // 按错的比例缩放（自测：不做这步 ⇒ 贪心第 3 个 token 起分叉）
+        let mut r = tau;
+        while r < rows_nom {
+            let ttr = udiv(r, group);
+            let mut m = f32::NEG_INFINITY;
+            if ttr < tn {
+                let pr = *positions.add(t0 + ttr) as usize;
+                if pr >= c0 {
+                    let jrr = (if pr < c1 { pr } else { c1 }) - c0;
+                    let mut jj = 0usize;
+                    while jj <= jrr {
+                        let x = *pb.add(jj * rows_nom + r);
+                        m = if x > m { x } else { m };
+                        jj += 1;
+                    }
+                }
+            }
+            *mch.add(r) = m;
+            r += bdim;
+        }
+        _syncthreads();
+        let mut r = tau;
+        while r < rows_nom {
+            let mr = *mru.add(r);
+            let mc = *mch.add(r);
+            let mn = if mc > mr { mc } else { mr };
+            // 空片（mr/mc 仍 −inf）域钳掉，避免 exp(−inf −(−inf)) = NaN 漏进 l/O
+            *scl.add(r) = if mr == f32::NEG_INFINITY { 0.0 } else { expf(mr - mn) };
+            *ech.add(r) = if mc == f32::NEG_INFINITY { 0.0 } else { expf(mc - mn) };
+            *mru.add(r) = mn;
+            r += bdim;
+        }
+        _syncthreads();
+
+        // ── B1c：p = exp(分值 − 本片 max)（j 属主原地写）
+        let mut p = 0usize;
+        while p < npass {
+            let tt = tt0 + p;
+            if tt < tn {
+                let pr = *positions.add(t0 + tt) as usize;
+                let jr = if pr < c1 { pr } else { c1 };
+                let mut j = c0 + lane;
+                while j <= jr {
+                    let mut k = 0usize;
+                    while k < G {
+                        let o = (j - c0) * rows_nom + r0g + p * group + k;
+                        *pb.add(o) = expf(*pb.add(o) - *mch.add(r0g + p * group + k));
+                        k += 1;
+                    }
+                    j += nv;
+                }
+            }
+            p += 1;
+        }
+        _syncthreads();
+
+        // ── B2：加权 V（每 pass 认领 ND 维、j 升序全扫；V 载入一次供 G 行）
+        // 片内偏量 s 从 0 累起，片末一次在线合并 `a = a·scale + echunk·s`——
+        // 与单遍档**逐位同式**（jchunk 相同 ⇒ 与单遍档逐位同值），只改存储位置
+        let mut p = 0usize;
+        while p < npass {
+            let tt = tt0 + p;
+            if tt < tn {
+                let pr = *positions.add(t0 + tt) as usize;
+                let jr = if pr < c1 { pr } else { c1 };
+                let r0 = r0g + p * group;
+                let mut a = [[0.0f32; ND]; G];
+                let mut s = [[0.0f32; ND]; G];
+                let mut ef = [0.0f32; G];
+                let mut sf = [0.0f32; G];
+                let mut dl = [0.0f32; G];
+                // running O：npass==1 常驻寄存器，否则读块私有 scratch
+                let mut k = 0usize;
+                while k < G {
+                    ef[k] = *ech.add(r0 + k);
+                    sf[k] = *scl.add(r0 + k);
+                    let mut l = 0usize;
+                    while l < ND {
+                        a[k][l] = if npass > 1 {
+                            *acc.add((r0 + k) * hd + d0 + l)
+                        } else {
+                            areg[k][l]
+                        };
+                        l += 1;
+                    }
+                    k += 1;
+                }
+                let mut j = c0;
+                while j <= jr {
+                    let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
+                    let vs = kv_ld::<ND, WIDE>(v_cache, vbase);
+                    let mut k = 0usize;
+                    while k < G {
+                        let q = *pb.add((j - c0) * rows_nom + r0 + k);
+                        let mut l = 0usize;
+                        while l < ND {
+                            s[k][l] = fma(q, vs[l], s[k][l]);
+                            l += 1;
+                        }
+                        dl[k] = q + dl[k];
+                        k += 1;
+                    }
+                    j += 1;
+                }
+                let mut k = 0usize;
+                while k < G {
+                    let mut l = 0usize;
+                    while l < ND {
+                        a[k][l] = fma(ef[k], s[k][l], a[k][l] * sf[k]);
+                        if npass > 1 {
+                            *acc.add((r0 + k) * hd + d0 + l) = a[k][l];
+                        } else {
+                            areg[k][l] = a[k][l];
+                        }
+                        l += 1;
+                    }
+                    if lane == 0 {
+                        *lru.add(r0 + k) = fma(ef[k], dl[k], *lru.add(r0 + k) * sf[k]);
+                    }
+                    k += 1;
+                }
+            }
+            p += 1;
+        }
+        _syncthreads();
+        c0 = c1 + 1;
+    }
+
+    // ③ 落结果（每 pass 一行组；jsplit=1 直落 out，否则落偏量表由 combine 合并）
+    let mut p = 0usize;
+    while p < npass {
+        let tt = tt0 + p;
+        if tt < tn {
+            let r0 = r0g + p * group;
+            let mut o = [[0.0f32; ND]; G];
+            let mut lv = [0.0f32; G];
+            let mut mv = [0.0f32; G];
+            let mut k = 0usize;
+            while k < G {
+                lv[k] = *lru.add(r0 + k);
+                mv[k] = *mru.add(r0 + k);
+                let mut l = 0usize;
+                while l < ND {
+                    o[k][l] = if npass > 1 {
+                        *acc.add((r0 + k) * hd + d0 + l)
+                    } else {
+                        areg[k][l]
+                    };
+                    l += 1;
+                }
+                k += 1;
+            }
+            let qb = ((t0 + tt) * qh_n + kh * group) * hd;
+            let mut k = 0usize;
+            while k < G {
+                if js == 1 {
+                    let mut l = 0usize;
+                    while l < ND {
+                        *out.add(qb + k * hd + d0 + l) = f32_to_bf16(o[k][l] / lv[k]);
+                        l += 1;
+                    }
+                } else {
+                    let rglob = (t0 + tt) * qh_n + kh * group + k;
+                    let base = rglob * js + sp;
+                    if lane == 0 {
+                        *part_ml.add(base * 2) = mv[k];
+                        *part_ml.add(base * 2 + 1) = lv[k];
+                    }
+                    let pb0 = part_acc.add(base * PART_HD_STRIDE + d0);
+                    let mut l = 0usize;
+                    while l < ND {
+                        *pb0.add(l) = o[k][l];
+                        l += 1;
+                    }
+                }
+                k += 1;
+            }
+        }
+        p += 1;
+    }
+    let _ = rows;
+}
+
+macro_rules! blk_export {
+    ($name:ident, $nd:literal, $g:literal, $wide:literal) => {
+        /// 块档（Br 参数化、O/P 落块私有 scratch）：prefill 长序列专用。
+        /// `ntok` = Br、`chunk` = j 片宽、`stride` = 每块 scratch 槽数。
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            q: *const u16,
+            k_cache: *const u8,
+            v_cache: *const u8,
+            block_table: *const u32,
+            seq_ids: *const u32,
+            positions: *const u32,
+            out: *mut u16,
+            part_acc: *mut f32,
+            part_ml: *mut f32,
+            q_scale: f32,
+            bpr: u32,
+            block_size: u32,
+            q_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            tokens: u32,
+            ntok: u32,
+            jsplit: u32,
+            chunk: u32,
+            stride: u32,
+            scratch: *mut f32,
+        ) {
+            blk_body::<$nd, $g, $wide>(
+                q, k_cache, v_cache, block_table, seq_ids, positions, out, part_acc, part_ml,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, ntok, jsplit, chunk,
+                stride, scratch,
+            )
+        }
+    };
+}
+
+/// 块档 bf16 池（group=4 定态：Qwen3.5-4B 的 16q/4kv）——prefill 长序列
+blk_export!(paged_attn_blk, 4, 4, false);
+/// 块档 f32 池（与 bf16 池数值逐位同值：只改载入形状）
+blk_export!(paged_attn_blk_f32, 4, 4, true);
+
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
 /// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的
 /// 上界 = ROWS_CAP/group）。四项的定尺依据：
