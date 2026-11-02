@@ -74,15 +74,16 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry argmax_rows("), "argmax_rows 入口缺失/被改名");
     // 设备端采样器（需求刀 1）
     assert!(ptx.contains(".entry sample_rows("), "sample_rows 入口缺失/被改名");
-    // 长序列分块 attention（KV 复用几何）两入口
+    // 长序列分块 attention（KV 复用几何）三入口：两遍 + 单遍在线 + 分片合并
     assert!(ptx.contains(".entry paged_attn_tile("), "paged_attn_tile 入口缺失/被改名");
+    assert!(ptx.contains(".entry paged_attn_online("), "paged_attn_online 入口缺失/被改名");
     assert!(ptx.contains(".entry attn_combine("), "attn_combine 入口缺失/被改名");
     // deltanet 的 q/k l2norm 前置小 kernel（invq/invk 去重）
     assert!(ptx.contains(".entry dn_qk_l2norm("), "dn_qk_l2norm 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        23,
-        "导出 kernel 数应为 23（多了说明编译单元混入了别的入口）"
+        24,
+        "导出 kernel 数应为 24（多了说明编译单元混入了别的入口）"
     );
 }
 
@@ -107,7 +108,7 @@ fn k2_intrinsics_lowered_to_ptx() {
     assert!(ptx.contains("add.rn.f32"), "加法未降落 add.rn.f32（字面量被收缩？）");
     let n_fma = ptx.matches("fma.rn.f32").count();
     assert!(n_fma >= 300, "fma.rn.f32 计数 {n_fma} < 300：热路径的 mul_add 没落成 fma");
-    // 逐 kernel 段：热路径的 fma 指令数下界（实测 38/55/2/646/9/1/1）
+    // 逐 kernel 段：热路径的 fma 指令数下界（实测 26/38/55/2/646/9/1/1）
     let seg = |name: &str| -> String {
         let head = format!(".visible .entry {name}(");
         let i = ptx.find(&head).unwrap_or_else(|| panic!("{name} 入口缺失"));
@@ -116,6 +117,7 @@ fn k2_intrinsics_lowered_to_ptx() {
         rest[..end].to_string()
     };
     for (name, floor, note) in [
+        ("paged_attn_online", 12, "attn_dot + chunk 偏量 4 维 + 在线合并 4 维（实测 26）"),
         ("paged_attn_tile", 12, "attn_dot + 4 维加权 V（jsplit 合并另计）"),
         ("paged_attn", 20, "attn_dot + 加权 V（流式/直路）"),
         ("attn_combine", 2, "jsplit 合并 l/acc"),

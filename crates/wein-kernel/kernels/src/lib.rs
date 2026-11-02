@@ -895,6 +895,227 @@ pub unsafe extern "ptx-kernel" fn paged_attn_tile(
     }
 }
 
+// ───────────── 单遍在线 softmax（同一几何，K/V 各读一遍） ─────────────
+// 为什么换算法：上面两遍档的遍 1 只求 max、遍 2 复算点积——同一个 dot 算两
+// 遍、K 读两遍（K+K+V = 3 个单位流量）。在线 softmax 把"求 max"并入加权 V
+// 的那一遍：每 chunk 先按**本 chunk 的块内 max**（跨线程归约，纯比较）把分值
+// 归一成 p∈(0,1]，再按 running (m,l,acc) 与 chunk 偏量合并——
+//   m_new = max(m, m_chunk)；scale = exp(m − m_new)；e = exp(m_chunk − m_new)
+//   l = l·scale + e·Σp_j；acc = acc·scale + e·Σ p_j·V_j
+// 于是 dot 只算一遍、K/V 各读一遍 = 2 个单位（−33% 流量），少了整条遍 1。
+//
+// rescale 位置的取舍（为什么不逐 j rescale、也不干脆不 rescale）：
+// · 逐 j rescale（经典 flash 内层）要求线程既独占一段 j 又持有**全部** hd 维
+//   累加器——hd=256 时 256 个寄存器，不可能；本几何里 4 维/线程 × 全部 j 才
+//   是可行的线程切分，j 的归约因此必须跨线程 → 每 j 的 p 必须落到公共暂存。
+// · 不 rescale（固定参考基）要先知道全局 max = 回到两遍；用任意上界（如 0）
+//   会在长序列上 exp 溢出（bf16 分值域 ±88 就 inf）。
+// · 所以取**每 chunk 一次 rescale + chunk 内块内 max 归一**：rescale 次数 =
+//   L/chunk（8k 时 32 次/行）而非 L 次，p 永不出 1、永不溢出；代价是每 chunk
+//   多一道"块内 max"屏障（B1a→B1b），换来遍 1 整段消失。
+// 屏障数/chunk = 4（填表前、填表后、max 归约后、exp 后），两遍档是 5（遍 1
+// 两道 + 遍 2 三道）。
+//
+// 合同档：**容差档**（不是位级）——在线合并改变结合律（跨 chunk 的
+// rescale 与"全局 max 后单链求和"不同），故按 o25/o31 的尺子（rel2 +
+// 峰值归一）验收，见 o33；端到端逐 token 一致是真正的验收（长/短两路）。
+// 分片（jsplit>1）时本 kernel 直接落 (m,l,acc) 偏量——语义与两遍档一致
+// （m 就是该分片的 max、l = Σexp(·−m)、acc = Σexp(·−m)·V）⇒ `attn_combine`
+// 一字不改即可合并（只改本段注释，不改语义）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn paged_attn_online(
+    q: *const u16,
+    k_cache: *const u16,
+    v_cache: *const u16,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    scratch: *mut f32,
+) {
+    let hd = head_dim as usize;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let ng = udiv(qh_n, kv_n);
+    let nt = ntok as usize;
+    let js = jsplit as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = udiv(rest, js);
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows_nom = nt * ng;
+    let nv = udiv(bdim, rows_nom);
+    let r = udiv(tau, nv);
+    let lane = urem(tau, nv);
+    let rows = tn * ng;
+    let vr = r < rows;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+    // j 轴分段（与两遍档同式：块内最大位置定段长，末片 token 少但仍共享）
+    let mut pmax = 0usize;
+    let mut u = 0usize;
+    while u < tn {
+        let p = *positions.add(t0 + u) as usize;
+        pmax = if p > pmax { p } else { pmax };
+        u += 1;
+    }
+    let lspan = udiv(pmax + js, js);
+    let jmax = pmax + 1;
+    let j0 = sp * lspan;
+    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    let rglob = if vr { (t0 + udiv(r, ng)) * qh_n + kh * ng + urem(r, ng) } else { 0 };
+    if j0 >= j1 {
+        if vr && lane == 0 {
+            *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
+            *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
+        }
+        return;
+    }
+    // scratch 布局与两遍档同（复用同一份分配，host 侧零改动）：
+    // scm[bdim] 行内 max 归约 / pb[chunk×rows] 分值→p 暂存 / sb[nt×chunk] 槽位表
+    let scratch = scratch.add(blk * TILE_SLOT);
+    let scm = scratch;
+    let pb = scratch.add(bdim);
+    let cap = chunk as usize;
+    let sb = pb.add(cap * rows_nom + rows_nom);
+    let tt = udiv(r, ng);
+    let gq = urem(r, ng);
+    let pr = if vr { *positions.add(t0 + tt) as usize } else { 0 };
+    let qbase = if vr { ((t0 + tt) * qh_n + kh * ng + gq) * hd } else { 0 };
+    let qp = q.add(qbase);
+    let vec4 = hd % 4 == 0;
+    let d0 = lane * 4; // 本线程 4 个输出维
+
+    // 在线状态（每行一份，跨 chunk 续）：m = 已见 j 全域 max、l = Σexp(·−m)、
+    // acc = Σexp(·−m)·V。l 由**每线程各自**按同一 j 序累加（同值冗余）——
+    // 省掉两遍档末尾那道 den 屏障（行内所有线程算出逐位相同的 l）。
+    let mut mrun = f32::NEG_INFINITY;
+    let mut lrun = 0.0f32;
+    let mut a0 = 0.0f32;
+    let mut a1 = 0.0f32;
+    let mut a2 = 0.0f32;
+    let mut a3 = 0.0f32;
+    let mut c0 = j0;
+    while c0 < j1 {
+        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+        let cc = c1 - c0 + 1;
+        let jr = if pr < c1 { pr } else { c1 }; // 本行该 chunk 的有效末位
+        _syncthreads(); // 读侧屏障（表要重填）
+        tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
+        _syncthreads();
+        // B1a：分值（j 属主整条点积）→ pb 原值 + 线程局部极值 → scm
+        let mut mx = f32::NEG_INFINITY;
+        if vr {
+            let mut j = c0 + lane;
+            while j <= jr {
+                let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
+                let sc = attn_dot(qp, k_cache.add(kbase), hd, vec4) * q_scale;
+                *pb.add((j - c0) * rows_nom + r) = sc;
+                mx = if sc > mx { sc } else { mx };
+                j += nv;
+            }
+            *scm.add(tau) = mx;
+        }
+        _syncthreads();
+        // 行内 max（各线程冗余扫 nv 格，纯比较——值与序无关）
+        let mut mc = f32::NEG_INFINITY;
+        if vr {
+            let mut v2 = 0usize;
+            while v2 < nv {
+                let x = *scm.add(r * nv + v2);
+                mc = if x > mc { x } else { mc };
+                v2 += 1;
+            }
+        }
+        // 在线合并系数：m 可能仍为 −inf（本行本 chunk 无有效 j，或整个分片空）
+        // ——域钳掉，避免 exp(−inf − (−inf)) = NaN 从空 chunk 漏进 l/acc。
+        let mn = if mc > mrun { mc } else { mrun };
+        let scale = if mrun == f32::NEG_INFINITY { 0.0 } else { expf(mrun - mn) };
+        let echunk = if mc == f32::NEG_INFINITY { 0.0 } else { expf(mc - mn) };
+        // B1b：p = exp(分值 − 本 chunk max) ∈ (0,1]（j 属主原地写）
+        if vr {
+            let mut j = c0 + lane;
+            while j <= jr {
+                let o = (j - c0) * rows_nom + r;
+                *pb.add(o) = expf(*pb.add(o) - mc);
+                j += nv;
+            }
+        }
+        _syncthreads();
+        // B2：加权 V（线程认领 4 维、j 升序全扫）→ 本 chunk 偏量 s[4]/dl，
+        // 再与 running 状态合并（rescale 收在 chunk 边界，每 chunk 一次）
+        if vr {
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            let mut dl = 0.0f32;
+            let mut j = c0;
+            while j <= jr {
+                let p = *pb.add((j - c0) * rows_nom + r);
+                let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
+                let vs = bf16x4(*(v_cache.add(vbase) as *const u64));
+                s0 = fma(p, bf16_to_f32(vs[0]), s0);
+                s1 = fma(p, bf16_to_f32(vs[1]), s1);
+                s2 = fma(p, bf16_to_f32(vs[2]), s2);
+                s3 = fma(p, bf16_to_f32(vs[3]), s3);
+                dl = p + dl;
+                j += 1;
+            }
+            a0 = fma(echunk, s0, a0 * scale);
+            a1 = fma(echunk, s1, a1 * scale);
+            a2 = fma(echunk, s2, a2 * scale);
+            a3 = fma(echunk, s3, a3 * scale);
+            lrun = fma(echunk, dl, lrun * scale);
+        }
+        mrun = mn;
+        c0 = c1 + 1;
+    }
+
+    if vr {
+        if js == 1 {
+            *out.add(qbase + d0) = f32_to_bf16(a0 / lrun);
+            *out.add(qbase + d0 + 1) = f32_to_bf16(a1 / lrun);
+            *out.add(qbase + d0 + 2) = f32_to_bf16(a2 / lrun);
+            *out.add(qbase + d0 + 3) = f32_to_bf16(a3 / lrun);
+        } else {
+            // 偏量语义与两遍档同（m = 本分片 max），attn_combine 直接可吃
+            let base = rglob * js + sp;
+            if lane == 0 {
+                *part_ml.add(base * 2) = mrun;
+                *part_ml.add(base * 2 + 1) = lrun;
+            }
+            let pb0 = part_acc.add(base * PART_HD_STRIDE + d0);
+            *pb0 = a0;
+            *pb0.add(1) = a1;
+            *pb0.add(2) = a2;
+            *pb0.add(3) = a3;
+        }
+    }
+}
+
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值
 const TILE_SLOT: usize = 1024 + 256 * 16 + 16 + 4 * 256;
 
@@ -906,6 +1127,13 @@ const PART_HD_STRIDE: usize = 256;
 /// 只有一分片非空时与直路**逐位相同**：l = l_s·expf(0) = l_s、
 /// acc = acc_s·expf(0) = acc_s（expf(0) 精确为 1，乘 1 精确）；
 /// 加 0.0 精确不改值 ⇒ `acc/l` 与原式同。空分片（l=0）直接跳过。
+///
+/// **两种上游同吃**（语义同一套代数，本函数不动）：两遍档 `paged_attn_tile`
+/// 的偏量是"全局 max 基下的单链求和"，单遍档 `paged_attn_online` 的偏量是
+/// 在线 softmax 收敛后的 (running max, running l, running acc)——后者与前者
+/// 的差别只在累加路径（chunk 内 rescale），三者恰好就是本函数要的
+/// "m_s、Σexp(·−m_s)、Σexp(·−m_s)·V"。故 rescale 到全局 max 的那一步
+/// `e = expf(m_s − m)` 对两种上游都成立，一字不改。
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn attn_combine(
     part_acc: *const f32,

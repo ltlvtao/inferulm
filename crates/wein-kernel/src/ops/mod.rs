@@ -119,6 +119,7 @@ impl OpTable<'_> {
             scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * (ATTN_SLOT_CAP + 2) * 4),
             slot_cap: ATTN_SLOT_CAP as u32,
             ft: m.func("paged_attn_tile"),
+            fo: m.func("paged_attn_online"),
             fc: m.func("attn_combine"),
             tscratch: gpu.alloc_bytes(ATTN_TILE_BLOCK_CAP * ATTN_TILE_SLOTS * 4),
             pacc: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
@@ -1023,6 +1024,11 @@ pub struct PagedAttnCuda<'a> {
     /// token 片, j 分片) 组织，一块内 `ntok×group` 个 q 行共享同一段 KV。
     /// 默认路径（ctx ≤ 256）不碰它——见 `run_tile`
     ft: Func,
+    /// 单遍在线 softmax 档（`paged_attn_online`）：与 `ft` **同几何同 scratch
+    /// 布局**，只把"两遍（先求 max 再复算 dot）"换成一遍在线合并。长序列默认
+    /// 走它（`run_tile_online`）；`run_tile` 仍是两遍档（位级资产 + 回退口，
+    /// exec 侧 `WEIN_ATTN_ONLINE=0`）
+    fo: Func,
     fc: Func,
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
@@ -1105,13 +1111,75 @@ impl PagedAttnCuda<'_> {
         (ntok, nv, rows_nom, bdim, ntile, jsplit)
     }
 
-    /// 长序列分块档：block = (kv 头, token 片, j 分片)。
+    /// 长序列分块档（两遍）：block = (kv 头, token 片, j 分片)。
     /// 与 `run` 的 ABI 同出参（out 同形），调用方无需知道几何。
     /// jsplit=1 → 直接落 out（与 `run` **逐位相同**）；jsplit>1 → 偏结果 +
     /// `attn_combine` 合并（容差档：分段求和改结合律）。
+    /// 语义冻结：这是位级资产那一条（o30）；新代码默认走 `run_tile_online`，
+    /// 本函数保留为回退口（exec 侧 `WEIN_ATTN_ONLINE=0`）。
     #[allow(clippy::too_many_arguments)]
     pub fn run_tile(
         &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        self.launch_tile(
+            &self.ft, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        );
+    }
+
+    /// 长序列分块档（**单遍在线 softmax**）：几何、scratch、出参与 `run_tile`
+    /// 逐字相同，kernel 内把"遍 1 求 max + 遍 2 复算 dot"并成一遍
+    /// （K/V 各读一遍：流量 3 单位 → 2 单位）。合同落到**容差档**（跨 chunk
+    /// rescale 改结合律，O33 钉 rel2 + 峰值归一）；端到端逐 token 一致由
+    /// 长/短两路的对拍守着。
+    /// jsplit>1 时偏量语义与两遍档一致（m_s = 本分片 max），`attn_combine`
+    /// 一字不改直接合并。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_online(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        self.launch_tile(
+            &self.fo, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        );
+    }
+
+    /// 分块档公共装订（两遍/单遍同一份几何裁决与 launch 账）：
+    /// `f` 决定进哪个 kernel，其余逐字相同
+    #[allow(clippy::too_many_arguments)]
+    fn launch_tile(
+        &self,
+        f: &Func,
         q: &DevBuf,
         k_cache: &DevBuf,
         v_cache: &DevBuf,
@@ -1163,7 +1231,7 @@ impl PagedAttnCuda<'_> {
             self.pacc, self.pml, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
             tokens, ntok_u, js_u, chunk_u, self.tscratch
         ];
-        self.gpu.launch(&self.ft, nblk as u32, bdim as u32, &args, stream);
+        self.gpu.launch(f, nblk as u32, bdim as u32, &args, stream);
         if jsplit > 1 {
             let (nrows, hd_u) = (tokens * q_heads, head_dim);
             let args = crate::kernel_args![

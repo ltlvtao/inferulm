@@ -681,6 +681,11 @@ pub struct Qwen35Executor {
     /// 超过旧路分值槽宽（`ATTN_SLOT_CAP=256`）时启用——默认 ctx-256 路径
     /// 一发不变。`WEIN_ATTN_TILE=0` 强制走旧路（对拍用）
     attn_tile: bool,
+    /// 长序列 attention 的**单遍在线 softmax** 档（`paged_attn_online`）：
+    /// `attn_tile` 成立时默认走它（K/V 各读一遍）；`WEIN_ATTN_ONLINE=0`
+    /// 回退两遍分块档（`paged_attn_tile`，位级资产那一条）。短序列
+    /// （ctx ≤ ATTN_SLOT_CAP=256）与本开关无关——仍走位级槽路
+    attn_online: bool,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -786,6 +791,40 @@ impl Qwen35Executor {
     /// gemm 调优审计（布局/选型 A/B 的判别仪器：每形状 chosen/best_ms）
     pub fn gemm_tune_report(&self) -> Vec<wein_kernel::cuda::GemmTuneRecord> {
         self.session.table().gemm.tune_report()
+    }
+
+    /// 长序列 attention 派发：单遍在线（默认）/ 两遍回退（`WEIN_ATTN_ONLINE=0`）。
+    /// 两个调用点（eager 层循环、图档逐层）共用这一份参数表——几何、scratch、
+    /// 出参对两条路径完全相同，只有 kernel 入口不同。
+    #[allow(clippy::too_many_arguments)]
+    fn attn_long(
+        &self,
+        a: &wein_kernel::ops::PagedAttnCuda<'_>,
+        q: &DevBuf<'_>,
+        k: &DevBuf<'_>,
+        v: &DevBuf<'_>,
+        bt: &DevBuf<'_>,
+        seqs: &DevBuf<'_>,
+        pos: &DevBuf<'_>,
+        out: &DevBuf<'_>,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        qh_n: u32,
+        kvh: u32,
+        hd: u32,
+        t: u32,
+        stream: &Stream,
+    ) {
+        if self.attn_online {
+            a.run_tile_online(
+                q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t, stream,
+            );
+        } else {
+            a.run_tile(
+                q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t, stream,
+            );
+        }
     }
 
     fn open_with_tune(dir: &Path, tune_m: &[u32]) -> Result<Self, String> {
@@ -1063,6 +1102,7 @@ impl Qwen35Executor {
             last_t: 0,
             attn_tile: ctx::max_pos() > wein_kernel::ops::ATTN_SLOT_CAP
                 && std::env::var("WEIN_ATTN_TILE").map(|v| v != "0").unwrap_or(true),
+            attn_online: std::env::var("WEIN_ATTN_ONLINE").map(|v| v != "0").unwrap_or(true),
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -2772,10 +2812,11 @@ impl Qwen35Executor {
                     );
                     self.prof_mark("attn");
                     if self.attn_tile {
-                        tb.paged_attn.run_tile(
-                            &self.scr.qh, &self.k_pool[full_i], &self.v_pool[full_i], inp.bt,
-                            inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32,
-                            ctx::block(), qh_n, kvh, hd, t32, stream,
+                        self.attn_long(
+                            &tb.paged_attn, &self.scr.qh, &self.k_pool[full_i],
+                            &self.v_pool[full_i], inp.bt, inp.seqs, inp.pos, &self.scr.attn,
+                            self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
+                            stream,
                         );
                     } else {
                         tb.paged_attn.run(
@@ -3238,10 +3279,10 @@ impl Qwen35Executor {
             &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
         );
         if self.attn_tile {
-            tb.paged_attn.run_tile(
-                &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt, inp.seqs, inp.pos,
-                &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
-                stream,
+            self.attn_long(
+                &tb.paged_attn, &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt,
+                inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(),
+                qh_n, kvh, hd, t32, stream,
             );
         } else {
             tb.paged_attn.run(

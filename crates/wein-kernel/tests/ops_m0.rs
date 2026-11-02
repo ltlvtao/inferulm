@@ -742,7 +742,7 @@ fn tile_case(
     head_dim: usize,
     tokens: usize,
     pos: usize,
-) -> (Vec<u16>, Vec<u16>, Vec<u16>, (usize, usize, usize, usize, usize, usize)) {
+) -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u16>, (usize, usize, usize, usize, usize, usize)) {
     let stream = gpu.stream();
     let block_size = 16usize;
     let geom = PagedAttnCuda::tile_geom(
@@ -788,6 +788,15 @@ fn tile_case(
     stream.sync();
     let tile: Vec<u16> = dout.read_to_vec();
     assert_ne!(tile, poison, "分块档未写输出（{q_heads}qh/{kv_heads}kvh/hd{head_dim} t={tokens} pos={pos}）");
+    // 单遍在线 softmax 档：同几何同 scratch，只换 kernel 入口
+    dout.upload_on(&poison, &stream);
+    t.paged_attn.run_tile_online(
+        &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, block_size as u32,
+        q_heads as u32, kv_heads as u32, head_dim as u32, tokens as u32, &stream,
+    );
+    stream.sync();
+    let online: Vec<u16> = dout.read_to_vec();
+    assert_ne!(online, poison, "在线档未写输出（{q_heads}qh/{kv_heads}kvh/hd{head_dim} t={tokens} pos={pos}）");
     drop((dq, dkc, dvc, dbt, dsi, dpo));
     let d_oe = old.iter().zip(expect.iter()).filter(|(a, b)| a != b).count();
     let d_te = tile.iter().zip(expect.iter()).filter(|(a, b)| a != b).count();
@@ -802,7 +811,7 @@ fn tile_case(
         expect.len(),
         row_diff.iter().take(20).map(|&b| b as u8).collect::<Vec<_>>()
     );
-    (expect, old, tile, geom)
+    (expect, old, tile, online, geom)
 }
 
 /// o30 · 分块档 **jsplit=1 位级档**：单分片时 out 由 tile kernel 直落，
@@ -821,7 +830,7 @@ fn o30_paged_attn_tile_bitwise() {
         (32, 16, 128, 32, 4000),
     ];
     for (qh, kvh, hd, tokens, pos) in cases {
-        let (expect, old, tile, (ntok, nv, rows, bdim, ntile, jsplit)) =
+        let (expect, old, tile, _online, (ntok, nv, rows, bdim, ntile, jsplit)) =
             tile_case(&gpu, &t, qh, kvh, hd, tokens, pos);
         assert_eq!(jsplit, 1, "o30 钉位级档：{qh}/{kvh}/{hd}×{tokens} 落 jsplit={jsplit}");
         let tag = format!("{qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos}");
@@ -850,7 +859,7 @@ fn o31_paged_attn_tile_split_tolerance() {
         (32, 16, 128, 1, 8191),
     ];
     for (qh, kvh, hd, tokens, pos) in cases {
-        let (expect, old, tile, (_ntok, _nv, rows, bdim, ntile, jsplit)) =
+        let (expect, old, tile, _online, (_ntok, _nv, rows, bdim, ntile, jsplit)) =
             tile_case(&gpu, &t, qh, kvh, hd, tokens, pos);
         assert!(jsplit > 1, "o31 钉容差档：{qh}/{kvh}/{hd}×{tokens} 落 jsplit={jsplit}");
         // 归一化账：rel2（能量占比）+ 峰值归一 + 位差计数
@@ -889,6 +898,81 @@ fn o31_paged_attn_tile_split_tolerance() {
         }
         let rel2_old = (sse2 / sy2).sqrt();
         assert!(rel2_old <= 2.0e-3, "o31 分块档 vs 直路 rel2 越门：{rel2_old:.3e}");
+    }
+}
+
+/// o33 · **单遍在线 softmax 档**（`paged_attn_online`）容差档：同一个 dot 只
+/// 算一遍（K/V 各读一遍），跨 chunk 用 running (m,l,acc) 合并——合并改变结合
+/// 律 ⇒ 与两遍档/参考**只到容差**，判据照 o25/o31：Frobenius 相对能量 rel2
+/// + 峰值归一 max|Δ|/max|y|。同时钉住"融合没把 p 归错基"这类形态错：
+/// · 与参考（全局 max 单链）：rel2 / 峰值须同 o31 量级（bf16 末位量子级）
+/// · 与两遍档（位级资产）：两路都只差结合律 ⇒ 同上量级，且**不得**出现整行
+///   错位（逐行位差行数 ≤ 行数，任一行 rel2 也须过门）
+/// 覆盖 prefill 形（jsplit=1：t=64/256）与 decode 形（jsplit>1：t=1）
+#[test]
+fn o33_paged_attn_online_tolerance() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let cases = [
+        (16usize, 4usize, 256usize, 64usize, 300usize),
+        (16, 4, 256, 64, 1000),
+        (16, 4, 256, 64, 3000),
+        (16, 4, 256, 256, 3000),
+        (32, 16, 128, 32, 1000),
+        (32, 16, 128, 32, 4000),
+        (16, 4, 256, 1, 3071),
+        (32, 16, 128, 1, 8191),
+    ];
+    for (qh, kvh, hd, tokens, pos) in cases {
+        let (expect, _old, tile, online, (ntok, nv, rows, bdim, ntile, jsplit)) =
+            tile_case(&gpu, &t, qh, kvh, hd, tokens, pos);
+        let tag = format!("{qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos}");
+        // 归一化账：rel2 = ‖x−y‖/‖y‖，峰值归一 = max|Δ|/max|y|
+        let mut norm = |x: &[u16], y: &[u16]| -> (f64, f64, usize) {
+            let (mut sse, mut sy, mut max_d, mut max_y) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(y.iter()) {
+                let (u, v) = (
+                    reference::bf16_to_f32(a) as f64,
+                    reference::bf16_to_f32(b) as f64,
+                );
+                sse += (u - v) * (u - v);
+                sy += v * v;
+                max_d = max_d.max((u - v).abs());
+                max_y = max_y.max(v.abs());
+            }
+            ((sse / sy).sqrt(), max_d / max_y, x.iter().zip(y.iter()).filter(|(a, b)| a != b).count())
+        };
+        let (r2_ref, pk_ref, d_ref) = norm(&online, &expect);
+        let (r2_two, pk_two, d_two) = norm(&online, &tile);
+        let (r2_old, _, _) = norm(&tile, &expect); // 两遍档自身 vs 参考（对照列）
+        // 逐行最坏一条（抓"整行归错基/漏 chunk"——全局 rel2 会被均值稀释）
+        let row_n = qh * hd;
+        let mut worst = 0.0f64;
+        for r in 0..tokens {
+            let (a, b) = (&online[r * row_n..(r + 1) * row_n], &expect[r * row_n..(r + 1) * row_n]);
+            let (_s, p, _d) = norm(a, b);
+            worst = worst.max(p);
+        }
+        eprintln!(
+            "o33 {tag}：jsplit={jsplit} ntok={ntok} nv={nv} rows={rows} bdim={bdim} ntile={ntile}｜\
+             单遍 vs 参考 rel2 {r2_ref:.3e} 峰值 {pk_ref:.3e}（{d_ref}/{} 位差）｜\
+             单遍 vs 两遍 rel2 {r2_two:.3e} 峰值 {pk_two:.3e}（{d_two} 位差）｜\
+             两遍 vs 参考 rel2 {r2_old:.3e}｜逐行最坏峰值 {worst:.3e}",
+            online.len()
+        );
+        // 门与依据（实测：rel2 ≤ 8.3e-5、峰值 ≤ 5.9e-3、位差 ≤ 267/1048576
+        // = 0.03%）：误差源只有跨 chunk rescale 改结合律 + bf16 输出末位
+        // 量子（2^-8 = 3.9e-3）——峰值门 1.5e-2 ≈ 4 ulp 的末位漂移，rel2 门
+        // 3e-3 留 36× 余量：专抓"归约基错（p 不是对本 chunk max 归一）/
+        // clamp 漏（空 chunk 出 NaN）/分片合并错"这类形态回归，不是位级合同。
+        assert!(r2_ref <= 3.0e-3, "o33 单遍 vs 参考 rel2 越门：{r2_ref:.3e}（{tag}）");
+        assert!(pk_ref <= 1.5e-2, "o33 单遍 vs 参考峰值越门：{pk_ref:.3e}（{tag}）");
+        assert!(r2_two <= 3.0e-3, "o33 单遍 vs 两遍 rel2 越门：{r2_two:.3e}（{tag}）");
+        assert!(pk_two <= 1.5e-2, "o33 单遍 vs 两遍峰值越门：{pk_two:.3e}（{tag}）");
+        assert!(worst <= 1.5e-2, "o33 逐行最坏峰值越门：{worst:.3e}（{tag}）");
+        // 空输出/未跑 = 形态错（污化已在 tile_case 内排除）
+        assert!(online.iter().any(|&x| x != 0), "o33 单遍档输出全零（{tag}）");
     }
 }
 

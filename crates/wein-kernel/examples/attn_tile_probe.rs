@@ -5,19 +5,23 @@
 //! 三种工作点：
 //! - decode 形：tokens=1 × q 头全量，pos = 1k/3k/8k（长上下文单发吞吐）
 //! - prefill 形：tokens=256 的 chunk，位置尾 = 768/1536/3072（chunk 几何）
-//! 每个工作点跑旧 kernel（`paged_attn`，长 pos 走流式路）与分块档
-//! （`paged_attn_tile`，prefill 落 jsplit=1），各 3 热身 + 10 拍事件计时，
-//! 并给 KV 实际读量（按各自几何算）与距 DRAM 地板倍数。
+//! 每个工作点跑三个 kernel：旧路（`paged_attn`，长 pos 走流式路）、两遍
+//! 分块档（`paged_attn_tile`，prefill 落 jsplit=1）、**单遍在线**
+//! （`paged_attn_online`），各 3 热身 + 10 拍事件计时；并给 KV 实际读量
+//! （按各自几何算）与距 DRAM 地板倍数。单遍档与两遍档之间打 rel2/峰值归一
+//! （容差档：在线合并改结合律，不是位级）。
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{OpTable, PagedAttnOp};
 use wein_platform::{Device, HardwareProfile};
 
 fn bf16_vec(seed_hi: u64, n: usize, scale: f32) -> Vec<u16> {
+    // 注意：`to_bits() as u16` 截的是 f32 的**低**半，f32 值全落 0x0000
+    // ⇒ 整个池子恒 0、对拍恒真（本探针曾经的假绿）。走 RNE 收窄。
     (0..n as u64)
         .map(|i| {
             let z = i.wrapping_mul(6364136223846793005).wrapping_add(seed_hi);
             let f = ((z >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * scale;
-            f.to_bits() as u16
+            wein_kernel::reference::f32_to_bf16(f)
         })
         .collect()
 }
@@ -82,8 +86,10 @@ fn main() {
         points.push((format!("{tag} (t=256)"), 256, end - 256));
     }
 
-    println!("\n| 工作点 | 旧 ms | 新 ms | 加速 | 旧 KV 读 | 新 KV 读 | 新/地板 |");
-    println!("|---|---|---|---|---|---|---|");
+    println!(
+        "\n| 工作点 | 旧 ms | 两遍 ms | 单遍 ms | 旧/两遍 | 两遍/单遍 | 旧 KV 读 | 两遍 KV 读 | 单遍 KV 读 | 两遍/地板 |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     for (tag, tokens, pos0) in points {
         let c = case(tokens, pos0, q_heads, kv_heads, hd, bs);
         let (ntok, nv, rows, bdim, ntile, jsplit) =
@@ -112,6 +118,12 @@ fn main() {
                 q_heads as u32, kv_heads as u32, hd as u32, tokens as u32, &stream,
             )
         };
+        let run_online = || {
+            t.paged_attn.run_tile_online(
+                &dq, &dk, &dv, &dbt, &dsi, &dpo, &dout, q_scale, c.bpr as u32, bs as u32,
+                q_heads as u32, kv_heads as u32, hd as u32, tokens as u32, &stream,
+            )
+        };
         let time = |f: &dyn Fn()| -> f64 {
             for _ in 0..3 {
                 f();
@@ -129,6 +141,7 @@ fn main() {
         // 旧路径 = 参考；新路跑前把 out 污化，确保"同"不是残留
         let old_ms = time(&run_old);
         let new_ms = time(&run_new);
+        let online_ms = time(&run_online);
         run_old();
         stream.sync();
         let o: Vec<u16> = dout.read_to_vec();
@@ -139,6 +152,23 @@ fn main() {
         let n: Vec<u16> = dout.read_to_vec();
         let same = o == n;
         assert_ne!(n, poison, "分块档没写 out");
+        // 单遍在线档：容差对拍（两遍档 = 位级资产，是这里最严的参照）
+        dout.upload_on(&poison, &stream);
+        run_online();
+        stream.sync();
+        let on: Vec<u16> = dout.read_to_vec();
+        assert_ne!(on, poison, "在线档没写 out");
+        let (mut sse, mut sy, mut md, mut my) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&a, &b) in on.iter().zip(o.iter()) {
+            let (u, v) =
+                (wein_kernel::reference::bf16_to_f32(a) as f64, wein_kernel::reference::bf16_to_f32(b) as f64);
+            sse += (u - v) * (u - v);
+            sy += v * v;
+            md = md.max((u - v).abs());
+            my = my.max(v.abs());
+        }
+        let (rel2, peakn) = ((sse / sy).sqrt(), md / my);
+        let ndiff = on.iter().zip(o.iter()).filter(|(a, b)| a != b).count();
 
         // KV 读量：旧 = tokens·q_heads·(pos+1)·hd·4B（每 q 行各读一遍 K/V）；
         // 新 = nblk·Lsplit·hd·4B（一块内 ntok·group 行共享一段）
@@ -148,22 +178,31 @@ fn main() {
         let nblk = kv_heads * ntile * jsplit;
         let new_bytes = nblk as f64 * (avg_l / jsplit as f64) * hd as f64 * 4.0;
         let floor_bytes = avg_l * kv_heads as f64 * hd as f64 * 4.0;
+        // 单遍档流量 = K 一遍 + V 一遍 = 2 个单位（两遍档 = K 两遍 + V = 3）
+        let online_bytes = new_bytes * 2.0 / 3.0;
         println!(
-            "| {} | {:.3} | {:.3} | {:.2}× | {:.1} MB | {:.1} MB | {:.1}× |",
+            "| {} | {:.3} | {:.3} | {:.3} | {:.2}× | {:.2}× | {:.1} MB | {:.1} MB | {:.1} MB | {:.1}× |",
             tag,
             old_ms,
             new_ms,
+            online_ms,
             old_ms / new_ms,
+            new_ms / online_ms,
             old_bytes / 1e6,
             new_bytes / 1e6,
+            online_bytes / 1e6,
             new_bytes / floor_bytes
         );
         let ms_floor = floor_bytes / 1.0e12 * 1.0e3; // @1TB/s
         // prefill 档每条 token 片都重读整段 j 区间（无 smem，只能靠 L2）：
         // "新/地板" 就是 ntile，即 L2 承担的超读倍数；有效速率才是真约束
         println!(
-            "   └ 位级同 {}｜理想单读 {:.3} ms｜新/理想单读 {:.1}×（=ntile，L2 承担）             ｜旧/理想单读 {:.1}×｜新有效速率 {:.0} GB/s｜几何 nblk={} (ntile={} jsplit={})",
+            "   └ 两遍位级同 {}（仅 jsplit=1 有约束）｜单遍 vs 两遍 rel2 {:.2e} 峰值 {:.2e}（{}/{} 位差）｜理想单读 {:.3} ms｜新/理想单读 {:.1}×（=ntile，L2 承担）｜旧/理想单读 {:.1}×｜新有效速率 {:.0} GB/s｜几何 nblk={} (ntile={} jsplit={})",
             same,
+            rel2,
+            peakn,
+            ndiff,
+            on.len(),
             ms_floor,
             new_bytes / floor_bytes,
             old_bytes / floor_bytes,
@@ -172,7 +211,11 @@ fn main() {
             ntile,
             jsplit
         );
-        assert!(same, "分块档（jsplit=1）应与旧路位级相同");
+        // 位级合同只在 jsplit=1（直落 out）；jsplit>1 走分片合并 = 容差档
+        if jsplit == 1 {
+            assert!(same, "分块档（jsplit=1）应与旧路位级相同");
+        }
+        assert!(rel2 <= 3.0e-3 && peakn <= 1.5e-2, "在线档容差越门：rel2 {rel2:.2e} 峰值 {peakn:.2e}");
         drop((dq, dk, dv, dbt, dsi, dpo, dout));
         let _ = he;
     }
