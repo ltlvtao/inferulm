@@ -146,6 +146,11 @@ fn run_turn(ex: &mut Qwen35Executor, id: u64, prompt: &[u32], gen: usize, chunk:
             panic!("step 失败：{fails:?}");
         }
     }
+    // 段表口径 = **prefill 段**（TTFT 点快照；decode 步的 gemm/attn 极小，
+    // 混进来会稀释 chunk 间差异——chunk 扫描表按此对齐）
+    let rep = ex.step_profile_report().unwrap_or_default();
+    ex.step_profile_reset();
+    let prefill_steps = steps;
     // decode 余下 gen-1 个 token
     let mut gen_ms = Vec::new();
     while tokens.len() < gen {
@@ -162,9 +167,8 @@ fn run_turn(ex: &mut Qwen35Executor, id: u64, prompt: &[u32], gen: usize, chunk:
             None => break,
         }
     }
-    let rep = ex.step_profile_report().unwrap_or_default();
-    println!("\n===== 请求 {id}：n={} chunk={chunk} 命中 {hit}｜TTFT {:.1} ms（{steps} 步）=====",
+    println!("\n===== 请求 {id}：n={} chunk={chunk} 命中 {hit}｜TTFT {:.1} ms（prefill {prefill_steps} 步）=====",
         prompt.len(), ttft);
     println!("{rep}");
-    Turn { ttft_ms: ttft, gen_ms, tokens, hit, steps }
+    Turn { ttft_ms: ttft, gen_ms, tokens, hit, steps: prefill_steps }
 }

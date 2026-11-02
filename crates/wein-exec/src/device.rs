@@ -5,7 +5,7 @@
 //! 同一结构——字段声明序保证借用者先于 gpu 析构。W2 计划用 arena
 //! （02-architecture §5）取代手写钉扎。
 use wein_kernel::cuda::{Gpu, Stream};
-use wein_kernel::ops::OpTable;
+use wein_kernel::ops::{OpTable, ScratchCaps};
 use wein_platform::{Device, HardwareProfile};
 
 /// 生命周期钉扎（见模块注释）；调用点的目标类型（'static）驱动推断
@@ -37,9 +37,15 @@ impl DeviceSession {
 
     /// 同 `open`，另指定 gemm autotune 的 m 集（稳态 decode 桶集）
     pub fn open_tuned(tune_m: &[u32]) -> Result<Self, String> {
+        Self::open_tuned_with(tune_m, &ScratchCaps::default())
+    }
+
+    /// `open_tuned` + scratch 容量参数（大块 prefill 的 t_max 抬档：rms/
+    /// deltanet l2 scratch 随批行数放大，exec 按模型几何 + ctx::t_max 推导）
+    pub fn open_tuned_with(tune_m: &[u32], caps: &ScratchCaps) -> Result<Self, String> {
         let gpu = Box::new(Gpu::probe().map_err(|e| format!("GPU 探测失败：{e}"))?);
         let profile = HardwareProfile::with_device(Device::Cuda).with_arch(gpu.arch());
-        let table = OpTable::resolve_tuned(&gpu, &profile, tune_m).map_err(|ds| {
+        let table = OpTable::resolve_tuned_with(&gpu, &profile, tune_m, caps).map_err(|ds| {
             let reasons: Vec<String> = ds.iter().map(|d| d.to_string()).collect();
             format!("算子表解析失败（{} 项降级）：{}", reasons.len(), reasons.join("; "))
         })?;

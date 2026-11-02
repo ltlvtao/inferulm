@@ -50,11 +50,12 @@ use wein_sched::{ReqId, StepPlan};
 use crate::ctx;
 use crate::device::{pin, DeviceSession};
 
-/// 批前向 scratch 行数上限（对齐调度 token_budget=512）。
-/// **不含 logits 表**：lm_head 只对需要出 token 的行做（`LG_CAP` 定尺），
-/// prefill chunk 的中间行不占 logits 显存、也不算 248K 词表投影——
-/// 抬 T_MAX 只需 scratch（[T,·] 那些）与 MAX_ROWS 的对账，见 `LG_CAP`
-const T_MAX: usize = 512;
+/// 批前向 scratch 行数上限——启动期参数（[`crate::ctx`] 的 t_max，
+/// `--t-max`/`WEIN_T_MAX`，未指定按 ctx-len 自动档；默认 512 = 原编译期
+/// 常量）。**不含 logits 表**：lm_head 只对需要出 token 的行做（`LG_CAP`
+/// 定尺），prefill chunk 的中间行不占 logits 显存、也不算 248K 词表投影——
+/// 抬 t_max 只需 scratch（[T,·] 那些）与 kernel 侧 ScratchCaps 的对账
+/// （rms 归约/deltanet l2），attn 块容量走行分片（见 kernel `launch_tile`）
 /// 块表/状态行数（串行并发上限；serve 接线时 max_running 须 ≤ 此值）
 const MAX_ROWS: usize = 128;
 /// logits 紧凑表行数：一步里**需要 logits 的行**（decode 行 + 每个 prefill
@@ -945,10 +946,20 @@ impl Qwen35Executor {
 
     fn open_with_tune(dir: &Path, tune_m: &[u32]) -> Result<Self, String> {
         ctx::check()?; // 上下文容量组合须可满足（不带病启动）
-        let session = DeviceSession::open_tuned(tune_m)?;
-        let gpu = session.gpu();
         let cfg = Qwen35Config::load(dir).map_err(|e| format!("config：{e}"))?;
         cfg.validate().map_err(|e| format!("config：{e}"))?;
+        // kernel scratch 容量按 t_max 推导（rms 归约 rows×块宽 / deltanet
+        // l2 tokens）。默认档（t_max=512）= 历史 compile 期常量，逐字节不变
+        let t_max = ctx::t_max();
+        let npot = |x: usize| x.min(256).next_power_of_two();
+        let r_zc = cfg.num_heads as usize * npot(cfg.head_dim as usize);
+        let r_gated = cfg.linear_num_v_heads as usize * npot(cfg.linear_v_dim as usize);
+        let caps = wein_kernel::ops::ScratchCaps {
+            reduce_floats: t_max * r_zc.max(r_gated),
+            delta_l2_tokens: t_max,
+        };
+        let session = DeviceSession::open_tuned_with(tune_m, &caps)?;
+        let gpu = session.gpu();
         let store = WeightStore::open(dir).map_err(|e| format!("权重：{e}"))?;
         let n_layers = cfg.num_layers as usize;
         // attention 的 A/B 旋钮（prefill/decode 两档）；kv 池字节密度只在分配处生效
@@ -1075,8 +1086,8 @@ impl Qwen35Executor {
                 layer,
                 norm: up("mtp.norm.weight")?,
                 kv,
-                hid: pin!(gpu.alloc_bytes(hidden_bytes * T_MAX)),
-                cat: pin!(gpu.alloc_bytes(hidden_bytes * 2 * T_MAX)),
+                hid: pin!(gpu.alloc_bytes(hidden_bytes * t_max)),
+                cat: pin!(gpu.alloc_bytes(hidden_bytes * 2 * t_max)),
             })
         } else {
             None
@@ -1096,61 +1107,61 @@ impl Qwen35Executor {
             (cfg.hidden_size as usize, cfg.inter_size as usize, cfg.vocab_size as usize);
         let bf = |n: usize| n * 2;
         let scr = ScrDev {
-            x: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            n1: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            qg: pin!(gpu.alloc_bytes(bf(T_MAX * 8192))),
-            qh: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            gate: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            kh: pin!(gpu.alloc_bytes(bf(T_MAX * 1024))),
-            vh: pin!(gpu.alloc_bytes(bf(T_MAX * 1024))),
-            attn: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            agated: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            qkv: pin!(gpu.alloc_bytes(bf(T_MAX * 8192))),
-            qkvc: pin!(gpu.alloc_bytes(bf(T_MAX * 8192))),
-            qs: pin!(gpu.alloc_bytes(bf(T_MAX * 2048))),
-            ks: pin!(gpu.alloc_bytes(bf(T_MAX * 2048))),
-            vs: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            z: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            aa: pin!(gpu.alloc_bytes(bf(T_MAX * 32))),
-            bb: pin!(gpu.alloc_bytes(bf(T_MAX * 32))),
-            core: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            normed: pin!(gpu.alloc_bytes(bf(T_MAX * 4096))),
-            o: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            h2: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            n2: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
-            g: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
-            u: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
-            act: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
-            m: pin!(gpu.alloc_bytes(bf(T_MAX * ii))),
-            d: pin!(gpu.alloc_bytes(bf(T_MAX * h))),
+            x: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            n1: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            qg: pin!(gpu.alloc_bytes(bf(t_max * 8192))),
+            qh: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            gate: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            kh: pin!(gpu.alloc_bytes(bf(t_max * 1024))),
+            vh: pin!(gpu.alloc_bytes(bf(t_max * 1024))),
+            attn: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            agated: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            qkv: pin!(gpu.alloc_bytes(bf(t_max * 8192))),
+            qkvc: pin!(gpu.alloc_bytes(bf(t_max * 8192))),
+            qs: pin!(gpu.alloc_bytes(bf(t_max * 2048))),
+            ks: pin!(gpu.alloc_bytes(bf(t_max * 2048))),
+            vs: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            z: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            aa: pin!(gpu.alloc_bytes(bf(t_max * 32))),
+            bb: pin!(gpu.alloc_bytes(bf(t_max * 32))),
+            core: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            normed: pin!(gpu.alloc_bytes(bf(t_max * 4096))),
+            o: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            h2: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            n2: pin!(gpu.alloc_bytes(bf(t_max * h))),
+            g: pin!(gpu.alloc_bytes(bf(t_max * ii))),
+            u: pin!(gpu.alloc_bytes(bf(t_max * ii))),
+            act: pin!(gpu.alloc_bytes(bf(t_max * ii))),
+            m: pin!(gpu.alloc_bytes(bf(t_max * ii))),
+            d: pin!(gpu.alloc_bytes(bf(t_max * h))),
             logits: pin!(gpu.alloc_bytes(bf(LG_CAP * voc))),
             lg_in: pin!(gpu.alloc_bytes(bf(LG_CAP * h))),
-            am_scratch: pin!(gpu.alloc_bytes(T_MAX * 512 * 4)),
-            am_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            am_scratch: pin!(gpu.alloc_bytes(t_max * 512 * 4)),
+            am_out: pin!(gpu.alloc_bytes(t_max * 4)),
             // 采样器逐行参数 + RNG 槽：**open 期一次分配**（图捕获区间内
             // 不许分配——gr5 守卫会 panic）。初值全 greedy（temp=0），
             // 图捕获就是"全 greedy 版"采样图，回放前主机覆写参数
-            sm_temp: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            sm_topk: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            sm_topp: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            sm_seed: pin!(gpu.alloc_bytes(T_MAX * 8)),
-            sm_slots: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_temp: pin!(gpu.alloc_bytes(t_max * 4)),
+            sm_topk: pin!(gpu.alloc_bytes(t_max * 4)),
+            sm_topp: pin!(gpu.alloc_bytes(t_max * 4)),
+            sm_seed: pin!(gpu.alloc_bytes(t_max * 8)),
+            sm_slots: pin!(gpu.alloc_bytes(t_max * 4)),
             sm_rng: pin!(gpu.alloc_bytes(MAX_ROWS * 8)),
-            sm_out: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            specs_zero: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            specs_one: pin!(gpu.alloc_bytes(T_MAX * 4)),
-            specs_mix: pin!(gpu.alloc_bytes(T_MAX * 4)),
+            sm_out: pin!(gpu.alloc_bytes(t_max * 4)),
+            specs_zero: pin!(gpu.alloc_bytes(t_max * 4)),
+            specs_one: pin!(gpu.alloc_bytes(t_max * 4)),
+            specs_mix: pin!(gpu.alloc_bytes(t_max * 4)),
         };
         // 逐 span 标志常量：一次写定（非投机 = 全 0；投机链段 = 全 1）
         scr.specs_zero.zero_on(session.stream());
-        scr.specs_one.upload_on(&vec![1u32; T_MAX], session.stream());
+        scr.specs_one.upload_on(&vec![1u32; t_max], session.stream());
         // 采样器开局态：temp=0（greedy）、top_k=64、top_p=1、槽号 0、种子 0、
         // RNG 槽全 0（= 未初始化哨兵 → 由图尾 kernel 用 seed 派生）。图捕获
         // 期不写这些缓冲（回放前主机才覆写），这里只是给"无采样步"一个
         // 确定初值：temp=0 ⇒ 图尾采样节点等价 argmax，且**不碰 RNG**
         scr.sm_temp.zero_on(session.stream());
-        scr.sm_topk.upload_on(&vec![64u32; T_MAX], session.stream());
-        scr.sm_topp.upload_on(&vec![1.0f32; T_MAX], session.stream());
+        scr.sm_topk.upload_on(&vec![64u32; t_max], session.stream());
+        scr.sm_topp.upload_on(&vec![1.0f32; t_max], session.stream());
         scr.sm_seed.zero_on(session.stream());
         scr.sm_slots.zero_on(session.stream());
         scr.sm_rng.zero_on(session.stream());
@@ -1158,23 +1169,23 @@ impl Qwen35Executor {
         // eager 混合批常驻输入表（open 期一次分配；运行期只前缀覆写）
         let nqh = cfg.num_heads as usize;
         let mix = MixIn {
-            ids: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            pos: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            seqs: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            start: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            count: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            rid: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            trow: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            tpos: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            iq: pin!(gpu.alloc_bytes(u32b(T_MAX * nqh))),
-            ig: pin!(gpu.alloc_bytes(u32b(T_MAX * nqh))),
-            ilq: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            ilk: pin!(gpu.alloc_bytes(u32b(T_MAX))),
-            ilv: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            ids: pin!(gpu.alloc_bytes(u32b(t_max))),
+            pos: pin!(gpu.alloc_bytes(u32b(t_max))),
+            seqs: pin!(gpu.alloc_bytes(u32b(t_max))),
+            start: pin!(gpu.alloc_bytes(u32b(t_max))),
+            count: pin!(gpu.alloc_bytes(u32b(t_max))),
+            rid: pin!(gpu.alloc_bytes(u32b(t_max))),
+            trow: pin!(gpu.alloc_bytes(u32b(t_max))),
+            tpos: pin!(gpu.alloc_bytes(u32b(t_max))),
+            iq: pin!(gpu.alloc_bytes(u32b(t_max * nqh))),
+            ig: pin!(gpu.alloc_bytes(u32b(t_max * nqh))),
+            ilq: pin!(gpu.alloc_bytes(u32b(t_max))),
+            ilk: pin!(gpu.alloc_bytes(u32b(t_max))),
+            ilv: pin!(gpu.alloc_bytes(u32b(t_max))),
             bt: pin!(gpu.alloc_bytes(u32b(MAX_ROWS * bpr_of()))),
-            samples: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            samples: pin!(gpu.alloc_bytes(u32b(t_max))),
             lg_rows: pin!(gpu.alloc_bytes(u32b(LG_CAP))),
-            sm_rows: pin!(gpu.alloc_bytes(u32b(T_MAX))),
+            sm_rows: pin!(gpu.alloc_bytes(u32b(t_max))),
         };
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
@@ -1303,8 +1314,8 @@ impl Qwen35Executor {
         if buckets.windows(2).any(|w| w[0] >= w[1]) {
             return Err(format!("桶集合须严格升序：{buckets:?}"));
         }
-        if buckets[0] < 1 || *buckets.last().unwrap() as usize > T_MAX {
-            return Err(format!("桶集越界（须 ≥1 且最大 ≤ {T_MAX}）：{buckets:?}"));
+        if buckets[0] < 1 || *buckets.last().unwrap() as usize > ctx::t_max() {
+            return Err(format!("桶集越界（须 ≥1 且最大 ≤ {}）：{buckets:?}", ctx::t_max()));
         }
         let mut ex = Self::open_with_tune(dir, &buckets)?;
         ex.row_capacity = MAX_ROWS as u32 - 1; // sink 让位——须在首个 admit 前定死
@@ -1562,7 +1573,7 @@ impl Qwen35Executor {
             if start == len {
                 break;
             }
-            let take = (len - start).min(T_MAX);
+            let take = (len - start).min(ctx::t_max());
             let (row, srow) = (st.row, st.state_row);
             let batch: Vec<(u32, u32, u32, u32)> = (0..take)
                 .map(|j| (row, srow, self.reqs[&1].seq[start + j], (start + j) as u32))
@@ -1729,7 +1740,7 @@ impl Qwen35Executor {
                 continue;
             };
             let (bt, mut state_row, start) = (st.row, st.state_row, st.forwarded);
-            if cnt as usize > T_MAX || start + cnt as usize > ctx::max_pos() {
+            if cnt as usize > ctx::t_max() || start + cnt as usize > ctx::max_pos() {
                 fails.push(*id);
                 continue;
             }
@@ -2605,8 +2616,8 @@ impl Qwen35Executor {
         // 批形与位置上界是**内部账目合同**（serve 侧 ctx_limit 前置校验 + `step`
         // 的 killed 过滤保证不违约）。违约时宁可本步空转也不 panic 带走引擎：
         // 空步由调度器下轮重试（`step` 已把越界请求标成失败，不会死循环）
-        if t == 0 || t > T_MAX || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= ctx::max_pos()) {
-            eprintln!("[exec] 前向批合同违约（t={t}，上限 {T_MAX}/{}），本步作废", ctx::max_pos());
+        if t == 0 || t > ctx::t_max() || rows.iter().any(|&(_, _, _, pos)| (pos as usize) >= ctx::max_pos()) {
+            eprintln!("[exec] 前向批合同违约（t={t}，上限 {}/{}），本步作废", ctx::t_max(), ctx::max_pos());
             return Vec::new();
         }
         self.last_t = t;
@@ -2743,7 +2754,7 @@ impl Qwen35Executor {
         } else if all_one {
             &self.scr.specs_one
         } else {
-            let mut mix = vec![0u32; T_MAX];
+            let mut mix = vec![0u32; ctx::t_max()];
             mix[..span_spec.len()].copy_from_slice(&span_spec);
             self.scr.specs_mix.upload_on(&mix, stream);
             &self.scr.specs_mix
@@ -3290,7 +3301,7 @@ impl Qwen35Executor {
         let t = items.len();
         assert_eq!(rope_pos.len(), t, "rope 位置表须与项数同长");
         assert!(t > 0, "mtp_draft：空批");
-        assert!(t <= T_MAX, "MTP 批 {t} 超前向缓冲上限 {T_MAX}");
+        assert!(t <= ctx::t_max(), "MTP 批 {t} 超前向缓冲上限 {}", ctx::t_max());
         // 草稿层末尾也要写 logits 紧凑表（[LG_CAP, vocab]，行 = 项号）。
         // 一项一链（≤ MTP_CHAINS），越界只可能是调用方违约——按"草稿作废"
         // 退化（全 0 必被验证拒绝），不 panic 带走引擎任务
@@ -3315,9 +3326,10 @@ impl Qwen35Executor {
                 ctx::max_pos()
             );
             debug_assert!(
-                (it.h as usize) < T_MAX,
-                "hidden 行 {} 超 scratch 行数 {T_MAX}",
-                it.h
+                (it.h as usize) < ctx::t_max(),
+                "hidden 行 {} 超 scratch 行数 {}",
+                it.h,
+                ctx::t_max()
             );
             debug_assert!(it.next_tok < voc, "MTP token {} 越界（vocab {voc}）", it.next_tok);
             // 链页耗尽 → 本轮草稿直接作废（返回全 0 占位，必然被验证拒绝）；
@@ -3332,7 +3344,7 @@ impl Qwen35Executor {
         let ids: Vec<u32> = items.iter().map(|i| i.next_tok.min(voc - 1)).collect();
         let pos: Vec<u32> = items.iter().map(|i| i.pos.min(ctx::max_pos() as u32 - 1)).collect();
         let seqs: Vec<u32> = items.iter().map(|i| i.kv_page_row).collect();
-        let hrows: Vec<u32> = items.iter().map(|i| i.h.min(T_MAX as u32 - 1)).collect();
+        let hrows: Vec<u32> = items.iter().map(|i| i.h.min(ctx::t_max() as u32 - 1)).collect();
         let (iq, ig) = qg_split_ids(t, self.cfg.num_heads as usize);
         let (d_ids, d_pos, d_rope_pos, d_seqs, d_hrows, d_bt, d_iq, d_ig) = (
             gpu.alloc_from_slice(&ids),

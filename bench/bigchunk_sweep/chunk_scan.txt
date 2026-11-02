@@ -1,0 +1,18 @@
+len=3009 chunk= 256 steps=12 TTFT=  686.5 | gemm  182.6 attn   90.2 delta  162.0 logits  17.8 norm+eltw  16.1 conv   6.2 hollow 205.0 | md5 dbcbac6b33
+len=3009 chunk= 512 steps= 6 TTFT=  587.3 | gemm  149.8 attn   91.9 delta  164.7 logits   8.2 norm+eltw  14.0 conv   4.6 hollow 149.6 | md5 dbcbac6b33
+len=3009 chunk=1024 steps= 3 TTFT=  524.0 | gemm  137.7 attn   80.6 delta  162.2 logits   4.1 norm+eltw  15.8 conv   4.1 hollow 115.3 | md5 dbcbac6b33
+len=3009 chunk=2048 steps= 2 TTFT=  511.4 | gemm  135.4 attn   78.1 delta  161.2 logits   2.7 norm+eltw  17.4 conv   4.6 hollow 107.7 | md5 dbcbac6b33
+len=3009 chunk=4096 steps= 1 TTFT=  541.6 | gemm  137.0 attn   74.5 delta  163.1 logits   1.3 norm+eltw  18.2 conv   5.2 hollow 135.7 | md5 dbcbac6b33
+len=3009 chunk=8192 steps= 1 TTFT=  507.6 | gemm  131.7 attn   76.9 delta  166.3 logits   1.4 norm+eltw  19.7 conv   4.6 hollow 101.4 | md5 dbcbac6b33
+len=6009 chunk= 256 steps=24 TTFT= 1299.1 | gemm  353.8 attn  354.0 delta  324.7 logits  34.8 norm+eltw  26.4 conv   9.6 hollow 184.1 | md5 4fefd99af5
+len=6009 chunk= 512 steps=12 TTFT= 1217.1 | gemm  298.0 attn  365.9 delta  322.7 logits  18.6 norm+eltw  25.1 conv   9.1 hollow 168.5 | md5 4fefd99af5
+len=6009 chunk=1024 steps= 6 TTFT= 1136.1 | gemm  270.8 attn  325.8 delta  329.8 logits   8.5 norm+eltw  31.9 conv   8.2 hollow 152.6 | md5 4fefd99af5
+len=6009 chunk=2048 steps= 3 TTFT= 1078.8 | gemm  268.1 attn  311.1 delta  329.0 logits   4.0 norm+eltw  34.9 conv   9.8 hollow 113.0 | md5 4fefd99af5
+len=6009 chunk=4096 steps= 2 TTFT= 1104.7 | gemm  266.7 attn  309.3 delta  325.5 logits   2.7 norm+eltw  38.6 conv   8.7 hollow 143.2 | md5 4fefd99af5
+len=6009 chunk=8192 steps= 1 TTFT= 1065.3 | gemm  265.5 attn  300.1 delta  332.0 logits   1.3 norm+eltw  41.3 conv  10.0 hollow 103.9 | md5 4fefd99af5
+len=8009 chunk= 256 steps=32 TTFT= 1836.0 | gemm  469.8 attn  617.0 delta  438.7 logits  47.7 norm+eltw  34.9 conv  14.4 hollow 196.8 | md5 90c86295b1
+len=8009 chunk= 512 steps=16 TTFT= 1705.6 | gemm  398.4 attn  645.9 delta  433.6 logits  21.9 norm+eltw  36.8 conv  11.8 hollow 144.5 | md5 90c86295b1
+len=8009 chunk=1024 steps= 8 TTFT= 1597.7 | gemm  365.6 attn  578.2 delta  426.8 logits  11.3 norm+eltw  44.1 conv  11.4 hollow 149.0 | md5 90c86295b1
+len=8009 chunk=2048 steps= 4 TTFT= 1545.3 | gemm  355.2 attn  564.3 delta  436.6 logits   6.6 norm+eltw  41.7 conv  12.4 hollow 116.0 | md5 90c86295b1
+len=8009 chunk=4096 steps= 2 TTFT= 1531.9 | gemm  352.0 attn  559.0 delta  439.0 logits   2.7 norm+eltw  51.8 conv  11.1 hollow 100.5 | md5 90c86295b1
+len=8009 chunk=8192 steps= 1 TTFT= 1555.5 | gemm  352.4 attn  552.4 delta  437.1 logits   1.4 norm+eltw  57.4 conv  13.6 hollow 126.8 | md5 90c86295b1

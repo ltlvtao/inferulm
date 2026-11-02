@@ -119,6 +119,10 @@ fn main() {
             take("--ctx-len", &mut c.max_pos, "max_pos");
             take("--kv-pages", &mut c.kv_pages, "kv_pages");
             take("--snap-stride", &mut c.snap_stride, "snap_stride");
+            // --t-max N：批前向行上限显式覆盖（未给 = 按 --ctx-len 自动档：
+            // ≥512、封顶 8192）。大块 prefill（chunk > 512）必须抬它——
+            // exec 的激活/输入表全按 t_max 定尺
+            take("--t-max", &mut c.t_max, "t_max");
             wein_exec::ctx::set(c).unwrap_or_else(|e| {
                 eprintln!("上下文容量配置无效：{e}");
                 std::process::exit(1)
@@ -167,6 +171,17 @@ fn main() {
                         cfg.sched.chunk_size = v.parse().unwrap_or_else(|_| {
                             eprintln!("--chunk-size 须为正整数：{v}");
                             std::process::exit(1)
+                        });
+                    }
+                    // token 预算默认接 t_max（默认档 = 512，与 SchedConfig
+                    // 原值相同⇒默认路径逐字节不变；--ctx-len 8192 时自动
+                    // 抬到 8192，chunk > 512 不被预算钳死）。--token-budget
+                    // 显式覆盖（battery 调参用）
+                    cfg.sched.token_budget = wein_exec::ctx::t_max();
+                    if let Some(v) = arg_opt(&args, "--token-budget") {
+                        cfg.sched.token_budget = v.parse().unwrap_or_else(|_| {
+                            eprintln!("--token-budget 须为正整数：{v}");
+                            std::process::exit(1);
                         });
                     }
                     // --memory：BlockPool 水位准入 + radix 前缀缓存（真模型路径

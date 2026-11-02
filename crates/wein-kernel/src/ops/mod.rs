@@ -36,6 +36,31 @@ pub enum RmsNormImpl<'a> {
     Blocked { gpu: &'a Gpu, f: Func, block: u32 },
 }
 
+/// 启动期 scratch 容量参数（exec 按批行上限 t_max 推导后经
+/// `resolve_tuned_with` 传入；默认值 = 历史编译期常量，默认路径逐字节不变）。
+/// 只装"容量随批行数线性放大"的两类：rms 块归约 scratch 与 deltanet
+/// l2norm 前置 inv——attn 的单次 launch 块容量不在此列（走行分片，见
+/// `launch_tile`/`launch_blk`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchCaps {
+    /// rms_norm_zc / rms_norm_gated 的块归约 scratch（f32 槽数）。
+    /// 需求 = rows × min(hidden,256)（b = 2 幂块宽）：zc 是 t×q 头、
+    /// gated 是 t×v 头，取两者最大
+    pub reduce_floats: usize,
+    /// deltanet l2norm 前置 inv 的 token 容量（× k 头上限 × 2 f32）
+    pub delta_l2_tokens: usize,
+}
+
+impl Default for ScratchCaps {
+    /// 历史 compile 期常量档（T_MAX=512）：rms 8192×256 槽 + l2 512 token
+    fn default() -> Self {
+        Self {
+            reduce_floats: REDUCE_ROWS_CAP * 256,
+            delta_l2_tokens: DELTA_L2_TOKENS_CAP,
+        }
+    }
+}
+
 /// 算子表：启动时 resolve 一次，全程只读
 pub struct OpTable<'a> {
     pub rms_norm: RmsNormImpl<'a>,
@@ -77,6 +102,17 @@ impl OpTable<'_> {
         gpu: &'a Gpu,
         profile: &HardwareProfile,
         tune_m: &[u32],
+    ) -> Result<OpTable<'a>, Vec<Degrade>> {
+        Self::resolve_tuned_with(gpu, profile, tune_m, &ScratchCaps::default())
+    }
+
+    /// `resolve_tuned` + scratch 容量参数（大块 prefill 的 t_max 抬档：
+    /// rms/deltanet l2 的 scratch 随批行数线性放大，exec 按几何推导传入）
+    pub fn resolve_tuned_with<'a>(
+        gpu: &'a Gpu,
+        profile: &HardwareProfile,
+        tune_m: &[u32],
+        caps: &ScratchCaps,
     ) -> Result<OpTable<'a>, Vec<Degrade>> {
         if profile.device != Device::Cuda {
             return Err(vec![Degrade {
@@ -153,7 +189,7 @@ impl OpTable<'_> {
         let rms_norm_zc = RmsNormZcCuda {
             gpu,
             f: m.func("rms_norm_zc"),
-            scratch: gpu.alloc_bytes(REDUCE_ROWS_CAP * 256 * 4),
+            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
@@ -164,12 +200,12 @@ impl OpTable<'_> {
             f: m.func("deltanet"),
             l2f: m.func("dn_qk_l2norm"),
             scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * DELTA_SLOTS_PER_BLOCK * 4),
-            inv: gpu.alloc_bytes(DELTA_L2_TOKENS_CAP * DELTA_L2_KHEADS_CAP * 2 * 4),
+            inv: gpu.alloc_bytes(caps.delta_l2_tokens * DELTA_L2_KHEADS_CAP * 2 * 4),
         };
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
             f: m.func("rms_norm_gated"),
-            scratch: gpu.alloc_bytes(REDUCE_ROWS_CAP * 256 * 4),
+            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
         let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
         let sample_rows = SampleRowsCuda {
@@ -609,12 +645,13 @@ impl DeltanetOp for DeltanetCuda<'_> {
         // 主 kernel 的每个 (行, 头) 有 vsplit 个块、每块 nwarps 个 warp，
         // 早先各自把 q/k 的 k_dim 维扫一遍求同一份 invq/invk——k[j]/q[j]
         // 对整条 v 维共享，这份重复是切块后剩下的主项。归约树（j 升序单链）
-        // 原样搬进前置 kernel，位级不变。
+        // 原样搬进前置 kernel，位级不变。token 容量按启动期 caps（大块
+        // prefill 的 t_max 抬档走 `resolve_tuned_with`），不再钉编译期常量
+        let l2_tokens = self.inv.bytes() / (DELTA_L2_KHEADS_CAP * 2 * 4);
         assert!(
-            tokens as usize <= DELTA_L2_TOKENS_CAP
-                && k_heads as usize <= DELTA_L2_KHEADS_CAP,
+            tokens as usize <= l2_tokens && k_heads as usize <= DELTA_L2_KHEADS_CAP,
             "deltanet l2norm 前置：tokens={tokens} × k_heads={k_heads} 超缓冲容量 \
-             {DELTA_L2_TOKENS_CAP}×{DELTA_L2_KHEADS_CAP}"
+             {l2_tokens}×{DELTA_L2_KHEADS_CAP}"
         );
         let n = tokens * k_heads;
         let l2args = crate::kernel_args![*q, *k, self.inv, tokens, k_heads, k_dim, l2_eps];
@@ -1682,7 +1719,10 @@ impl PagedAttnCuda<'_> {
         );
     }
 
-    /// 块档装订：ABI = 单遍档 + `stride`（插在 `chunk` 之后）
+    /// 块档装订：ABI = 单遍档 + `stride`（插在 `chunk` 之后）。
+    /// 行分片（slab）同 `launch_tile`：`bscratch` 池按单次 launch 定尺
+    /// （64M f32），t 超出单片容量时按 token 行切片多发——行独立、KV 已
+    /// 落池，片内几何（br/jsplit/bdim）沿用整批裁决值，算术序不变
     #[allow(clippy::too_many_arguments)]
     fn launch_blk(
         &self,
@@ -1705,7 +1745,61 @@ impl PagedAttnCuda<'_> {
         stream: &Stream,
     ) {
         assert!(tokens > 0, "paged_attn_blk: tokens=0");
-        let nblk = g.nblk(kv_heads);
+        // 单片 token 容量：块数 = kv_heads × ceil(t/br) × jsplit，
+        // 每块 stride 槽 ≤ BLK_SCRATCH_FLOATS
+        let per = ((BLK_SCRATCH_FLOATS / g.stride / (kv_heads as usize * g.jsplit)) * g.br)
+            .max(g.br);
+        if tokens as usize <= per {
+            self.launch_blk_span(
+                f, g, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+                block_size, q_heads, kv_heads, head_dim, tokens, stream,
+            );
+            return;
+        }
+        let row = (q_heads * head_dim) as usize * 2;
+        let mut start = 0usize;
+        while start < tokens as usize {
+            let len = per.min(tokens as usize - start);
+            self.launch_blk_span(
+                f, g,
+                &q.narrow(start * row, len * row),
+                k_cache,
+                v_cache,
+                block_table,
+                &seq_ids.narrow(start * 4, len * 4),
+                &positions.narrow(start * 4, len * 4),
+                &out.narrow(start * row, len * row),
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, len as u32, stream,
+            );
+            start += len;
+        }
+    }
+
+    /// 单次发射（块档行分片的片体）
+    #[allow(clippy::too_many_arguments)]
+    fn launch_blk_span(
+        &self,
+        f: &Func,
+        g: &BlkGeom,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_blk: tokens=0");
+        // ntile 按片内 tokens 重算（行分片：g.ntile 是整批值，仅几何裁决用）
+        let nblk = kv_heads as usize * tokens.div_ceil(g.br as u32) as usize * g.jsplit;
         assert!(nblk * g.stride <= BLK_SCRATCH_FLOATS, "块档 scratch 越界：{nblk} 块");
         if g.jsplit > 1 {
             assert!(
@@ -1730,9 +1824,69 @@ impl PagedAttnCuda<'_> {
     }
 
     /// 分块档公共装订（两遍/单遍同一份 launch 账）：
-    /// `f` 决定进哪个 kernel、`ntok/js/bdim` 是几何裁决的结果，其余逐字相同
+    /// `f` 决定进哪个 kernel、`ntok/js/bdim` 是几何裁决的结果，其余逐字相同。
+    ///
+    /// **行分片（slab）**：`tscratch`/块数容量（ATTN_TILE_BLOCK_CAP）是按
+    /// **单次 launch** 定尺的——t 超出时按 token 行切片多发而不是抬显存
+    /// （1024 块 × ~205KB/块 已是 21MB，×8 = 不可行）。行（token×q 头）
+    /// 彼此独立且 KV 已先落池（kv_scatter 前置），分片不改任何一行的
+    /// 算术序；几何按整批 tokens 裁一次、逐片沿用——片内 ntok/jsplit/bdim
+    /// 与"整批单发"完全同构。t ≤ 单片容量时一次发射，路径与旧版逐字相同
     #[allow(clippy::too_many_arguments)]
     fn launch_tile(
+        &self,
+        f: &Func,
+        ntok: usize,
+        jsplit: usize,
+        bdim: usize,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        // 单片 token 容量：块数 = kv_heads × ceil(t/ntok) × jsplit ≤ CAP
+        let per = ((ATTN_TILE_BLOCK_CAP / (kv_heads as usize * jsplit)) * ntok).max(ntok);
+        if tokens as usize <= per {
+            self.launch_tile_span(
+                f, ntok, jsplit, bdim, q, k_cache, v_cache, block_table, seq_ids, positions, out,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, stream,
+            );
+            return;
+        }
+        // q/out 行宽 = q_heads × head_dim × 2B（bf16）；pos/seqs 每 token u32
+        let row = (q_heads * head_dim) as usize * 2;
+        let mut start = 0usize;
+        while start < tokens as usize {
+            let len = per.min(tokens as usize - start);
+            self.launch_tile_span(
+                f, ntok, jsplit, bdim,
+                &q.narrow(start * row, len * row),
+                k_cache,
+                v_cache,
+                block_table,
+                &seq_ids.narrow(start * 4, len * 4),
+                &positions.narrow(start * 4, len * 4),
+                &out.narrow(start * row, len * row),
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, len as u32, stream,
+            );
+            start += len;
+        }
+    }
+
+    /// 单次发射（行分片的片体；参数合同与旧 `launch_tile` 逐字相同）
+    #[allow(clippy::too_many_arguments)]
+    fn launch_tile_span(
         &self,
         f: &Func,
         ntok: usize,
@@ -1819,14 +1973,28 @@ impl PagedAttnOp for PagedAttnCuda<'_> {
         tokens: u32,
         stream: &Stream,
     ) {
-        let n = tokens * q_heads;
-        assert!(n as usize <= ATTN_BLOCK_CAP,
-            "paged_attn 块数 {n} 超 scratch 容量 {ATTN_BLOCK_CAP}");
-        let args = crate::kernel_args![*q, *k_cache, *v_cache, *block_table, *seq_ids, *positions,
-            *out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, self.slot_cap,
-            self.scratch];
-        // 一 block 一 (t,qh)、block=head_dim 线程（四相位块协作——kernel 同构）
-        self.gpu.launch(&self.f, n, head_dim, &args, stream);
+        // 行分片（slab，同 launch_tile）：scratch 按单次 launch 的块数定尺
+        // （ATTN_BLOCK_CAP），t 超出时按 (token,q 头) 行切片多发——行独立，
+        // 算术序不变；t ≤ 单片容量时与旧版一次发射逐字相同
+        let per = (ATTN_BLOCK_CAP / q_heads as usize).max(1);
+        let mut start = 0u32;
+        while start < tokens {
+            let len = (per as u32).min(tokens - start);
+            let qs = &q.narrow(start as usize * q_heads as usize * head_dim as usize * 2,
+                len as usize * q_heads as usize * head_dim as usize * 2);
+            let ss = &seq_ids.narrow(start as usize * 4, len as usize * 4);
+            let ps = &positions.narrow(start as usize * 4, len as usize * 4);
+            let os = &out.narrow(start as usize * q_heads as usize * head_dim as usize * 2,
+                len as usize * q_heads as usize * head_dim as usize * 2);
+            let args = crate::kernel_args![*qs, *k_cache, *v_cache, *block_table, *ss, *ps,
+                *os, q_scale, bpr, block_size, q_heads, kv_heads, head_dim, len, self.slot_cap,
+                self.scratch];
+            // 一 block 一 (t,qh)、block=head_dim 线程（四相位块协作——kernel 同构）
+            self.gpu.launch(&self.f, len * q_heads, head_dim, &args, stream);
+            start += len;
+        }
+        assert!(q_heads as usize <= ATTN_BLOCK_CAP,
+            "paged_attn 行分片异常：q_heads={q_heads} 容量 {ATTN_BLOCK_CAP}");
     }
     fn name(&self) -> &'static str {
         "paged_attn/cuda"

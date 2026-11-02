@@ -105,7 +105,12 @@ impl Gpu {
 
     pub fn alloc_bytes(&self, bytes: usize) -> DevBuf<'_> {
         capture_guard();
-        DevBuf { drv: &self.drv, ptr: self.drv.mem_alloc(bytes).expect("cuMemAlloc"), bytes }
+        DevBuf {
+            drv: &self.drv,
+            ptr: self.drv.mem_alloc(bytes).expect("cuMemAlloc"),
+            bytes,
+            owned: true,
+        }
     }
     pub fn alloc_from_slice<T: Copy>(&self, slice: &[T]) -> DevBuf<'_> {
         capture_guard();
@@ -264,6 +269,8 @@ pub struct DevBuf<'a> {
     drv: &'a Driver,
     ptr: u64,
     bytes: usize,
+    /// false = `narrow` 出来的偏移视图（源缓冲的内部指针）——drop 不回收
+    owned: bool,
 }
 
 impl DevBuf<'_> {
@@ -279,6 +286,13 @@ impl DevBuf<'_> {
     /// 设备地址（CUdeviceptr）——非零校验/日志用，不进 launch 参数
     pub fn device_ptr(&self) -> u64 {
         self.ptr
+    }
+    /// 偏移视图（行分片用）：同一驱动句柄、ptr 前移 start 字节、容量收窄到
+    /// len。零拷贝零分配——attn 大块 prefill 的"单次 launch 行容量"不足时
+    /// 逐片发 kernel，各片拿本缓冲的窄视图（lifetime 跟随源缓冲）
+    pub fn narrow(&self, start: usize, len: usize) -> DevBuf<'_> {
+        assert!(start + len <= self.bytes, "narrow 区间越界：{start}+{len} > {}", self.bytes);
+        DevBuf { drv: self.drv, ptr: self.ptr + start as u64, bytes: len, owned: false }
     }
     pub fn len_bytes(&self) -> usize {
         self.bytes
@@ -347,7 +361,9 @@ impl DevBuf<'_> {
 
 impl Drop for DevBuf<'_> {
     fn drop(&mut self) {
-        self.drv.mem_free(self.ptr).expect("cuMemFree");
+        if self.owned {
+            self.drv.mem_free(self.ptr).expect("cuMemFree");
+        }
     }
 }
 
