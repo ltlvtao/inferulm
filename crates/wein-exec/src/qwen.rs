@@ -105,6 +105,50 @@ pub fn kv_block() -> u32 {
 pub fn kv_pages() -> u32 {
     ctx::kv_pages()
 }
+
+/// 单遍 attention 的 A/B 旋钮（`WEIN_ATTN_CFG`／`WEIN_ATTN_CFG_DEC`）：每线程维数（nd）、每线程
+/// q 行数（rpt）、单块 token 片（ntok）、池 dtype（kv）。别名：
+/// `baseline`｜`n8`｜`n16`｜`r2`｜`r4`｜`n8r4`｜`f32`｜`f32n8`｜`f32r4`｜
+/// `f32r2`；也可写逗号分隔的原子项（`nd=8,rpt=4,ntok=4,f32`）。
+/// 默认：prefill 形（t>4 行）= `n8r4`（8 维 × 4 行/线程，bdim 128）、
+/// decode 形（t≤4 行）= `r2`（4 维 × 2 行/线程，bdim 512）——A/B 实测见
+/// `examples/attn_ab_probe.rs`：RPT 是唯一有效的流量杠杆，但 RPT=4 在
+/// decode 形会把 bdim 压到 1 warp（块数不够 → 反而更慢），故按形状分档。
+/// 两档**逐位同值**（每条分值仍由单线程按 d 升序算完），故形状切换无风险。
+fn attn_cfg_from_env(var: &str, dflt: wein_kernel::ops::AttnCfg) -> wein_kernel::ops::AttnCfg {
+    use wein_kernel::ops::{AttnCfg, KvDtype};
+    let mut cfg = dflt;
+    let Ok(s) = std::env::var(var) else { return cfg };
+    for tok in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        // 别名是**绝对**档（从 baseline 起算，不继承 dflt 的 nd/rpt），
+        // `nd=/rpt=/ntok=/f32` 原子项才是在当前档上叠加——否则
+        // `WEIN_ATTN_CFG=f32r4` 会继承 prefill 默认的 nd=8 变成不存在的档
+        match tok {
+            "baseline" => cfg = AttnCfg::baseline(),
+            "n8" => cfg = AttnCfg { nd: 8, ..AttnCfg::baseline() },
+            "n16" => cfg = AttnCfg { nd: 16, ..AttnCfg::baseline() },
+            "r2" => cfg = AttnCfg { rpt: 2, ..AttnCfg::baseline() },
+            "r4" => cfg = AttnCfg { rpt: 4, ..AttnCfg::baseline() },
+            "n8r4" => cfg = AttnCfg { nd: 8, rpt: 4, ..AttnCfg::baseline() },
+            "f32" => cfg = AttnCfg { kv: KvDtype::F32, ..AttnCfg::baseline() },
+            "f32n8" => cfg = AttnCfg { nd: 8, kv: KvDtype::F32, ..AttnCfg::baseline() },
+            "f32r2" => cfg = AttnCfg { rpt: 2, kv: KvDtype::F32, ..AttnCfg::baseline() },
+            "f32r4" => cfg = AttnCfg { rpt: 4, kv: KvDtype::F32, ..AttnCfg::baseline() },
+            _ => {
+                if let Some(v) = tok.strip_prefix("nd=") {
+                    cfg.nd = v.parse().expect("WEIN_ATTN_CFG nd=");
+                } else if let Some(v) = tok.strip_prefix("rpt=") {
+                    cfg.rpt = v.parse().expect("WEIN_ATTN_CFG rpt=");
+                } else if let Some(v) = tok.strip_prefix("ntok=") {
+                    cfg.ntok_max = v.parse().expect("WEIN_ATTN_CFG ntok=");
+                } else {
+                    panic!("未知 WEIN_ATTN_CFG 项：{tok}（见 attn_cfg_from_env）");
+                }
+            }
+        }
+    }
+    cfg
+}
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
@@ -686,6 +730,14 @@ pub struct Qwen35Executor {
     /// 回退两遍分块档（`paged_attn_tile`，位级资产那一条）。短序列
     /// （ctx ≤ ATTN_SLOT_CAP=256）与本开关无关——仍走位级槽路
     attn_online: bool,
+    /// 单遍档的几何 + 池 dtype 档（`WEIN_ATTN_CFG`）：**prefill 形**（t>4 行）
+    /// 用这一档，默认 `n8r4`。`attn_cfg.kv` 决定 KV 池的字节密度（f32 池 =
+    /// 每元素 4B）——池页数/块大小不变，故 token 容量口径不变。
+    attn_cfg: wein_kernel::ops::AttnCfg,
+    /// 单遍档的 **decode 形**（t≤4 行）档（`WEIN_ATTN_CFG_DEC`，默认 `r2`）：
+    /// 小批时 RPT=4 会把 bdim 压到 1 warp、块数不够 ⇒ 单独选。dtype 须与
+    /// `attn_cfg` 一致（KV 池只分配一次）
+    attn_cfg_dec: wein_kernel::ops::AttnCfg,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -816,8 +868,16 @@ impl Qwen35Executor {
         t: u32,
         stream: &Stream,
     ) {
+        // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
+        let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
         if self.attn_online {
-            a.run_tile_online(
+            a.run_tile_online_cfg(
+                cfg, q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t,
+                stream,
+            );
+        } else if cfg.kv == wein_kernel::ops::KvDtype::F32 {
+            // 两遍位级档 + f32 池（回退口；与 bf16 池逐位同值）
+            a.run_tile_f32(
                 q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t, stream,
             );
         } else {
@@ -835,6 +895,20 @@ impl Qwen35Executor {
         cfg.validate().map_err(|e| format!("config：{e}"))?;
         let store = WeightStore::open(dir).map_err(|e| format!("权重：{e}"))?;
         let n_layers = cfg.num_layers as usize;
+        // attention 的 A/B 旋钮（prefill/decode 两档）；kv 池字节密度只在分配处生效
+        let attn_cfg = attn_cfg_from_env(
+            "WEIN_ATTN_CFG",
+            wein_kernel::ops::AttnCfg { nd: 8, rpt: 4, ..wein_kernel::ops::AttnCfg::baseline() },
+        );
+        let attn_cfg_dec = attn_cfg_from_env(
+            "WEIN_ATTN_CFG_DEC",
+            wein_kernel::ops::AttnCfg { rpt: 2, ..wein_kernel::ops::AttnCfg::baseline() },
+        );
+        assert_eq!(
+            attn_cfg.kv, attn_cfg_dec.kv,
+            "WEIN_ATTN_CFG 与 WEIN_ATTN_CFG_DEC 的池 dtype 须一致（KV 池只分配一次）"
+        );
+        let kv_esz = if attn_cfg.kv == wein_kernel::ops::KvDtype::F32 { 4 } else { 2 };
 
         // ---- 权重上载（mmap 切片直传；文本骨干前缀 model.language_model.，
         // visual/mtp 不在文本路径——738 张量里只取 32 层文本集）----
@@ -865,7 +939,7 @@ impl Qwen35Executor {
                 LayerType::Full => {
                     let bytes = ctx::kv_pages() as usize * ctx::block() as usize
                         * (cfg.num_kv_heads * cfg.head_dim) as usize
-                        * 2;
+                        * kv_esz;
                     k_pool.push(pin!(gpu.alloc_bytes(bytes)));
                     v_pool.push(pin!(gpu.alloc_bytes(bytes)));
                     AttnDev::Full(FullDev {
@@ -934,7 +1008,7 @@ impl Qwen35Executor {
             let kv = k_pool.len();
             let bytes = ctx::kv_pages() as usize * ctx::block() as usize
                 * (cfg.num_kv_heads * cfg.head_dim) as usize
-                * 2;
+                * kv_esz;
             k_pool.push(pin!(gpu.alloc_bytes(bytes)));
             v_pool.push(pin!(gpu.alloc_bytes(bytes)));
             let hidden_bytes = cfg.hidden_size as usize * 2;
@@ -1100,9 +1174,13 @@ impl Qwen35Executor {
             mtp_chains: HashMap::new(),
             mtp_free: (0..MTP_CHAINS as u32).rev().collect(),
             last_t: 0,
-            attn_tile: ctx::max_pos() > wein_kernel::ops::ATTN_SLOT_CAP
-                && std::env::var("WEIN_ATTN_TILE").map(|v| v != "0").unwrap_or(true),
+            // f32 池只能由分块档读出（位级槽路是 bf16 专用）⇒ 强制开 tile
+            attn_tile: attn_cfg.kv == wein_kernel::ops::KvDtype::F32
+                || (ctx::max_pos() > wein_kernel::ops::ATTN_SLOT_CAP
+                    && std::env::var("WEIN_ATTN_TILE").map(|v| v != "0").unwrap_or(true)),
             attn_online: std::env::var("WEIN_ATTN_ONLINE").map(|v| v != "0").unwrap_or(true),
+            attn_cfg,
+            attn_cfg_dec,
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -2806,10 +2884,19 @@ impl Qwen35Executor {
                         t32, stream,
                     );
                     self.prof_mark("kv");
-                    tb.kv_scatter.run(
-                        &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[full_i],
-                        &self.v_pool[full_i], self.bpr as u32, ctx::block(), he, t32, stream,
-                    );
+                    if self.attn_cfg.kv == wein_kernel::ops::KvDtype::F32 {
+                        tb.kv_scatter.run_f32(
+                            &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos,
+                            &self.k_pool[full_i], &self.v_pool[full_i], self.bpr as u32,
+                            ctx::block(), he, t32, stream,
+                        );
+                    } else {
+                        tb.kv_scatter.run(
+                            &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos,
+                            &self.k_pool[full_i], &self.v_pool[full_i], self.bpr as u32,
+                            ctx::block(), he, t32, stream,
+                        );
+                    }
                     self.prof_mark("attn");
                     if self.attn_tile {
                         self.attn_long(
@@ -3274,10 +3361,17 @@ impl Qwen35Executor {
         let rd = self.cfg.rot_dim();
         tb.rope_pt.run(&self.scr.qh, &self.cos, &self.sin, inp.rope_pos, &self.scr.qh, rd, hd, qh_n, t32, stream);
         tb.rope_pt.run(&self.scr.kh, &self.cos, &self.sin, inp.rope_pos, &self.scr.kh, rd, hd, kvh, t32, stream);
-        tb.kv_scatter.run(
-            &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
-            &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
-        );
+        if self.attn_cfg.kv == wein_kernel::ops::KvDtype::F32 {
+            tb.kv_scatter.run_f32(
+                &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
+                &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
+            );
+        } else {
+            tb.kv_scatter.run(
+                &self.scr.kh, &self.scr.vh, inp.bt, inp.seqs, inp.pos, &self.k_pool[w.kv],
+                &self.v_pool[w.kv], self.bpr as u32, ctx::block(), he, t32, stream,
+            );
+        }
         if self.attn_tile {
             self.attn_long(
                 &tb.paged_attn, &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt,

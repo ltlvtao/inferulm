@@ -112,14 +112,28 @@ impl OpTable<'_> {
         let rope = RopeCuda { gpu, f: m.func("rope") };
         let silu = SiluCuda { gpu, f: m.func("silu") };
         let w8a8_quant = QuantCuda { gpu, f: m.func("w8a8_quant") };
-        let kv_scatter = KvScatterCuda { gpu, f: m.func("kv_scatter") };
+        let kv_scatter = KvScatterCuda {
+            gpu,
+            f: m.func("kv_scatter"),
+            f32v: m.func("kv_scatter_f32"),
+        };
         let paged_attn = PagedAttnCuda {
             gpu,
             f: m.func("paged_attn"),
             scratch: gpu.alloc_bytes(ATTN_BLOCK_CAP * (ATTN_SLOT_CAP + 2) * 4),
             slot_cap: ATTN_SLOT_CAP as u32,
             ft: m.func("paged_attn_tile"),
+            ftf32: m.func("paged_attn_tile_f32"),
             fo: m.func("paged_attn_online"),
+            f_nd8: m.func("paged_attn_online_n8"),
+            f_nd16: m.func("paged_attn_online_n16"),
+            f_r2: m.func("paged_attn_online_r2"),
+            f_r4: m.func("paged_attn_online_r4"),
+            f_nd8_r4: m.func("paged_attn_online_n8_r4"),
+            f_f32: m.func("paged_attn_online_f32"),
+            f_f32_nd8: m.func("paged_attn_online_f32_n8"),
+            f_f32_r4: m.func("paged_attn_online_f32_r4"),
+            f_f32_r2: m.func("paged_attn_online_f32_r2"),
             fc: m.func("attn_combine"),
             tscratch: gpu.alloc_bytes(ATTN_TILE_BLOCK_CAP * ATTN_TILE_SLOTS * 4),
             pacc: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
@@ -949,12 +963,32 @@ pub trait KvScatterOp {
         tokens: u32,
         stream: &Stream,
     );
+    /// 同 `run`，但写入 **f32 池**（源仍 bf16，写入端精确加宽——
+    /// 池里每一位都是原 bf16 值的精确表示，故不改任何数值）
+    #[allow(clippy::too_many_arguments)]
+    fn run_f32(
+        &self,
+        src_k: &DevBuf,
+        src_v: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        k_dst: &DevBuf,
+        v_dst: &DevBuf,
+        bpr: u32,
+        block_size: u32,
+        head_elems: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
     fn name(&self) -> &'static str;
 }
 
 pub struct KvScatterCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
+    /// f32 池写入口（`kv_scatter_f32`）
+    f32v: Func,
 }
 
 impl KvScatterOp for KvScatterCuda<'_> {
@@ -977,6 +1011,26 @@ impl KvScatterOp for KvScatterCuda<'_> {
         let args = crate::kernel_args![*src_k, *src_v, *block_table, *seq_ids, *positions,
             *k_dst, *v_dst, bpr, block_size, head_elems, tokens];
         self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn run_f32(
+        &self,
+        src_k: &DevBuf,
+        src_v: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        k_dst: &DevBuf,
+        v_dst: &DevBuf,
+        bpr: u32,
+        block_size: u32,
+        head_elems: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * head_elems;
+        let args = crate::kernel_args![*src_k, *src_v, *block_table, *seq_ids, *positions,
+            *k_dst, *v_dst, bpr, block_size, head_elems, tokens];
+        self.gpu.launch(&self.f32v, n.div_ceil(256), 256, &args, stream);
     }
     fn name(&self) -> &'static str {
         "kv_scatter/cuda"
@@ -1024,11 +1078,24 @@ pub struct PagedAttnCuda<'a> {
     /// token 片, j 分片) 组织，一块内 `ntok×group` 个 q 行共享同一段 KV。
     /// 默认路径（ctx ≤ 256）不碰它——见 `run_tile`
     ft: Func,
+    /// 两遍档 f32 池入口（`paged_attn_tile_f32`；回退口 + f32 池用）
+    ftf32: Func,
     /// 单遍在线 softmax 档（`paged_attn_online`）：与 `ft` **同几何同 scratch
     /// 布局**，只把"两遍（先求 max 再复算 dot）"换成一遍在线合并。长序列默认
     /// 走它（`run_tile_online`）；`run_tile` 仍是两遍档（位级资产 + 回退口，
     /// exec 侧 `WEIN_ATTN_ONLINE=0`）
     fo: Func,
+    /// 单遍档的几何/dtype 变体（见 `AttnCfg`）：ND 维每线程 × RPT 行每线程 ×
+    /// 池 dtype。基线与变体共用同一 ABI 与 scratch，故只是入口不同。
+    f_nd8: Func,
+    f_nd16: Func,
+    f_r2: Func,
+    f_r4: Func,
+    f_nd8_r4: Func,
+    f_f32: Func,
+    f_f32_nd8: Func,
+    f_f32_r4: Func,
+    f_f32_r2: Func,
     fc: Func,
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
@@ -1049,16 +1116,17 @@ pub const ATTN_SLOT_CAP: usize = 256;
 /// (4 kv × 128 片 × 1) = 512；(32q/16kv/128) 形的 256-token chunk 是
 /// 16 × 64 = 1024。scratch = 1024 × ATTN_TILE_SLOTS × 4B ≈ 21MB（一次分配）
 const ATTN_TILE_BLOCK_CAP: usize = 1024;
-/// 一块内 q 行数上限 = ntok × group（映射用：bdim = rows × hd/4 ≤ 1024）
-const ATTN_TILE_ROWS_CAP: usize = 16;
+/// 一块内 q 行数上限 = ntok × group（映射用：bdim = rows/rpt × hd/nd ≤ 512）
+const ATTN_TILE_ROWS_CAP: usize = 32;
 /// p 暂存的 j chunk 宽（每 chunk 一次屏障）
 const ATTN_TILE_CHUNK: usize = 256;
-/// 每块 scratch 槽数上限：max 归约(bdim≤1024) + p(chunk×rows≤4096) +
-/// den(rows≤16) + 槽位表(nt≤4 × chunk≤1024)
-const ATTN_TILE_SLOTS: usize = 1024
+/// 每块 scratch 槽数上限：max 归约(rows_nom×nv ≤ 32×64 = 2048) +
+/// p(chunk×rows≤8192) + den(rows≤32) + 槽位表(nt≤8 × chunk≤256)——与 kernel
+/// 侧 `TILE_SLOT` 同值。首项按 RPT>1 的 rows_nom×nv 定尺（不是 bdim）
+const ATTN_TILE_SLOTS: usize = 2048
     + ATTN_TILE_CHUNK * ATTN_TILE_ROWS_CAP
     + ATTN_TILE_ROWS_CAP
-    + 4 * ATTN_TILE_CHUNK;
+    + 8 * ATTN_TILE_CHUNK;
 /// j 分片数上限（decode 形：批小、块不够用时按 j 切片换并行度）
 pub const ATTN_TILE_SPLIT_CAP: usize = 16;
 /// 分片档的 q 行容量（jsplit>1 只在小批发生：rows = tokens×q_heads ≤ 1024）
@@ -1067,9 +1135,92 @@ const ATTN_TILE_PART_ROWS: usize = 1024;
 const ATTN_TILE_HD_CAP: usize = 256;
 /// 分块档最小并行目标：块数低于它就往上加 j 分片
 const ATTN_TILE_TARGET_BLOCKS: usize = 128;
-/// 分块档线程上限：kernel 80 regs/线程 ⇒ 1024 线程（80×1024 > 64K 寄存器）
-/// 直接 "too many resources"；512 线程（40960 regs）安全
+/// 分块档线程上限的**兜底**值：真正的夹子是寄存器账（`attn_bdim_cap` =
+/// 65536/regs 向下取 32 的整）。512 = tile(96 regs)/tile_f32(102 regs) 的
+/// 65536/regs 都不足 640（向上取到 1024 线程会撞 "too many resources"）。
+/// 单遍各档 regs ≥86 ⇒ 1024 线程（需 ≤64 regs）在所有档上都不可达
+/// （见 `attn_regs` 与 A2 的 maxrregcount 实测：64 档 162 spill stores）。
 const ATTN_TILE_BDIM_CAP: usize = 512;
+
+// ── 单遍档的几何 / dtype 旋钮（A/B 判别仪器） ──
+
+/// KV 池 dtype。**只改载入形状，不改数值**：写入端 bf16→f32 是精确加宽，
+/// 读出端算术序一字不改 ⇒ 两种池的 attention 输出逐位相同。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvDtype {
+    Bf16,
+    F32,
+}
+
+/// 单遍 attention 的几何配置：
+/// · `rpt`：**每线程 q 行数**＝"每 KV 字节服务的 q 行数"，K/V 的 L2 载入次数
+///   直接 ÷rpt（唯一有效的流量杠杆；受 group 整除与寄存器预算约束）
+/// · `nd`：每线程维数（4/8/16）＝V 段切分与载入粒度
+/// · `ntok_max`：单块 token 片上限（只改块数：流量中性，减屏障）
+/// · `bdim_max`：单块线程上限（实际再被寄存器账夹住）
+/// · `kv`：池 dtype
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AttnCfg {
+    pub nd: usize,
+    pub rpt: usize,
+    pub ntok_max: usize,
+    pub bdim_max: usize,
+    pub kv: KvDtype,
+}
+
+impl AttnCfg {
+    /// 现值（W2 单遍档首发形态）：4 维/线程、1 行/线程、bf16 池
+    pub fn baseline() -> Self {
+        Self { nd: 4, rpt: 1, ntok_max: 4, bdim_max: ATTN_TILE_BDIM_CAP, kv: KvDtype::Bf16 }
+    }
+}
+
+/// 单遍档的落地几何（`online_geom` 的返回值；测试/探针打印用）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OnlineGeom {
+    pub ntok: usize,
+    pub nd: usize,
+    pub rpt: usize,
+    pub nv: usize,
+    pub rows_nom: usize,
+    pub bdim: usize,
+    pub ntile: usize,
+    pub jsplit: usize,
+}
+
+/// 每档 kernel 的寄存器用量（ptxas -v @sm_89 实测；改 kernel 后须重测）。
+/// 作用：把 bdim 夹在 65536/regs 之内——超了就 "too many resources" 起不来。
+const fn attn_regs(nd: usize, rpt: usize, f32_kv: bool) -> usize {
+    match (nd, rpt, f32_kv) {
+        (4, 1, false) => 88,
+        (8, 1, false) => 86,
+        (16, 1, false) => 100,
+        (4, 2, false) => 128,
+        (4, 4, false) => 168,
+        (8, 4, false) => 168,
+        (4, 1, true) => 96,
+        (8, 1, true) => 96,
+        (4, 2, true) => 134,
+        (4, 4, true) => 168,
+        _ => 128,
+    }
+}
+
+/// 某档的寄存器用量（探针/报告口径；见 `attn_regs`）
+pub fn attn_regs_of(cfg: AttnCfg) -> usize {
+    attn_regs(cfg.nd, cfg.rpt, cfg.kv == KvDtype::F32)
+}
+
+/// 该档的线程上限 = min(全局上限, 65536/regs 向下取 32 的整)
+const fn attn_bdim_cap(nd: usize, rpt: usize, f32_kv: bool) -> usize {
+    let cap = 65536 / attn_regs(nd, rpt, f32_kv);
+    let cap = cap / 32 * 32;
+    if cap < ATTN_TILE_BDIM_CAP {
+        cap
+    } else {
+        ATTN_TILE_BDIM_CAP
+    }
+}
 
 impl PagedAttnCuda<'_> {
     /// 测试用：偏结果表设备指针（pacc, pml, tscratch）
@@ -1093,9 +1244,11 @@ impl PagedAttnCuda<'_> {
         let nv = hd / 4; // 4 维/线程（u64 载 4×bf16）
         // token 片：最多 4 个 token，且 rows = ntok×group ≤ ROWS_CAP，
         // 线程数 rows×hd/4 ≤ BDIM_CAP（寄存器上限，见常量注释）
+        // 寄存器账：两遍档 tile=96 / tile_f32=102 regs，取更紧的一档做夹子
+        let bdim_cap = ATTN_TILE_BDIM_CAP.min(attn_bdim_cap(4, 1, true));
         let mut ntok = 4.min(tokens as usize).max(1);
         while ntok > 1
-            && (ntok * group > ATTN_TILE_ROWS_CAP || ntok * group * nv > ATTN_TILE_BDIM_CAP)
+            && (ntok * group > ATTN_TILE_ROWS_CAP || ntok * group * nv > bdim_cap)
         {
             ntok -= 1;
         }
@@ -1104,9 +1257,15 @@ impl PagedAttnCuda<'_> {
         let ntile = (tokens as usize + ntok - 1) / ntok;
         // j 分片：块数不足时按 j 切（decode 形）；prefill 形落 jsplit=1（位级同）
         let base = kv_heads as usize * ntile;
+        // j 分片只在**小批**（偏结果表装得下 tokens×q_heads 行）时开：大 chunk
+        // 的块数本就够，开分片只会把行数顶穿 PART_ROWS（曾实测 6009 的 121
+        // token chunk：ntok=4 ⇒ ntile=31 ⇒ base=124 <128 触发 jsplit=2，
+        // 行数 121×16=1936 > 1024）
         let mut jsplit = 1usize;
-        while jsplit * base < ATTN_TILE_TARGET_BLOCKS && jsplit < ATTN_TILE_SPLIT_CAP {
-            jsplit += 1;
+        if tokens as usize * q_heads as usize <= ATTN_TILE_PART_ROWS {
+            while jsplit * base < ATTN_TILE_TARGET_BLOCKS && jsplit < ATTN_TILE_SPLIT_CAP {
+                jsplit += 1;
+            }
         }
         (ntok, nv, rows_nom, bdim, ntile, jsplit)
     }
@@ -1136,9 +1295,38 @@ impl PagedAttnCuda<'_> {
         tokens: u32,
         stream: &Stream,
     ) {
+        let g = Self::tile_geom(q_heads, kv_heads, head_dim, tokens);
         self.launch_tile(
-            &self.ft, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
-            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+            &self.ft, g.0, g.5, g.3, q, k_cache, v_cache, block_table, seq_ids, positions, out,
+            q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        );
+    }
+
+    /// 两遍档（回退口）跑 **f32 池**：与 `run_tile` 同几何同算术，只有 K/V
+    /// 载入形状不同（与 bf16 逐位同值）
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_f32(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let g = Self::tile_geom(q_heads, kv_heads, head_dim, tokens);
+        self.launch_tile(
+            &self.ftf32, g.0, g.5, g.3, q, k_cache, v_cache, block_table, seq_ids, positions, out,
+            q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, stream,
         );
     }
 
@@ -1168,18 +1356,129 @@ impl PagedAttnCuda<'_> {
         tokens: u32,
         stream: &Stream,
     ) {
-        self.launch_tile(
-            &self.fo, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
-            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        self.run_tile_online_cfg(
+            AttnCfg::baseline(), q, k_cache, v_cache, block_table, seq_ids, positions, out,
+            q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, stream,
         );
     }
 
-    /// 分块档公共装订（两遍/单遍同一份几何裁决与 launch 账）：
-    /// `f` 决定进哪个 kernel，其余逐字相同
+    /// 单遍档（**指定几何/dtype 档**）：`cfg` 决定进哪个 kernel 变体与落地
+    /// 几何（`online_geom`）。同一 ABI/scratch/出参，故调用方只需换 cfg。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_online_cfg(
+        &self,
+        cfg: AttnCfg,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let g = Self::online_geom(cfg, q_heads, kv_heads, head_dim, tokens);
+        // 实体按**落地几何**选（rpt 由 online_geom 保证与 cfg 一致，此处仍按
+        // g.rpt 取，避免将来加回落时再次错配）
+        let f = self.online_func(AttnCfg { rpt: g.rpt, ..cfg });
+        self.launch_tile(
+            f, g.ntok, g.jsplit, g.bdim, q, k_cache, v_cache, block_table,
+            seq_ids, positions, out, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, stream,
+        );
+    }
+
+    /// cfg → kernel 入口（每档一份单态实体，见 kernels/src 的导出表）
+    fn online_func(&self, cfg: AttnCfg) -> &Func {
+        match (cfg.nd, cfg.rpt, cfg.kv) {
+            (4, 1, KvDtype::Bf16) => &self.fo,
+            (8, 1, KvDtype::Bf16) => &self.f_nd8,
+            (16, 1, KvDtype::Bf16) => &self.f_nd16,
+            (4, 2, KvDtype::Bf16) => &self.f_r2,
+            (4, 4, KvDtype::Bf16) => &self.f_r4,
+            (8, 4, KvDtype::Bf16) => &self.f_nd8_r4,
+            (4, 1, KvDtype::F32) => &self.f_f32,
+            (8, 1, KvDtype::F32) => &self.f_f32_nd8,
+            (4, 4, KvDtype::F32) => &self.f_f32_r4,
+            (4, 2, KvDtype::F32) => &self.f_f32_r2,
+            (nd, rpt, kv) => panic!("无此单遍档：nd={nd} rpt={rpt} kv={kv:?}"),
+        }
+    }
+
+    /// 单遍档几何裁决（纯函数：探针/exec/测试共用一份算式）。
+    ///
+    /// 选法：**先要 rpt 大**（流量 ÷rpt），再要 ntok 大（块少、屏障少），
+    /// 夹在 `rows_nom ≤ ROWS_CAP`、`bdim ≤ min(cfg.bdim_max, 寄存器账)` 之内。
+    /// rpt 还须整除 group（行组不跨 token）。
+    pub fn online_geom(
+        cfg: AttnCfg,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+    ) -> OnlineGeom {
+        let group = (q_heads / kv_heads) as usize;
+        let hd = head_dim as usize;
+        let nd = cfg.nd;
+        assert!(nd == 4 || nd == 8 || nd == 16, "nd 须 4/8/16");
+        assert!(hd % nd == 0, "head_dim {hd} 须整除 nd {nd}");
+        let nv = hd / nd;
+        let bdim_cap = cfg.bdim_max.min(attn_bdim_cap(nd, cfg.rpt, cfg.kv == KvDtype::F32));
+        let ntok_cap = cfg
+            .ntok_max
+            .min(tokens as usize)
+            .min(ATTN_TILE_ROWS_CAP / group)
+            .max(1);
+        // rpt **不回落**：kernel 实体是按 (nd, rpt) 单态的，几何若偷换成别的
+        // rpt 就会拿 RPT 不符的实体去跑（实测 n8r4 在 decode 形回落 rpt=2 ⇒
+        // 输出全错）。故 rpt 必须由 cfg 给定并可落地，落不了就是配置错。
+        let rpt = cfg.rpt;
+        assert!(
+            rpt >= 1 && group % rpt == 0 && nd * rpt <= 64,
+            "rpt 须整除 group({group}) 且 nd×rpt ≤ 64：cfg={cfg:?}"
+        );
+        // bdim 下限 32 = 一个 warp：decode 形（tokens=1、大 nd、大 rpt）只剩
+        // 一组线程，1 warp/块也是合法几何（块数由 j 分片补回来）
+        let ntok = (1..=ntok_cap)
+            .rev()
+            .find(|&ntok| {
+                let bdim = (ntok * group / rpt) * nv;
+                ntok * group % rpt == 0 && bdim <= bdim_cap && bdim % 32 == 0 && bdim >= 32
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "无可用单遍档几何：cfg={cfg:?} qh={q_heads} kvh={kv_heads} hd={hd} t={tokens}"
+                )
+            });
+        let (rows_nom, bdim) = (ntok * group, (ntok * group / rpt) * nv);
+        let ntile = (tokens as usize + ntok - 1) / ntok;
+        let base = kv_heads as usize * ntile;
+        // 同 `tile_geom`：偏结果表按 tokens×q_heads 行定尺，大 chunk 不开分片
+        let mut jsplit = 1usize;
+        if tokens as usize * q_heads as usize <= ATTN_TILE_PART_ROWS {
+            while jsplit * base < ATTN_TILE_TARGET_BLOCKS && jsplit < ATTN_TILE_SPLIT_CAP {
+                jsplit += 1;
+            }
+        }
+        OnlineGeom { ntok, nd, rpt, nv, rows_nom, bdim, ntile, jsplit }
+    }
+
+    /// 分块档公共装订（两遍/单遍同一份 launch 账）：
+    /// `f` 决定进哪个 kernel、`ntok/js/bdim` 是几何裁决的结果，其余逐字相同
     #[allow(clippy::too_many_arguments)]
     fn launch_tile(
         &self,
         f: &Func,
+        ntok: usize,
+        jsplit: usize,
+        bdim: usize,
         q: &DevBuf,
         k_cache: &DevBuf,
         v_cache: &DevBuf,
@@ -1204,12 +1503,11 @@ impl PagedAttnCuda<'_> {
             ATTN_TILE_CHUNK % (head_dim as usize / 4) == 0,
             "chunk 宽须是 head_dim/4 的整数倍（j 升序拼接的前提）"
         );
-        let (ntok, _nv, rows_nom, bdim, ntile, jsplit) =
-            Self::tile_geom(q_heads, kv_heads, head_dim, tokens);
         assert!(
             bdim <= ATTN_TILE_BDIM_CAP && bdim % 32 == 0,
-            "分块档线程数 {bdim} 非法（须 ≤{ATTN_TILE_BDIM_CAP} 且 32 的倍数；rows={rows_nom}×hd/4）"
+            "分块档线程数 {bdim} 非法（须 ≤{ATTN_TILE_BDIM_CAP} 且 32 的倍数）"
         );
+        let ntile = (tokens as usize + ntok - 1) / ntok;
         let nblk = kv_heads as usize * ntile * jsplit;
         assert!(
             nblk <= ATTN_TILE_BLOCK_CAP,

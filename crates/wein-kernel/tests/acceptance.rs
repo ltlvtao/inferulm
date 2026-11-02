@@ -80,10 +80,28 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry attn_combine("), "attn_combine 入口缺失/被改名");
     // deltanet 的 q/k l2norm 前置小 kernel（invq/invk 去重）
     assert!(ptx.contains(".entry dn_qk_l2norm("), "dn_qk_l2norm 入口缺失/被改名");
+    // attention A/B 档（几何 × 池 dtype；见 `ops::AttnCfg`）：单遍 9 档 +
+    // 两遍 f32 + kv_scatter f32。每档一份单态实体（nd/rpt/wide 是编译期常量）
+    for k in [
+        "paged_attn_online_n8",
+        "paged_attn_online_n16",
+        "paged_attn_online_r2",
+        "paged_attn_online_r4",
+        "paged_attn_online_n8_r4",
+        "paged_attn_online_f32",
+        "paged_attn_online_f32_n8",
+        "paged_attn_online_f32_r2",
+        "paged_attn_online_f32_r4",
+        "paged_attn_tile_f32",
+        "kv_scatter_f32",
+    ] {
+        let head = format!(".entry {k}(");
+        assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
+    }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        24,
-        "导出 kernel 数应为 24（多了说明编译单元混入了别的入口）"
+        35,
+        "导出 kernel 数应为 35（24 + attention A/B 档 11；多了说明编译单元混入了别的入口）"
     );
 }
 
