@@ -366,7 +366,12 @@ impl EngineCore {
                         + plan.decode.len(),
                     Ordering::Relaxed,
                 );
-                if !cfg.step_delay.is_zero() {
+                if cfg.step_delay.is_zero() {
+                    // 让点：本循环无任何 await（drain 用 try_recv、send 是非阻塞），
+                    // 会把所在 worker 线程占满整代——同 worker 上的 SSE 投递任务被饿死，
+                    // 客户端在生成结束前一个 token 都收不到（单请求尤其明显）。
+                    tokio::task::yield_now().await;
+                } else {
                     sleep(cfg.step_delay).await;
                 }
                 // 同一步内同一请求可发多个 token（投机解码：接受的草稿 + 奖励）。

@@ -1,0 +1,70 @@
+
+### 场景B 全窗口 — GPU 时间 341.57 ms
+  gemm               273.267 ms   80.0%
+  mamba/GDN           22.681 ms    6.6%
+  attn                19.591 ms    5.7%
+  elementwise/act     19.397 ms    5.7%
+  rms_norm             4.480 ms    1.3%
+  rope                 1.077 ms    0.3%
+  memcpy/memset        1.052 ms    0.3%
+  sampling             0.023 ms    0.0%
+
+  top-20 kernel:
+    1.   241.216ms  70.6%  n=   288 avg=   837.6us  ampere_bf16_s1688gemm_bf16_64x128_sliced1x2_ldg8_f2f_tn
+    2.    26.116ms   7.6%  n=    96 avg=   272.0us  ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f_tn
+    3.    19.267ms   5.6%  n=    24 avg=   802.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    4.    10.111ms   3.0%  n=    96 avg=   105.3us  triton_poi_fused_mul_silu_slice_2
+    5.     7.310ms   2.1%  n=    72 avg=   101.5us  chunk_fwd_kernel_o
+    6.     5.271ms   1.5%  n=    72 avg=    73.2us  chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    7.     4.870ms   1.4%  n=     3 avg=  1623.5us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    8.     4.254ms   1.2%  n=    72 avg=    59.1us  merge_16x16_to_64x64_inverse_kernel
+    9.     3.798ms   1.1%  n=    72 avg=    52.7us  _causal_conv1d_fwd_kernel
+   10.     2.424ms   0.7%  n=    96 avg=    25.3us  triton_red_fused__to_copy_add_fused_add_rms_norm_3
+   11.     2.336ms   0.7%  n=    72 avg=    32.4us  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_silu_0
+   12.     2.102ms   0.6%  n=    72 avg=    29.2us  _fused_post_conv_kernel
+   13.     2.008ms   0.6%  n=    96 avg=    20.9us  triton_red_fused__to_copy_add_fused_add_rms_norm_1
+   14.     1.901ms   0.6%  n=    72 avg=    26.4us  recompute_w_u_fwd_kernel
+   15.     1.180ms   0.3%  n=    72 avg=    16.4us  chunk_scaled_dot_kkt_fwd_kernel
+   16.     1.077ms   0.3%  n=    24 avg=    44.9us  _fused_qk_rmsnorm_rope_gate_kernel
+   17.     0.955ms   0.3%  n=    72 avg=    13.3us  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8
+   18.     0.890ms   0.3%  n=    75 avg=    11.9us  Memcpy DtoD (Device -> Device)
+   19.     0.661ms   0.2%  n=    24 avg=    27.6us  triton_poi_fused_mul_sigmoid_view_0
+   20.     0.579ms   0.2%  n=    69 avg=     8.4us  triton_poi_fused_zeros_5
+
+# 归属：gen 步 0.00ms / ctx 步 341.57ms / 未归属 341228.25ms
+
+### 场景B 仅 prefill(ctx) 步 — GPU 时间 341.57 ms
+  gemm               273.267 ms   80.0%
+  mamba/GDN           22.681 ms    6.6%
+  attn                19.591 ms    5.7%
+  elementwise/act     19.397 ms    5.7%
+  rms_norm             4.480 ms    1.3%
+  rope                 1.077 ms    0.3%
+  memcpy/memset        1.052 ms    0.3%
+  sampling             0.023 ms    0.0%
+
+  top-20 kernel:
+    1.   241.216ms  70.6%  n=   288 avg=   837.6us  ampere_bf16_s1688gemm_bf16_64x128_sliced1x2_ldg8_f2f_tn
+    2.    26.116ms   7.6%  n=    96 avg=   272.0us  ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f_tn
+    3.    19.267ms   5.6%  n=    24 avg=   802.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    4.    10.111ms   3.0%  n=    96 avg=   105.3us  triton_poi_fused_mul_silu_slice_2
+    5.     7.310ms   2.1%  n=    72 avg=   101.5us  chunk_fwd_kernel_o
+    6.     5.271ms   1.5%  n=    72 avg=    73.2us  chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    7.     4.870ms   1.4%  n=     3 avg=  1623.5us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    8.     4.254ms   1.2%  n=    72 avg=    59.1us  merge_16x16_to_64x64_inverse_kernel
+    9.     3.798ms   1.1%  n=    72 avg=    52.7us  _causal_conv1d_fwd_kernel
+   10.     2.424ms   0.7%  n=    96 avg=    25.3us  triton_red_fused__to_copy_add_fused_add_rms_norm_3
+   11.     2.336ms   0.7%  n=    72 avg=    32.4us  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_silu_0
+   12.     2.102ms   0.6%  n=    72 avg=    29.2us  _fused_post_conv_kernel
+   13.     2.008ms   0.6%  n=    96 avg=    20.9us  triton_red_fused__to_copy_add_fused_add_rms_norm_1
+   14.     1.901ms   0.6%  n=    72 avg=    26.4us  recompute_w_u_fwd_kernel
+   15.     1.180ms   0.3%  n=    72 avg=    16.4us  chunk_scaled_dot_kkt_fwd_kernel
+   16.     1.077ms   0.3%  n=    24 avg=    44.9us  _fused_qk_rmsnorm_rope_gate_kernel
+   17.     0.955ms   0.3%  n=    72 avg=    13.3us  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8
+   18.     0.890ms   0.3%  n=    75 avg=    11.9us  Memcpy DtoD (Device -> Device)
+   19.     0.661ms   0.2%  n=    24 avg=    27.6us  triton_poi_fused_mul_sigmoid_view_0
+   20.     0.579ms   0.2%  n=    69 avg=     8.4us  triton_poi_fused_zeros_5
+
+### 逐步（3 步）
+  ctx(prefill 步)     n=   3 step(cadence)=  116.52ms kernel=  113.86ms 空洞=   2.67ms (  2.3%)  kernels/step=885
+  全部                 n=   3 step(cadence)=  116.52ms kernel=  113.86ms 空洞=   2.67ms (  2.3%)  kernels/step=885

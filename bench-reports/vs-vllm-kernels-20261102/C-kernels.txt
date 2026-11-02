@@ -1,0 +1,106 @@
+
+### 场景C 全窗口 — GPU 时间 338.35 ms
+  gemm               263.641 ms   77.9%
+  lm_head             42.188 ms   12.5%
+  attn                16.550 ms    4.9%
+  elementwise/act      5.432 ms    1.6%
+  mamba/GDN            5.425 ms    1.6%
+  rms_norm             3.530 ms    1.0%
+  memcpy/memset        0.931 ms    0.3%
+  rope                 0.420 ms    0.1%
+  sampling             0.227 ms    0.1%
+
+  top-20 kernel:
+    1.   254.638ms  75.3%  n=  3390 avg=    75.1us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    2.    25.333ms   7.5%  n=   896 avg=    28.3us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    3.    15.579ms   4.6%  n=   160 avg=    97.4us  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8
+    4.     8.459ms   2.5%  n=   224 avg=    37.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    5.     7.494ms   2.2%  n=    56 avg=   133.8us  ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f_tn
+    6.     5.405ms   1.6%  n=    16 avg=   337.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    7.     2.578ms   0.8%  n=    64 avg=    40.3us  ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_stages_64x5_tn
+    8.     2.355ms   0.7%  n=   672 avg=     3.5us  fused_recurrent_gated_delta_rule_packed_decode_kernel
+    9.     2.317ms   0.7%  n=   224 avg=    10.3us  void flash::flash_fwd_splitkv_combine_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, fal
+   10.     1.950ms   0.6%  n=   960 avg=     2.0us  triton_red_fused__to_copy_add_fused_add_rms_norm_3
+   11.     1.514ms   0.4%  n=   960 avg=     1.6us  triton_red_fused__to_copy_add_fused_add_rms_norm_1
+   12.     1.122ms   0.3%  n=   960 avg=     1.2us  triton_poi_fused_mul_silu_slice_2
+   13.     1.086ms   0.3%  n=   720 avg=     1.5us  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_silu_0
+   14.     1.084ms   0.3%  n=   672 avg=     1.6us  _causal_conv1d_update_kernel
+   15.     0.588ms   0.2%  n=   690 avg=     0.9us  triton_poi_fused_4
+   16.     0.532ms   0.2%  n=   690 avg=     0.8us  triton_poi_fused_zeros_5
+   17.     0.483ms   0.1%  n=    48 avg=    10.1us  chunk_fwd_kernel_o
+   18.     0.428ms   0.1%  n=    48 avg=     8.9us  merge_16x16_to_64x64_inverse_kernel
+   19.     0.420ms   0.1%  n=   240 avg=     1.8us  _fused_qk_rmsnorm_rope_gate_kernel
+   20.     0.369ms   0.1%  n=   240 avg=     1.5us  void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, (vllm::Fp8KVCach
+
+# 归属：gen 步 300.20ms / ctx 步 38.15ms / 未归属 338007.16ms
+
+### 场景C 仅 decode(gen) 步 — GPU 时间 300.20 ms
+  gemm               237.782 ms   79.2%
+  lm_head             39.505 ms   13.2%
+  attn                11.111 ms    3.7%
+  elementwise/act      3.747 ms    1.2%
+  mamba/GDN            3.560 ms    1.2%
+  rms_norm             3.222 ms    1.1%
+  memcpy/memset        0.698 ms    0.2%
+  rope                 0.359 ms    0.1%
+  sampling             0.212 ms    0.1%
+
+  top-20 kernel:
+    1.   251.955ms  83.9%  n=  3388 avg=    74.4us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    2.    25.333ms   8.4%  n=   896 avg=    28.3us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    3.     8.459ms   2.8%  n=   224 avg=    37.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    4.     2.355ms   0.8%  n=   672 avg=     3.5us  fused_recurrent_gated_delta_rule_packed_decode_kernel
+    5.     2.317ms   0.8%  n=   224 avg=    10.3us  void flash::flash_fwd_splitkv_combine_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, fal
+    6.     1.800ms   0.6%  n=   896 avg=     2.0us  triton_red_fused__to_copy_add_fused_add_rms_norm_3
+    7.     1.362ms   0.5%  n=   896 avg=     1.5us  triton_red_fused__to_copy_add_fused_add_rms_norm_1
+    8.     1.084ms   0.4%  n=   672 avg=     1.6us  _causal_conv1d_update_kernel
+    9.     0.958ms   0.3%  n=   672 avg=     1.4us  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_silu_0
+   10.     0.917ms   0.3%  n=   896 avg=     1.0us  triton_poi_fused_mul_silu_slice_2
+   11.     0.547ms   0.2%  n=   644 avg=     0.8us  triton_poi_fused_4
+   12.     0.465ms   0.2%  n=   644 avg=     0.7us  triton_poi_fused_zeros_5
+   13.     0.359ms   0.1%  n=   224 avg=     1.6us  _fused_qk_rmsnorm_rope_gate_kernel
+   14.     0.335ms   0.1%  n=   224 avg=     1.5us  void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, (vllm::Fp8KVCach
+   15.     0.277ms   0.1%  n=   504 avg=     0.5us  Memcpy HtoD (Pageable -> Device)
+   16.     0.212ms   0.1%  n=   252 avg=     0.8us  memcpy32_post
+   17.     0.200ms   0.1%  n=   224 avg=     0.9us  triton_poi_fused_mul_sigmoid_view_0
+   18.     0.140ms   0.0%  n=   140 avg=     1.0us  Memcpy DtoD (Device -> Device)
+   19.     0.099ms   0.0%  n=    28 avg=     3.6us  void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::nativ
+   20.     0.093ms   0.0%  n=    28 avg=     3.3us  void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps
+
+### 场景C 仅 prefill(ctx) 步 — GPU 时间 38.15 ms
+  gemm                25.858 ms   67.8%
+  attn                 5.439 ms   14.3%
+  lm_head              2.684 ms    7.0%
+  mamba/GDN            1.864 ms    4.9%
+  elementwise/act      1.685 ms    4.4%
+  rms_norm             0.308 ms    0.8%
+  memcpy/memset        0.234 ms    0.6%
+  rope                 0.062 ms    0.2%
+  sampling             0.015 ms    0.0%
+
+  top-20 kernel:
+    1.    15.579ms  40.8%  n=   160 avg=    97.4us  void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8
+    2.     7.494ms  19.6%  n=    56 avg=   133.8us  ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f_tn
+    3.     5.405ms  14.2%  n=    16 avg=   337.8us  void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256, 64, 64, 4, false, fals
+    4.     2.684ms   7.0%  n=     2 avg=  1341.8us  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __
+    5.     2.578ms   6.8%  n=    64 avg=    40.3us  ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_stages_64x5_tn
+    6.     0.483ms   1.3%  n=    48 avg=    10.1us  chunk_fwd_kernel_o
+    7.     0.428ms   1.1%  n=    48 avg=     8.9us  merge_16x16_to_64x64_inverse_kernel
+    8.     0.351ms   0.9%  n=    48 avg=     7.3us  chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    9.     0.258ms   0.7%  n=    48 avg=     5.4us  recompute_w_u_fwd_kernel
+   10.     0.251ms   0.7%  n=    48 avg=     5.2us  _causal_conv1d_fwd_kernel
+   11.     0.205ms   0.5%  n=    64 avg=     3.2us  triton_poi_fused_mul_silu_slice_2
+   12.     0.202ms   0.5%  n=    50 avg=     4.0us  void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::nativ
+   13.     0.193ms   0.5%  n=    48 avg=     4.0us  chunk_scaled_dot_kkt_fwd_kernel
+   14.     0.160ms   0.4%  n=    48 avg=     3.3us  void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::nativ
+   15.     0.152ms   0.4%  n=    64 avg=     2.4us  triton_red_fused__to_copy_add_fused_add_rms_norm_1
+   16.     0.150ms   0.4%  n=    64 avg=     2.3us  triton_red_fused__to_copy_add_fused_add_rms_norm_3
+   17.     0.149ms   0.4%  n=   112 avg=     1.3us  void cublasLt::splitKreduce_kernel<32, 16, int, __nv_bfloat16, __nv_bfloat16, float, __n
+   18.     0.136ms   0.4%  n=   136 avg=     1.0us  Memset (Device)
+   19.     0.128ms   0.3%  n=    48 avg=     2.7us  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_silu_0
+   20.     0.126ms   0.3%  n=    48 avg=     2.6us  _fused_post_conv_kernel
+
+### 逐步（30 步）
+  gen(纯 decode 步)    n=  28 step(cadence)=   10.93ms kernel=   10.72ms 空洞=   0.21ms (  1.9%)  kernels/step=465
+  ctx(prefill 步)     n=   2 step(cadence)=   28.59ms kernel=   19.07ms 空洞=   9.52ms ( 33.3%)  kernels/step=946
+  全部                 n=  30 step(cadence)=   12.11ms kernel=   11.28ms 空洞=   0.83ms (  6.9%)  kernels/step=497
