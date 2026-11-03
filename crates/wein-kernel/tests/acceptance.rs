@@ -105,8 +105,8 @@ fn k1_ptx_artifact_structure() {
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        39,
-        "导出 kernel 数应为 39（24 + attention A/B 档 15；多了说明编译单元混入了别的入口）"
+        42,
+        "导出 kernel 数应为 42（24 + attention A/B 档 15 + deltanet chunked 3：dn_chunk_prep/h/o）"
     );
 }
 

@@ -66,7 +66,6 @@ pub fn f32_to_bf16(x: f32) -> u16 {
 /// （`core_float_math` #137578）——`core::intrinsics::fma` 是同一物（冒烟
 /// 双向验证：两写法产出的 PTX 逐字相同；`a·b + c` 字面量则产 16×mul +
 /// 16×add，无收缩）。
-#[inline(always)]
 fn fma(a: f32, b: f32, c: f32) -> f32 {
     core::f32::math::mul_add(a, b, c)
 }
@@ -2771,6 +2770,1084 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             *core_out.add((g * vh + h) * vd + vv) = f32_to_bf16(o);
         }
         i += 1;
+    }
+}
+
+// ───────────── delta BT-chunked（WY/UT 分块递推；prefill 大 span 容差档） ─────────────
+//
+// 代数（与 FLA chunk.py/wy_fast.py 同构；标量衰减版——本模型 a 是 [tokens, v_heads]
+// 逐 (token, 头) 标量，非逐 k 维向量，UT 变换因此更简）：
+//
+//   逐 token（kernel 现状，reference 同式）：S₁=S₀·λ；kvm=S₁k̂；δ=(v−kvm)·β；
+//   S₂=S₁+k̂⊗δ；o=S₂·q̂/√kd。β=sigmoid(b)（收 bf16 同式）；
+//   λ=exp(−X)，X=exp(a_log)·softplus(a+dt_bias)（≥0，逐 (token,头) 标量）。
+//
+//   块内（BT token，C_t = Σ_{s≤t}X_s 块内累计——e^{−C_t} 即逐 token 衰减积）：
+//   ① A[t,s] = β_t·(k̂_t·k̂_s)·e^{C_s−C_t}（s<t 严格下三角）
+//   ② ū = (I+A)⁻¹(β⊙v)          [BT,V]（状态无关）
+//      w  = (I+A)⁻¹(β·e^{−C}⊙k̂) [BT,K]（状态无关）
+//   ③ 块间串行：x = w·S₀ᵀ；δ = ū − x；S ← e^{−C_last}·S₀ + Σ_t e^{C_t−C_last}·k̂_t⊗δ_t
+//   ④ 输出（全并行）：o_t = e^{−C_t}·(S₀·q̂_t) + Σ_{s≤t}(q̂_t·k̂_s)·e^{C_s−C_t}·δ_s，再 /√kd
+//
+//   对拍（/tmp 原型 vs 朴素递推，f32）：rel2 out 6.2e-7 / 末态 6.2e-8——代数精确；
+//   与 reference 的差全在舍入路径（reference 逐 token 收 bf16 状态、本路 f32 链
+//   + 块边界 bf16 快照），容差档 o35 钉预算。
+//
+// 三 kernel（host 侧 ops::DeltanetChunkedCuda 串三次 launch；前置 dn_qk_l2norm 复用）：
+//   dn_chunk_prep：逐 (全局块, v 头) 并行——门控 scan（C/β + eneg/epos 端点缩放）、
+//     rhs 直落 u/w（4 列 1×u64 载 2×u64 存）、A 下三角物化（行主线程：8 车道
+//     共享 k_t 行、4-bf16 u64 载）、右看前代（tp 成对——A 相邻对 1×u64 载 +
+//     8 车道 ILP；fma 应用序对每元素 p 升序 = 左看同位）；
+//   dn_chunk_h：逐 (行, v 头, v 行片) 块间串行，2 屏障/块——δ=ū−w·S₀ᵀ
+//     （车道共享 S 行、w 2-f32 u64 载，u 原位）、更新+快照融合（run = 固定 j ×
+//     rl 连续 v 行：k̂·ds 合并标量每 tp 一次、δ 行 u64 载）；
+//   dn_chunk_o：逐 (全局块, v 头) 全并行——Mᵀ 转置物化（列主线程共享 k_s 行；
+//     转置使 ③ 的 M 读取变 8-t 连续 u64 载）、② base 与 ③ 累加融合成
+//     (8t×4v) 瓦片（q 行/S₀ 行双边共享、δ 4-v u64 载、出 4-bf16 u64 存）。
+//
+// 热路形律（v2，"散乱行指针每 fma 一载"是 v1 慢 50× 的根因）：
+// ① 序列传载一律 u64（4×bf16 / 2×f32）——每 fma 载指令 ≤0.5；
+// ② 点积操作数在车道间共享（行主/列主/瓦片双边）；
+// ③ expf 全析出循环：e^{C_s−C_t} = eneg_t·epos_s·E（E=e^{C_last}；eneg/epos
+//   各 ≤1 恒安全，E 在 C_last ≤ 60 档内 f32 安全，超档逐对 expf 兜底）；
+// ④ 独立链 8-16 路藏 L2 延迟。v2 不保证逐位（本路容差档，o35 钉）。
+//
+// 约束同仓库既有：无 smem/shfl，块间通信走块私有 global scratch + _syncthreads；
+// 禁 asm!；f32 累加、fma 允许。
+
+/// prep 的块私有 scratch 布局（f32，5·BT 槽）：
+///   [0, bt) scan 缓冲 A｜[bt, 2bt) scan 缓冲 B｜[2bt, 3bt) β
+///   [3bt, 4bt) eneg[t]=e^{−C_t}｜[4bt, 5bt) epos[t]=e^{C_t−C_last}
+/// （o kernel 经同槽位只读 eneg/epos——衰减析出的端点缩放）
+/// A 矩阵走独立的 `ascratch`（[块, BT·BT] f32——host 以 snap 缓冲别名传入：
+/// prep 先于 h 运行且不读 snap，生命周期零交叠）
+
+// 诊断档：0=全跑（生产）；>0 为临时分相排除法（见 git 历史/探针注释）
+
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
+    k: *const u16,      // [tokens, k_heads, k_dim]
+    v: *const u16,      // [tokens, v_heads, v_dim]
+    a: *const u16,      // [tokens, v_heads]
+    b: *const u16,      // [tokens, v_heads]
+    a_log: *const f32,  // [v_heads]
+    dt_bias: *const u16, // [v_heads]
+    inv: *const f32,    // [tokens*k_heads, 2]（dn_qk_l2norm 前置产物，只读）
+    gcum: *mut f32,     // [tokens, v_heads]（块内累计 C，出）
+    u: *mut f32,        // [tokens, v_heads, v_dim]（(I+A)⁻¹(βv)，出）
+    w: *mut f32,        // [tokens, v_heads, k_dim]（(I+A)⁻¹(βe^{−C}k̂)，出）
+    row_start: *const u32, // [rows]
+    row_count: *const u32, // [rows]
+    snap_off: *const u32,  // [rows+1]（逐行块数前缀和）
+    n_rows: u32,
+    chunks: u32, // 全局块总数 = snap_off[n_rows]
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    bt: u32, // 块 token 数（32/64/128）
+    ascratch: *mut f32, // [块, BT·BT]——A 下三角（行主 [t][s]）
+    scratch: *mut f32,  // [块, 5·BT]——scan/β/eneg/epos
+) {
+    let (kd, vd) = (k_dim as usize, v_dim as usize);
+    let (kh_n, vh) = (k_heads as usize, v_heads as usize);
+    let bts = bt as usize;
+    // A 的 Gram 核 dot(k_t,k_s) 只依赖 k 头——v 头专属因子（β/invk/eneg/epos）
+    // 全部在端点尾乘（原 dn_ast! 即此形）⇒ 一块 = (块, k 头)，跨 vph = vh/kh_n
+    // 个 v 头共用一份 Gram，逐位等价（同一 dot 结果同一尾乘序）
+    let vph = udiv(vh, kh_n);
+    let bid = _block_idx_x() as usize;
+    if bid >= chunks as usize * kh_n {
+        return;
+    }
+    let gc = udiv(bid, kh_n);
+    let kk = urem(bid, kh_n);
+    // 行定位：snap_off 前缀上线性扫（行数 ≤ 百级，全线程冗余扫）
+    let mut r = 0usize;
+    while r + 1 < n_rows as usize && gc >= *snap_off.add(r + 1) as usize {
+        r += 1;
+    }
+    let c = gc - *snap_off.add(r) as usize;
+    let st = *row_start.add(r) as usize;
+    let cnt = *row_count.add(r) as usize;
+    let t0 = st + c * bts;
+    let n = if cnt - c * bts < bts { cnt - c * bts } else { bts };
+    let kh = kk;
+    let krow = |g: usize, j: usize| (g * kh_n + kh) * kd + j; // q/k 的 (token, k 头) 行内偏移
+    let t = _thread_idx_x() as usize;
+    // ── 逐 v 头：门控 scan + gcum/neg/pos + rhs 直落 u/w ──
+    let mut hv = 0usize;
+    while hv < vph {
+        let h = kk * vph + hv;
+        let vb = gc * vh + h; // 旧 (块,v 头) 槽位语义（scratch/ascratch、o/h 读法不变）
+        let big_a = expf(*a_log.add(h));
+        let dtb = bf16_to_f32(*dt_bias.add(h));
+        let sc = scratch.add(vb * (5 * bts));
+        let (buf0, buf1, bet, neg, pos) = (
+            sc,
+            sc.add(bts),
+            sc.add(2 * bts),
+            sc.add(3 * bts),
+            sc.add(4 * bts),
+        );
+        // 门控：X = −ln λ（λ=exp(−X) 免对数）与 β（sigmoid 收 bf16——同 reference 两跳）
+        if t < n {
+            let g = t0 + t;
+            *buf0.add(t) = big_a * softplus(bf16_to_f32(*a.add(g * vh + h)) + dtb);
+            *bet.add(t) = bf16_to_f32(f32_to_bf16(
+                1.0f32 / (1.0f32 + expf(0.0 - bf16_to_f32(*b.add(g * vh + h)))),
+            ));
+        }
+        _syncthreads();
+        // 包含式 scan（Hillis-Steele 双缓冲；n 外槽位垃圾不被读）
+        let (mut src, mut dst) = (buf0, buf1);
+        let mut off = 1usize;
+        while off < bts {
+            _syncthreads();
+            if t < n {
+                let acc = if t >= off { *src.add(t) + *src.add(t - off) } else { *src.add(t) };
+                *dst.add(t) = acc;
+            }
+            let tmp = src;
+            src = dst;
+            dst = tmp;
+            off <<= 1;
+        }
+        _syncthreads();
+        // C 落 gcum（o/h/A 尾乘只读）+ 端点缩放（neg/epos 各 ≤1 恒安全；E=e^{C_last}
+        // 由用点自算 1 次 expf，C_last ≤ 60 档内 f32 安全）
+        let clast = *src.add(n - 1);
+        if t < n {
+            *gcum.add((t0 + t) * vh + h) = *src.add(t);
+            *neg.add(t) = expf(0.0 - *src.add(t));
+            *pos.add(t) = expf(*src.add(t) - clast);
+        }
+        _syncthreads();
+        // rhs 直落 u/w：任务 = (行 tp, 4 列 run)（64 run/行——vd=kd=128 钉死）。
+        // 4 列 1×u64 载、2×u64 存；scale（β / β·eneg·invk）每 run 一次
+        {
+            let mut e = t;
+            while e < n * 64 {
+                let tp = udiv(e, 64);
+                let run = urem(e, 64);
+                let cc = run * 4;
+                let (w4, s_, p) = if run < 32 {
+                    (
+                        *(v.add((t0 + tp) * vh * vd + h * vd + cc) as *const u64),
+                        *bet.add(tp),
+                        u.add((t0 + tp) * vh * vd + h * vd + cc) as *mut u64,
+                    )
+                } else {
+                    (
+                        *(k.add(krow(t0 + tp, cc - 128)) as *const u64),
+                        *bet.add(tp)
+                            * *neg.add(tp)
+                            * *inv.add((t0 + tp) * kh_n * 2 + kh * 2 + 1),
+                        w.add((t0 + tp) * vh * kd + h * kd + (cc - 128)) as *mut u64,
+                    )
+                };
+                let (lo, hi) = (w4 as u32, (w4 >> 32) as u32);
+                let f0 = f32::from_bits(lo << 16) * s_;
+                let f1 = f32::from_bits(lo & 0xffff_0000) * s_;
+                let f2 = f32::from_bits(hi << 16) * s_;
+                let f3 = f32::from_bits(hi & 0xffff_0000) * s_;
+                *p = (f0.to_bits() as u64) | ((f1.to_bits() as u64) << 32);
+                *(p.add(1)) = (f2.to_bits() as u64) | ((f3.to_bits() as u64) << 32);
+                e += 256;
+            }
+        }
+        hv += 1;
+    }
+    // ── A 下三角物化：任务 = (t 八元 × s 八元) 8×8 寄存器瓦片（绿版结构；
+    //    4×4 改写实测累加器散点污染——散点 e37/清零，未定位即弃）——每 j4
+    //    步 k 行 8+8×u64（L1 驻）→ 256 fma/16 载。Gram（k 头份）算一次，
+    //    端点缩放（β/invk/衰减）尾乘逐 v 头落位（fastf 档 A[t][s] =
+    //    (β_t·invk_t·eneg_t)·(invk_s·epos_s·E)·(k_t·k_s)；兜底档 e^{C_s−C_t}
+    //    逐对 expf，C 改读 gcum 全局——与 scan 缓冲等值）──
+    if true {
+        let ntg = udiv(n + 7, 8);
+        let ntasks = ntg * ntg;
+        let mut e = t;
+        while e < ntasks {
+            let tr0 = udiv(e, ntg) * 8;
+            let sr0 = urem(e, ntg) * 8;
+            if sr0 <= tr0 + 7 {
+                let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                let (mut a4, mut a5, mut a6, mut a7) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                let mut kt = [0u64; 8];
+                let mut ks = [0u64; 8];
+                macro_rules! dn_arow {
+                    ($acc:ident, $r:expr) => {{
+                        let (tlo, thi) = (kt[$r] as u32, (kt[$r] >> 32) as u32);
+                        let ta = f32::from_bits(tlo << 16);
+                        let tb = f32::from_bits(tlo & 0xffff_0000);
+                        let tc = f32::from_bits(thi << 16);
+                        let td = f32::from_bits(thi & 0xffff_0000);
+                        for c in 0..8 {
+                            let (slo, shi) = (ks[c] as u32, (ks[c] >> 32) as u32);
+                            $acc[c] = fma(ta, f32::from_bits(slo << 16), $acc[c]);
+                            $acc[c] = fma(tb, f32::from_bits(slo & 0xffff_0000), $acc[c]);
+                            $acc[c] = fma(tc, f32::from_bits(shi << 16), $acc[c]);
+                            $acc[c] = fma(td, f32::from_bits(shi & 0xffff_0000), $acc[c]);
+                        }
+                    }};
+                }
+                let mut j4 = 0usize;
+                while j4 < 32 {
+                    let jb = j4 * 4;
+                    for r in 0..8 {
+                        if tr0 + r < n {
+                            kt[r] = *(k.add(krow(t0 + tr0 + r, jb)) as *const u64);
+                        }
+                    }
+                    for c in 0..8 {
+                        if sr0 + c < n {
+                            ks[c] = *(k.add(krow(t0 + sr0 + c, jb)) as *const u64);
+                        }
+                    }
+                    dn_arow!(a0, 0);
+                    dn_arow!(a1, 1);
+                    dn_arow!(a2, 2);
+                    dn_arow!(a3, 3);
+                    dn_arow!(a4, 4);
+                    dn_arow!(a5, 5);
+                    dn_arow!(a6, 6);
+                    dn_arow!(a7, 7);
+                    j4 += 1;
+                }
+                // 逐 v 头尾乘落位（端点缩放尾乘；s<t 掩码；tr<n 尾块守卫）
+                let mut hv = 0usize;
+                while hv < vph {
+                    let h = kk * vph + hv;
+                    let vb = gc * vh + h;
+                    let sc = scratch.add(vb * (5 * bts));
+                    let (bet, neg, pos) = (sc.add(2 * bts), sc.add(3 * bts), sc.add(4 * bts));
+                    let abase = ascratch.add(vb * bts * bts);
+                    let clast = *gcum.add((t0 + n - 1) * vh + h);
+                    let fastf = clast <= 60.0f32;
+                    let bige = if fastf { expf(clast) } else { 1.0f32 };
+                    macro_rules! dn_ast {
+                        ($ar:ident, $r:expr) => {{
+                            let tr = tr0 + $r;
+                            if tr < n {
+                                let g0 = *bet.add(tr)
+                                    * *inv.add((t0 + tr) * kh_n * 2 + kh * 2 + 1)
+                                    * if fastf { *neg.add(tr) } else { 1.0f32 };
+                                for half in 0..4 {
+                                    let sa = sr0 + half * 2;
+                                    let sb = sr0 + half * 2 + 1;
+                                    let va = if sa < tr {
+                                        let hsa = *inv.add((t0 + sa) * kh_n * 2 + kh * 2 + 1)
+                                            * if fastf {
+                                                *pos.add(sa) * bige
+                                            } else {
+                                                expf(
+                                                    *gcum.add((t0 + sa) * vh + h)
+                                                        - *gcum.add((t0 + tr) * vh + h),
+                                                )
+                                            };
+                                        g0 * hsa * $ar[half * 2]
+                                    } else {
+                                        0.0f32
+                                    };
+                                    let vb2 = if sb < tr {
+                                        let hsb = *inv.add((t0 + sb) * kh_n * 2 + kh * 2 + 1)
+                                            * if fastf {
+                                                *pos.add(sb) * bige
+                                            } else {
+                                                expf(
+                                                    *gcum.add((t0 + sb) * vh + h)
+                                                        - *gcum.add((t0 + tr) * vh + h),
+                                                )
+                                            };
+                                        g0 * hsb * $ar[half * 2 + 1]
+                                    } else {
+                                        0.0f32
+                                    };
+                                    *(abase.add(tr * bts + sa) as *mut u64) =
+                                        (va.to_bits() as u64) | ((vb2.to_bits() as u64) << 32);
+                                }
+                            }
+                        }};
+                    }
+                    dn_ast!(a0, 0);
+                    dn_ast!(a1, 1);
+                    dn_ast!(a2, 2);
+                    dn_ast!(a3, 3);
+                    dn_ast!(a4, 4);
+                    dn_ast!(a5, 5);
+                    dn_ast!(a6, 6);
+                    dn_ast!(a7, 7);
+                    hv += 1;
+                }
+            }
+            e += 256;
+        }
+    }
+    _syncthreads(); // A 物化完成（跨线程）后才进 solve
+    // ── 左看前代：256 线程列并行（t<128 → u 列 t；t≥128 → w 列 t−128；
+    //    vd=kd=128 钉死）。每线程独占一列串行走完 n 行：X[t][c] = R[t][c] −
+    //    Σ_{p<t} A[t][p]·X[p][c]（p 升序 fma——与旧 8 宽瓦片版逐元素同序）。
+    //    列独占 ⇒ 零跨线程依赖零屏障；warp 内列连续 → 每行 1 条 128B 合并
+    //    载；逐 v 头串行各解一份（A/u/w/ascratch 均按 (块,v 头) 槽位）
+    if true {
+        let mut hv = 0usize;
+        while hv < vph {
+            let h = kk * vph + hv;
+            let abase = ascratch.add((gc * vh + h) * bts * bts);
+            let isu = t < 128;
+            let c = if isu { t } else { t - 128 };
+            let (base, pitch) = if isu {
+                (u.add(t0 * vh * vd + h * vd + c), vh * vd)
+            } else {
+                (w.add(t0 * vh * kd + h * kd + c), vh * kd)
+            };
+            let mut ti = 0usize;
+            while ti < n {
+                let mut x = *base.add(ti * pitch);
+                let arow = abase.add(ti * bts);
+                // p 链 4× 展开：X 行 4 载 + A 行 2×u64（warp 同址广播）先行批量
+                // 发出再跑 4 fma，藏 L1 延迟（4 路部分和树实测更慢——批量载齐
+                // 才放 fma，反而失去 load/fma 交错；且序变无精度收益）
+                let mut p = 0usize;
+                let p4 = ti & !3usize;
+                while p < p4 {
+                    let (a01, a23) = (
+                        *(arow.add(p) as *const u64),
+                        *(arow.add(p + 2) as *const u64),
+                    );
+                    let x0 = *base.add(p * pitch);
+                    let x1 = *base.add((p + 1) * pitch);
+                    let x2 = *base.add((p + 2) * pitch);
+                    let x3 = *base.add((p + 3) * pitch);
+                    x = fma(0.0 - f32::from_bits(a01 as u32), x0, x);
+                    x = fma(0.0 - f32::from_bits((a01 >> 32) as u32), x1, x);
+                    x = fma(0.0 - f32::from_bits(a23 as u32), x2, x);
+                    x = fma(0.0 - f32::from_bits((a23 >> 32) as u32), x3, x);
+                    p += 4;
+                }
+                while p < ti {
+                    let a = *arow.add(p);
+                    x = fma(0.0 - a, *base.add(p * pitch), x);
+                    p += 1;
+                }
+                *base.add(ti * pitch) = x;
+                ti += 1;
+            }
+            hv += 1;
+        }
+    }
+}
+
+/// dn_chunk_h v3 的逐块上下文。
+struct DnH {
+    k: *const u16,
+    inv: *const f32,
+    gcum: *const f32,
+    u: *mut f32,       // in: ū；out: δ″ = invk·δ（o 读 δ″ 配 M[t][s]=invq·(q·k)·e^{C_s−C_t}）
+    w: *const f32,
+    s_mat: *mut f32,   // [vrows, kd] f32 状态片（① 读；② 每 chunk 末写回）
+    pool0: *mut u16,   // 状态池本片基址（初态 in / 末态 out）
+    snap0: *mut u16,   // 本片 chunk0 快照基址
+    kh_n: usize,
+    vh: usize,
+    kd: usize,
+    vd: usize,
+    bts: usize,
+    vrows: usize,
+    vbase: usize,
+    kh: usize,
+    h: usize,
+    st: usize,
+    cnt: usize,
+    nch: usize,
+    t: usize,
+}
+
+/// u64 → 4×f32（bf16 高位展开——纯移位/掩码，无查表）
+#[inline(always)]
+fn dn_dec4(q: u64) -> [f32; 4] {
+    let (lo, hi) = (q as u32, (q >> 32) as u32);
+    [
+        f32::from_bits(lo << 16),
+        f32::from_bits(lo & 0xffff_0000),
+        f32::from_bits(hi << 16),
+        f32::from_bits(hi & 0xffff_0000),
+    ]
+}
+
+/// 4×f32 → u64（bf16 打包）
+#[inline(always)]
+fn dn_pack4(v: [f32; 4]) -> u64 {
+    (f32_to_bf16(v[0]) as u64)
+        | ((f32_to_bf16(v[1]) as u64) << 16)
+        | ((f32_to_bf16(v[2]) as u64) << 32)
+        | ((f32_to_bf16(v[3]) as u64) << 48)
+}
+
+/// chunk 主循环 v3（VW = 每 warp 的 v 行数 = vrows/8）：
+///   ① δ′ = m·(ū − w·S₀ᵀ)：任务 = (t 四元 × v 四元 × j 半程)——jh=0 把
+///      ū−p₀ 原位写回 u；jh=1 的 p₁ 驻寄存器过屏障再 RMW + m 尾乘。
+///      每 j 步 16 条 v4 载 / 128 fma（w/S 均 f32，零解码）。
+///   ② S = e^{−C_last}·S + Σ_t k̂_t⊗δ′_t：warp-per-row——warp w 吃 v 行段
+///      [w·VW, +VW)，lane l 持 j 片 [l·4, +4)。k̂ 1×u64（warp 内合并 256B）+
+///      δ′ VW/4×F4（全 lane 同址广播）→ VW·4 fma / (1+VW/4) 载 + 8 解码；
+///      状态 VW×4 驻寄存器跨 chunk，块末写 s_mat（① 用）+ 快照。
+#[inline(always)]
+unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
+    let (kd, vd, vh, kh_n) = (d.kd, d.vd, d.vh, d.kh_n);
+    let (h, kh, vbase) = (d.h, d.kh, d.vbase);
+    let (t0row, cnt, bts) = (d.st, d.cnt, d.bts);
+    let t = d.t;
+    let warp = t >> 5;
+    let lane = t & 31;
+    let vb0 = warp * VW; // 本 warp 首行（块内局部）
+    let j4 = lane * 4; //   本 lane j 片基
+    let vrows = d.vrows;
+    let nvq = vrows >> 2; // v 四元组数（vrows ≥ 16 ⇒ ≥ 4）
+    let bdim = _block_dim_x() as usize;
+    // ── S₀ → 寄存器 + s_mat + chunk0 快照（一趟；vrows<VW·8 时尾部 warp 空转）──
+    let mut acc = [[0f32; 4]; VW];
+    if vb0 < vrows {
+        for r in 0..VW {
+            let e = (vb0 + r) * kd + j4;
+            let v = dn_dec4(*(d.pool0.add(e) as *const u64));
+            acc[r] = v;
+            *(d.s_mat.add(e) as *mut F4) = F4(v);
+            *(d.snap0.add(e) as *mut u64) = dn_pack4(v);
+        }
+    }
+    _syncthreads(); // s_mat 全片就绪（① 任务跨 warp 读）
+    let mut ci = 0usize;
+    while ci < d.nch {
+        let t0 = t0row + ci * bts;
+        let n = if cnt - ci * bts < bts { cnt - ci * bts } else { bts };
+        let clast = *d.gcum.add((t0 + n - 1) * vh + h);
+        // g_t = e^{C_t−C_last}：② 状态累加用的块内权重。每 chunk 每线程 ≤1 次
+        // expf 落 scratch 尾槽（"旧 ds"尾巴复用），② warp 同址广播读——替代
+        // ② 每 tp 每 lane 一次 expf（实测 +1.1ms/层）。欠流为 0 在此是正确语义
+        // （旧 token 对块末态贡献≈0）。
+        let mut gt = t;
+        while gt < bts {
+            if gt < n {
+                *d.s_mat.add(vrows * kd + gt) = expf(*d.gcum.add((t0 + gt) * vh + h) - clast);
+            }
+            gt += bdim;
+        }
+        // ── ① δ″ = invk·(ū − w·S₀ᵀ)：任务 = (t **对** × v 四元)——2×4 瓦片
+        //    全 j。2×4 而非 4×4：bt=64/vsplit=4 下任务数 = 32·8 = 256 = 线程数
+        //    （4×4 只有 128 ⇒ 半线程空转）；vsplit=8 恰 128。每线程 1024 fma /
+        //    192 F4 载，零跨 lane 归约零屏障。invk 尾乘（无 g 因子：② 在
+        //    寄存器内补乘 e^{C_t−C_last}）──
+        let ntq = bts >> 1;
+        if true {
+            let wk = d.vh * d.kd;
+            let mut e = t;
+            while e < ntq * nvq {
+                let tq = udiv(e, nvq);
+                let vq = e - tq * nvq;
+                let tr0 = tq * 2;
+                // 行钳位（末块尾：越界行读回块首行，tr<n 守卫丢结果）
+                let x0 = if tr0 < n { t0 + tr0 } else { t0 };
+                let x1 = if tr0 + 1 < n { t0 + tr0 + 1 } else { t0 };
+                let pw0 = d.w.add(x0 * wk + d.h * d.kd);
+                let pw1 = d.w.add(x1 * wk + d.h * d.kd);
+                let sb = d.s_mat.add(vq * 4 * kd);
+                let mut aa = [[0f32; 4]; 2]; // aa[rr][c] = dot(w[x_rr], S₀[vq*4+c])
+                let mut jb = 0usize;
+                while jb < kd {
+                    let s00 = (*(sb.add(jb) as *const F4)).0;
+                    let s01 = (*(sb.add(jb + 4) as *const F4)).0;
+                    let s10 = (*(sb.add(jb + kd) as *const F4)).0;
+                    let s11 = (*(sb.add(jb + kd + 4) as *const F4)).0;
+                    let s20 = (*(sb.add(jb + 2 * kd) as *const F4)).0;
+                    let s21 = (*(sb.add(jb + 2 * kd + 4) as *const F4)).0;
+                    let s30 = (*(sb.add(jb + 3 * kd) as *const F4)).0;
+                    let s31 = (*(sb.add(jb + 3 * kd + 4) as *const F4)).0;
+                    macro_rules! dn_p1c {
+                        ($rr:literal, $cc:literal, $w0:ident, $w1:ident, $sa:ident, $sz:ident) => {{
+                            let a = fma($w0[0], $sa[0], aa[$rr][$cc]);
+                            let a = fma($w0[1], $sa[1], a);
+                            let a = fma($w0[2], $sa[2], a);
+                            let a = fma($w0[3], $sa[3], a);
+                            let a = fma($w1[0], $sz[0], a);
+                            let a = fma($w1[1], $sz[1], a);
+                            let a = fma($w1[2], $sz[2], a);
+                            let a = fma($w1[3], $sz[3], a);
+                            aa[$rr][$cc] = a;
+                        }};
+                    }
+                    macro_rules! dn_p1w {
+                        ($pw:expr, $rr:literal) => {{
+                            let wv0 = (*($pw.add(jb) as *const F4)).0;
+                            let wv1 = (*($pw.add(jb + 4) as *const F4)).0;
+                            dn_p1c!($rr, 0, wv0, wv1, s00, s01);
+                            dn_p1c!($rr, 1, wv0, wv1, s10, s11);
+                            dn_p1c!($rr, 2, wv0, wv1, s20, s21);
+                            dn_p1c!($rr, 3, wv0, wv1, s30, s31);
+                        }};
+                    }
+                    dn_p1w!(pw0, 0);
+                    dn_p1w!(pw1, 1);
+                    jb += 8;
+                }
+                for rr in 0..2usize {
+                    let tr = tr0 + rr;
+                    if tr < n {
+                        let m = *d.inv.add((t0 + tr) * kh_n * 2 + kh * 2 + 1);
+                        let p = d.u.add((t0 + tr) * vh * vd + h * vd + vbase + vq * 4);
+                        let old = (*(p as *const F4)).0;
+                        *(p as *mut F4) = F4([
+                            m * (old[0] - aa[rr][0]),
+                            m * (old[1] - aa[rr][1]),
+                            m * (old[2] - aa[rr][2]),
+                            m * (old[3] - aa[rr][3]),
+                        ]);
+                    }
+                }
+                e += bdim;
+            }
+        }
+        _syncthreads();
+        // ── ② 衰减 + 秩 n 更新 + 快照：warp-per-row ──
+        let dlast = expf(0.0 - clast);
+        if vb0 < vrows {
+            for r in 0..VW {
+                for j in 0..4usize {
+                    acc[r][j] *= dlast;
+                }
+            }
+            let mut tp = 0usize;
+            // δ″ F4 载（VW/4 条；vb0 恒 4 倍 ⇒ 16B 对齐）+ 2 深软件流水 + 2×
+            // token 展开：A/B 双槽轮转，当拍 fma 与 tp+2 预取并发——1 深时
+            // 6016 步链每步裸吃整条载入延迟（~400cy），是 ② 的主导项。
+            // rq 字面展开（d_a/d_b/acc 全寄存器）；rq ≥ VW/4 有 vrows 守卫
+            let krow = d.k.add(t0 * kh_n * kd + kh * kd + j4);
+            let urow = d.u.add(t0 * vh * vd + h * vd + vbase + vb0);
+            let gs = d.s_mat.add(vrows * kd);
+            let nq = VW / 4;
+            macro_rules! dn_h2ld {
+                ($arr:ident, $rq:literal, $ub:expr) => {{
+                    if $rq < nq {
+                        $arr[$rq] = *($ub.add($rq * 4) as *const F4);
+                    }
+                }};
+            }
+            macro_rules! dn_h2pf {
+                ($ka:ident, $ga:ident, $da:ident, $tt:expr) => {{
+                    $ka = *(krow.add($tt * kh_n * kd) as *const u64);
+                    $ga = *gs.add($tt);
+                    let un = urow.add($tt * vh * vd);
+                    dn_h2ld!($da, 0, un);
+                    dn_h2ld!($da, 1, un);
+                    dn_h2ld!($da, 2, un);
+                    dn_h2ld!($da, 3, un);
+                }};
+            }
+            macro_rules! dn_h2q {
+                ($rq:literal, $kq:ident, $g:ident, $dv:ident) => {{
+                    if $rq < nq {
+                        for rr in 0..4usize {
+                            let dvs = $dv[rr] * $g;
+                            for j in 0..4usize {
+                                acc[$rq * 4 + rr][j] = fma($kq[j], dvs, acc[$rq * 4 + rr][j]);
+                            }
+                        }
+                    }
+                }};
+            }
+            let (mut k_a, mut g_a) = (*(krow as *const u64), *gs);
+            let (mut k_b, mut g_b) = (0u64, 0f32);
+            let (mut k_c, mut g_c) = (0u64, 0f32);
+            let (mut k_d, mut g_d) = (0u64, 0f32);
+            let mut d_a = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_b = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_c = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_d = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            dn_h2ld!(d_a, 0, urow);
+            dn_h2ld!(d_a, 1, urow);
+            dn_h2ld!(d_a, 2, urow);
+            dn_h2ld!(d_a, 3, urow);
+            if n > 1 {
+                dn_h2pf!(k_b, g_b, d_b, 1);
+            }
+            if n > 2 {
+                dn_h2pf!(k_c, g_c, d_c, 2);
+            }
+            if n > 3 {
+                dn_h2pf!(k_d, g_d, d_d, 3);
+            }
+            macro_rules! dn_h2tick {
+                ($kq:ident, $g:ident, $ka:ident, $ga:ident, $da:ident) => {{
+                    let kq = dn_dec4($kq);
+                    let g = $g;
+                    let d0 = $da[0].0;
+                    let d1 = $da[1].0;
+                    let d2 = $da[2].0;
+                    let d3 = $da[3].0;
+                    if tp + 4 < n {
+                        dn_h2pf!($ka, $ga, $da, tp + 4);
+                    }
+                    dn_h2q!(0, kq, g, d0);
+                    dn_h2q!(1, kq, g, d1);
+                    dn_h2q!(2, kq, g, d2);
+                    dn_h2q!(3, kq, g, d3);
+                    tp += 1;
+                }};
+            }
+            while tp < n {
+                // A/B/C/D 四槽轮转：4 深预取，每拍快照后再补 tp+4
+                dn_h2tick!(k_a, g_a, k_a, g_a, d_a);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_b, g_b, k_b, g_b, d_b);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_c, g_c, k_c, g_c, d_c);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_d, g_d, k_d, g_d, d_d);
+            }
+            for r in 0..VW {
+                let e0 = (vb0 + r) * kd + j4;
+                *(d.s_mat.add(e0) as *mut F4) = F4(acc[r]);
+                if ci + 1 < d.nch {
+                    *(d.snap0.add((ci + 1) * vh * vd * kd + e0) as *mut u64) = dn_pack4(acc[r]);
+                }
+            }
+        }
+        _syncthreads();
+        ci += 1;
+    }
+    // 末态回池（bf16）
+    if vb0 < vrows {
+        for r in 0..VW {
+            let e = (vb0 + r) * kd + j4;
+            *(d.pool0.add(e) as *mut u64) = dn_pack4(acc[r]);
+        }
+    }
+}
+
+/// 块间串行状态推进（fwd_h）v3：一块 = (行, v 头, v 行片)，bd=256（8 warp）。
+/// 状态 VW×4/线程驻寄存器；① 半程点积 + ② warp-per-row 更新，每 chunk
+/// 3 屏障。δ″ = invk·δ 原位落 u（o 以逐对指数 M[t][s]=invq·(q·k)·e^{C_s−C_t} 配对读）。
+/// 末态回状态池（bf16）；快照到 nchunks−1 块首 + chunk 0 初态。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn dn_chunk_h(
+    k: *const u16,     // [tokens, k_heads, k_dim]
+    inv: *const f32,   // [tokens*k_heads, 2]
+    gcum: *const f32,  // [tokens, v_heads]
+    u: *mut f32,       // [tokens, v_heads, v_dim]（in: ū；out: δ′）
+    w: *const f32,     // [tokens, v_heads, k_dim]
+    snap: *mut u16,    // [chunks, v_heads, v_dim, k_dim] bf16（块首状态）
+    state: *mut u16,   // [rows, v_heads, v_dim, k_dim] bf16（初态 in / 末态 out）
+    row_start: *const u32,
+    row_count: *const u32,
+    row_id: *const u32,
+    snap_off: *const u32,
+    n_rows: u32,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    bt: u32,
+    vsplit: u32, // v 行切分（1/2/4/8）
+    scratch: *mut f32, // [块, vrows·kd]（s_mat；旧 ds 尾巴弃用）
+) {
+    let (kd, vd) = (k_dim as usize, v_dim as usize);
+    let (kh_n, vh) = (k_heads as usize, v_heads as usize);
+    let bts = bt as usize;
+    let nsp = if vsplit == 0 { 1 } else { vsplit as usize };
+    let bid = _block_idx_x() as usize;
+    if bid >= n_rows as usize * vh * nsp {
+        return;
+    }
+    let sp = urem(bid, nsp);
+    let rest = udiv(bid, nsp);
+    let (r, h) = (udiv(rest, vh), urem(rest, vh));
+    let vrows = udiv(vd, nsp);
+    let vbase = sp * vrows;
+    let kh = udiv(h * kh_n, vh);
+    let st = *row_start.add(r) as usize;
+    let cnt = *row_count.add(r) as usize;
+    let nch = udiv(cnt + bts - 1, bts);
+    let t = _thread_idx_x() as usize;
+    let sc = scratch.add(bid * (vrows * kd + bts + 8192)); // +① 两相部分和区（2任务×16输出×32lane×nwarp=8192 f32）
+    let pool0 = state.add(((*row_id.add(r) as usize) * vh + h) * vd * kd + vbase * kd);
+    let snap0 = snap.add((((*snap_off.add(r) as usize) * vh + h) * vd * kd) + vbase * kd);
+    let d = DnH {
+        k,
+        inv,
+        gcum,
+        u,
+        w,
+        s_mat: sc,
+        pool0,
+        snap0,
+        kh_n,
+        vh,
+        kd,
+        vd,
+        bts,
+        vrows,
+        vbase,
+        kh,
+        h,
+        st,
+        cnt,
+        nch,
+        t,
+    };
+    // VW 派发按 warp 数覆盖行数（bdim=64：2 warp × VW8=16 行恰满 vs=8 片；
+    // 128/256 时与旧阈值等价）。VW ≥4 保 ② 的 F4 v 列 16B 对齐
+    let warps = (_block_dim_x() as usize) >> 5;
+    let need = udiv(vrows + warps - 1, warps);
+    if need <= 4 || vrows < 16 {
+        dn_h_run3::<4>(&d);
+    } else if need <= 8 {
+        dn_h_run3::<8>(&d);
+    } else if need <= 16 {
+        dn_h_run3::<16>(&d);
+    } else {
+        dn_h_run3::<32>(&d);
+    }
+}
+
+/// 输出组装（chunk_fwd_o 同构）：一块 = (全局块, v 头)，全并行——
+/// ① Mᵀ 转置物化（mscratch = w 缓冲别名；列主线程：8 车道 t 共享 k_s 行；
+///   转置使 ③ 的 M 读取变 8-t 连续 u64 载，免散乱列读）；
+/// ② base 与 ③ 累加融合：(8t × 4v) 瓦片 × j 半程——q 行/S₀ 行双边共享，
+///   δ 4-v u64 载，出 4-bf16 u64 存。行缩放（e^{−C_t}·invq_t）析出为
+///   base 尾乘（neg 槽位读 prep 的 scratch）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn dn_chunk_o(
+    q: *const u16,    // [tokens, k_heads, k_dim]
+    k: *const u16,    // [tokens, k_heads, k_dim]
+    inv: *const f32,  // [tokens*k_heads, 2]
+    gcum: *const f32, // [tokens, v_heads]
+    dn: *const f32,   // [tokens, v_heads, v_dim]（δ——u 缓冲，fwd_h 原位后）
+    snap: *const u16, // [chunks, v_heads, v_dim, k_dim] bf16
+    core_out: *mut u16, // [tokens, v_heads*v_dim]
+    row_start: *const u32,
+    row_count: *const u32,
+    snap_off: *const u32,
+    n_rows: u32,
+    chunks: u32,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    bt: u32,
+    mscratch: *mut f32, // [块, BT·BT]——Mᵀ（列主 [s][t]，别名 w 缓冲）
+    scratch: *const f32, // prep 的块私有 scratch（只读 neg/pos 槽）
+) {
+    let (kd, vd) = (k_dim as usize, v_dim as usize);
+    let (kh_n, vh) = (k_heads as usize, v_heads as usize);
+    let bts = bt as usize;
+    let bid = _block_idx_x() as usize;
+    if bid >= chunks as usize * kh_n {
+        return;
+    }
+    let gc = udiv(bid, kh_n);
+    let kk = urem(bid, kh_n); // 本块 k 头：① 的 q·k Gram 按 k 头算一份共用
+    let vph = udiv(vh, kh_n); // 每份 Gram 服务的 v 头数（host 断言整除）
+    let mut r = 0usize;
+    while r + 1 < n_rows as usize && gc >= *snap_off.add(r + 1) as usize {
+        r += 1;
+    }
+    let c = gc - *snap_off.add(r) as usize;
+    let st = *row_start.add(r) as usize;
+    let cnt = *row_count.add(r) as usize;
+    let t0 = st + c * bts;
+    let n = if cnt - c * bts < bts { cnt - c * bts } else { bts };
+    let kh = kk; // h = kk·vph + hv ⇒ ⌊h·kh_n/vh⌋ = kk（整除时严格）
+    let t = _thread_idx_x() as usize;
+    let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32);
+    let qrow = |g: usize, j: usize| (g * kh_n + kh) * kd + j;
+    // ── ① Mᵀ：任务 = (t 八元 × s 八元) 8×8 寄存器瓦片（同 A 形）——每 j4 步
+    //    k_s 行 8×u64 + q 行 8×u64 → 256 fma/16 载；存转置 Mᵀ[s][t]（行连续），
+    //    s ≤ t 含对角（对角 e^0 由析出式自然给出），M[t][s] =
+    //    (invq_t·eneg_t)·(invk_s·epos_s·E)·(q_t·k_s)；兜底档逐对 expf ──
+    if true {
+        let ntg = udiv(n + 7, 8);
+        let ntasks = ntg * ntg;
+        let mut e = t;
+        while e < ntasks {
+            let tr0 = udiv(e, ntg) * 8;
+            let sr0 = urem(e, ntg) * 8;
+            if tr0 + 7 >= sr0 {
+                let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                let (mut a4, mut a5, mut a6, mut a7) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                let mut qt = [0u64; 8];
+                let mut ks = [0u64; 8];
+                // t 行宏：qt[r] 解 4 bf16 × ks[c]（c 常量展开）4 fma
+                macro_rules! dn_mrow {
+                    ($acc:ident, $r:expr) => {{
+                        let (qlo, qhi) = (qt[$r] as u32, (qt[$r] >> 32) as u32);
+                        let qa = f32::from_bits(qlo << 16);
+                        let qb = f32::from_bits(qlo & 0xffff_0000);
+                        let qc = f32::from_bits(qhi << 16);
+                        let qd = f32::from_bits(qhi & 0xffff_0000);
+                        for c in 0..8 {
+                            let (slo, shi) = (ks[c] as u32, (ks[c] >> 32) as u32);
+                            $acc[c] = fma(qa, f32::from_bits(slo << 16), $acc[c]);
+                            $acc[c] = fma(qb, f32::from_bits(slo & 0xffff_0000), $acc[c]);
+                            $acc[c] = fma(qc, f32::from_bits(shi << 16), $acc[c]);
+                            $acc[c] = fma(qd, f32::from_bits(shi & 0xffff_0000), $acc[c]);
+                        }
+                    }};
+                }
+                let mut j4 = 0usize;
+                while j4 < 32 {
+                    let jb = j4 * 4;
+                    for r in 0..8 {
+                        if tr0 + r < n {
+                            qt[r] = *(q.add(qrow(t0 + tr0 + r, jb)) as *const u64);
+                        }
+                    }
+                    for c in 0..8 {
+                        if sr0 + c < n {
+                            ks[c] = *(k.add(qrow(t0 + sr0 + c, jb)) as *const u64);
+                        }
+                    }
+                    dn_mrow!(a0, 0);
+                    dn_mrow!(a1, 1);
+                    dn_mrow!(a2, 2);
+                    dn_mrow!(a3, 3);
+                    dn_mrow!(a4, 4);
+                    dn_mrow!(a5, 5);
+                    dn_mrow!(a6, 6);
+                    dn_mrow!(a7, 7);
+                    j4 += 1;
+                }
+                // 列落位：Mᵀ[sr][tr0..+8]（4×u64，行连续）；端点缩放 +
+                // s ≤ t 掩码（对角含）。c 展开为 8 支常量分支——运行期 c 会
+                // 把 a0..a7 打回 local（循环体过大不展开 → 动态索引）
+                // M[t][s] = invq_t·(q_t·k_s)·e^{C_s−C_t}（h 落 δ″=invk_s·δ_s
+                // 配对）：指数 ≤ 0 恒安全——**不可**拆 e^{C_last−C_t}·e^{C_s−C_last}
+                // （大 X 头两侧同时欠流 → 0·0，o35 head1-3 全零根因）；fastf 档
+                // (C_last≤60) neg_t·pos_s·E 与 prep 的 A 同式，兜底逐对 expf
+                // （宏体自由标识符按定义点解析 ⇒ 定义须在 hv 循环内）
+                let mut hv = 0usize;
+                while hv < vph {
+                    let h = kk * vph + hv;
+                    let vb = gc * vh + h;
+                    let sc = scratch.add(vb * (5 * bts));
+                    let neg = sc.add(3 * bts);
+                    let pos = sc.add(4 * bts);
+                    let mbase = mscratch.add(vb * bts * bts);
+                    let clast = *gcum.add((t0 + n - 1) * vh + h);
+                    let fastf = clast <= 60.0f32;
+                    let bige = if fastf { expf(clast) } else { 1.0f32 };
+                    macro_rules! dn_mstc {
+                        ($c:expr) => {{
+                            let sr = sr0 + $c;
+                            if sr < n {
+                                macro_rules! mv2 {
+                                    ($ar:ident, $tr:expr) => {
+                                        if $tr < n && $tr >= sr {
+                                            if fastf {
+                                                *inv.add((t0 + $tr) * kh_n * 2 + kh * 2)
+                                                    * *neg.add($tr)
+                                                    * *pos.add(sr)
+                                                    * bige
+                                                    * $ar[$c]
+                                            } else {
+                                                *inv.add((t0 + $tr) * kh_n * 2 + kh * 2)
+                                                    * $ar[$c]
+                                                    * expf(
+                                                        *gcum.add((t0 + sr) * vh + h)
+                                                            - *gcum.add((t0 + $tr) * vh + h),
+                                                    )
+                                            }
+                                        } else {
+                                            0.0f32
+                                        }
+                                    };
+                                }
+                                let p0 = mbase.add(sr * bts + tr0) as *mut u64;
+                                *p0 = (mv2!(a0, tr0).to_bits() as u64)
+                                    | ((mv2!(a1, tr0 + 1).to_bits() as u64) << 32);
+                                *(p0.add(1)) = (mv2!(a2, tr0 + 2).to_bits() as u64)
+                                    | ((mv2!(a3, tr0 + 3).to_bits() as u64) << 32);
+                                *(p0.add(2)) = (mv2!(a4, tr0 + 4).to_bits() as u64)
+                                    | ((mv2!(a5, tr0 + 5).to_bits() as u64) << 32);
+                                *(p0.add(3)) = (mv2!(a6, tr0 + 6).to_bits() as u64)
+                                    | ((mv2!(a7, tr0 + 7).to_bits() as u64) << 32);
+                            }
+                        }};
+                    }
+                    dn_mstc!(0);
+                    dn_mstc!(1);
+                    dn_mstc!(2);
+                    dn_mstc!(3);
+                    dn_mstc!(4);
+                    dn_mstc!(5);
+                    dn_mstc!(6);
+                    dn_mstc!(7);
+                    hv += 1;
+                }
+            }
+            e += 256;
+        }
+    }
+    _syncthreads();
+    // ── ②+③ 任务 = (t 八元 tg × v 八元 vg) 寄存器瓦片（跨步 256 领）：
+    //    ② base = Σ_j S₀[v][j]·q̂_t[j]（S₀ bf16 8 行 + q bf16 8 行，
+    //    16×u64/256 fma）；③ o += Σ_{s≤t} M[t][s]·δ[s][v]（Mᵀ 8-t 2×u64 +
+    //    δ 8-v 4×u64 → 4 载/64 fma）；行缩放 rs = e^{−C_t}·invq_t 尾乘，
+    //    /√kd 收 bf16 ──
+    if true {
+        // t 八元 × v 四元：bt=64 下任务 = 8·32 = 256 = 线程数（8×8 只有 128，
+        // 半线程空转——③ 的 s 链载入延迟无 warp 可藏）。v 轴切（而非 t 轴）：
+        // δ/M 每 s 步载入字节数不变，总流量不涨
+        let ntg = udiv(n + 7, 8);
+        let nvt = vd / 4;
+        let hvt = ntg * nvt;
+        let ntasks = hvt * vph; // hv 并入任务轴：块数减半、任务翻倍，总量不变
+        let mut e = t;
+        while e < ntasks {
+            let hv = udiv(e, hvt);
+            let e2 = e - hv * hvt;
+            let h = kk * vph + hv;
+            let vb = gc * vh + h;
+            let mbase = mscratch.add(vb * bts * bts);
+            let s0 = snap.add(vb * vd * kd); // 本块首状态
+            let neg = scratch.add(vb * (5 * bts) + 3 * bts);
+            let tr0 = udiv(e2, nvt) * 8;
+            let v0 = urem(e2, nvt) * 4;
+            let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 4], [0f32; 4], [0f32; 4], [0f32; 4]);
+            let (mut a4, mut a5, mut a6, mut a7) = ([0f32; 4], [0f32; 4], [0f32; 4], [0f32; 4]);
+            let mut qt = [0u64; 8];
+            let mut st = [0u64; 4];
+            // ② base 行宏：qt[r] 解 4 bf16 × S₀ 4 行（c 常量展开）4 fma
+            macro_rules! dn_orow {
+                ($acc:ident, $r:expr) => {{
+                    let (qlo, qhi) = (qt[$r] as u32, (qt[$r] >> 32) as u32);
+                    let qa = f32::from_bits(qlo << 16);
+                    let qb = f32::from_bits(qlo & 0xffff_0000);
+                    let qc = f32::from_bits(qhi << 16);
+                    let qd = f32::from_bits(qhi & 0xffff_0000);
+                    for c in 0..4 {
+                        let (slo, shi) = (st[c] as u32, (st[c] >> 32) as u32);
+                        $acc[c] = fma(qa, f32::from_bits(slo << 16), $acc[c]);
+                        $acc[c] = fma(qb, f32::from_bits(slo & 0xffff_0000), $acc[c]);
+                        $acc[c] = fma(qc, f32::from_bits(shi << 16), $acc[c]);
+                        $acc[c] = fma(qd, f32::from_bits(shi & 0xffff_0000), $acc[c]);
+                    }
+                }};
+            }
+            // base 行缩放（rs = e^{−C_t}·invq_t）
+            macro_rules! dn_oscale {
+                ($acc:ident, $r:expr) => {{
+                    if tr0 + $r < n {
+                        let rs = *neg.add(tr0 + $r)
+                            * *inv.add((t0 + tr0 + $r) * kh_n * 2 + kh * 2);
+                        for c in 0..4 {
+                            $acc[c] *= rs;
+                        }
+                    }
+                }};
+            }
+            // 落盘行宏：/√kd 收 bf16，4 连续 v = 1×u64 存
+            macro_rules! dn_ost {
+                ($acc:ident, $r:expr) => {{
+                    if tr0 + $r < n {
+                        let po =
+                            core_out.add((t0 + tr0 + $r) * vh * vd + h * vd + v0) as *mut u64;
+                        *po = (f32_to_bf16($acc[0] / kd_sqrt) as u64)
+                            | ((f32_to_bf16($acc[1] / kd_sqrt) as u64) << 16)
+                            | ((f32_to_bf16($acc[2] / kd_sqrt) as u64) << 32)
+                            | ((f32_to_bf16($acc[3] / kd_sqrt) as u64) << 48);
+                    }
+                }};
+            }
+            let mut j4 = 0usize;
+            while j4 < 32 {
+                let jb = j4 * 4;
+                for r in 0..8 {
+                    if tr0 + r < n {
+                        qt[r] = *(q.add(qrow(t0 + tr0 + r, jb)) as *const u64);
+                    }
+                }
+                for c in 0..4 {
+                    st[c] = *(s0.add((v0 + c) * kd + jb) as *const u64);
+                }
+                dn_orow!(a0, 0);
+                dn_orow!(a1, 1);
+                dn_orow!(a2, 2);
+                dn_orow!(a3, 3);
+                dn_orow!(a4, 4);
+                dn_orow!(a5, 5);
+                dn_orow!(a6, 6);
+                dn_orow!(a7, 7);
+                j4 += 1;
+            }
+            dn_oscale!(a0, 0);
+            dn_oscale!(a1, 1);
+            dn_oscale!(a2, 2);
+            dn_oscale!(a3, 3);
+            dn_oscale!(a4, 4);
+            dn_oscale!(a5, 5);
+            dn_oscale!(a6, 6);
+            dn_oscale!(a7, 7);
+            // ③ s 升序链（s ≤ t）：Mᵀ[s][tr0..+8] 4×u64 + δ[v0..+4] 2×u64
+            let smax = if tr0 + 8 < n { tr0 + 8 } else { n };
+            let mut s = 0usize;
+            while s < smax {
+                let m2a = *(mbase.add(s * bts + tr0) as *const u64);
+                let m2b = *(mbase.add(s * bts + tr0 + 2) as *const u64);
+                let m2c = *(mbase.add(s * bts + tr0 + 4) as *const u64);
+                let m2d = *(mbase.add(s * bts + tr0 + 6) as *const u64);
+                let d2a = *(dn.add((t0 + s) * vh * vd + h * vd + v0) as *const u64);
+                let d2b = *(dn.add((t0 + s) * vh * vd + h * vd + v0 + 2) as *const u64);
+                let dv = [
+                    f32::from_bits(d2a as u32),
+                    f32::from_bits((d2a >> 32) as u32),
+                    f32::from_bits(d2b as u32),
+                    f32::from_bits((d2b >> 32) as u32),
+                ];
+                let mv = [
+                    f32::from_bits(m2a as u32),
+                    f32::from_bits((m2a >> 32) as u32),
+                    f32::from_bits(m2b as u32),
+                    f32::from_bits((m2b >> 32) as u32),
+                    f32::from_bits(m2c as u32),
+                    f32::from_bits((m2c >> 32) as u32),
+                    f32::from_bits(m2d as u32),
+                    f32::from_bits((m2d >> 32) as u32),
+                ];
+                macro_rules! dn_ofma {
+                    ($acc:ident, $r:literal) => {{
+                        for c in 0..4 {
+                            $acc[c] = fma(mv[$r], dv[c], $acc[c]);
+                        }
+                    }};
+                }
+                dn_ofma!(a0, 0);
+                dn_ofma!(a1, 1);
+                dn_ofma!(a2, 2);
+                dn_ofma!(a3, 3);
+                dn_ofma!(a4, 4);
+                dn_ofma!(a5, 5);
+                dn_ofma!(a6, 6);
+                dn_ofma!(a7, 7);
+                s += 1;
+            }
+            // 落盘（dn_ost 行宏，tr<n 守卫）
+            dn_ost!(a0, 0);
+            dn_ost!(a1, 1);
+            dn_ost!(a2, 2);
+            dn_ost!(a3, 3);
+            dn_ost!(a4, 4);
+            dn_ost!(a5, 5);
+            dn_ost!(a6, 6);
+            dn_ost!(a7, 7);
+            e += 256;
+        }
     }
 }
 

@@ -38,8 +38,9 @@ use wein_engine::{Executor, SampleParams, StepError};
 use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
-    AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetOp, EmbedOp, GemmOp, KvScatterOp,
-    MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluOp,
+    AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp, EmbedOp,
+    GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SampleRowsOp,
+    SigmulOp, SiluOp,
 };
 use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
@@ -194,6 +195,19 @@ fn attn_blk_from_env(var: &str, kv: wein_kernel::ops::KvDtype) -> Option<wein_ke
 const SNAP_SLOTS: usize = 64;
 /// linear 侧 q/k l2norm eps（FLA 对齐，modeling l2norm）
 const L2_EPS: f32 = 1e-6;
+
+/// deltanet chunked（BT=64 分块递推，FLA 同构）的接线常量：大 span prefill
+/// 专用**容差路径**（kernel 侧 o35 口径 rel2 ≤ 3e-3——代数变形破位级合同），
+/// decode / 小 span / 投机链段仍走老 kernel 位级不动。`WEIN_DN_CHUNK=0`
+/// 总关（回退完整性：一切与 HEAD 位级同）
+const DN_CHUNK_MIN_SPAN: u32 = 256;
+/// BT=64/vsplit=8 是 dn_chunk_probe 的实测最优（6009 全段 24 层 102.35ms，
+/// 老路 332ms）
+const DN_CHUNK_BT: u32 = 64;
+const DN_CHUNK_VSPLIT: u32 = 8;
+/// chunked 子段表容量（= kernel 侧 fwd_h scratch 的行上限 DN_CHUNK_ROWS_CAP；
+/// 混合批多请求同时大 prefill 时超出部分回退老路）
+const DN_CHUNK_ROWS: usize = 4;
 
 /// full_attention 层权重
 struct FullDev {
@@ -532,6 +546,21 @@ struct MixIn {
     lg_rows: DevBuf<'static>,
     /// 设备端采样器的采样行表 [T_MAX]（只含非 greedy 行——每条按行下标）
     sm_rows: DevBuf<'static>,
+    /// deltanet chunked 的 eligible 子段表（段数 ≤ DN_CHUNK_ROWS；每步由
+    /// `dn_chunk_plan` 前缀覆写一次，层循环只读）
+    dn_start: DevBuf<'static>,
+    dn_count: DevBuf<'static>,
+    dn_rid: DevBuf<'static>,
+    /// 逐段块数前缀和 [rows+1]（host 算好上传，[0]=0）
+    dn_snap: DevBuf<'static>,
+    /// chunked 接走大 span 后的**余段**老路子表（decode/小 span/链段/超容
+    /// 溢出）——与全量表同构，仅段集缩小
+    dno_start: DevBuf<'static>,
+    dno_count: DevBuf<'static>,
+    dno_rid: DevBuf<'static>,
+    /// 余段的逐段投机标志（老 kernel 的 specs 按子表行号索引——全量表
+    /// 的 specs_mix 不能复用：conv_state_roll 还在全表上读它）
+    dno_specs: DevBuf<'static>,
 }
 
 /// 前向输入束——eager 临时缓冲与图档常驻缓冲同构喂法（run_forward 共用）
@@ -556,6 +585,27 @@ struct FwdIn<'a> {
     specs: &'a DevBuf<'a>,
     /// logits 行选择（`None` = 全行恒等：纯 decode / 图档 / 单行批）
     lg: Option<LogitsSel<'a>>,
+}
+
+/// 段表 host 镜像——`run_forward` 的 deltanet chunked 分派输入（四张表
+/// 同长 = 段数；`forward_batch_mixed` 的现筑表 / 图档捕获的合成纯 decode
+/// 表各一份只读视图）
+struct SpanTabs<'a> {
+    start: &'a [u32],
+    count: &'a [u32],
+    rid: &'a [u32],
+    spec: &'a [u32],
+}
+
+/// 本步 deltanet chunked 分派结果（子表上传已完成，纯标量——层循环只发
+/// launch）
+struct DnChunkPlan {
+    /// 走 chunked 的段数（`mix.dn_*` 前缀已上传）
+    rows: u32,
+    /// Σ逐段块数（snap_off 末项）
+    chunks: u32,
+    /// 余段走老 kernel 的段数（0 = 无余段，老 launch 整个不发）
+    old_rows: u32,
 }
 
 /// 一步里需要 logits 的批内行（升序紧凑表）：`dev` 是设备端行号表
@@ -783,6 +833,9 @@ pub struct Qwen35Executor {
     attn_blk: Option<wein_kernel::ops::BlkCfg>,
     /// 块档的启用门限（t = 本步 token 数；`WEIN_ATTN_BLK_T`，默认 32）
     attn_blk_min_t: u32,
+    /// deltanet chunked 总开关（`WEIN_DN_CHUNK=0` 关——大 span prefill 一律
+    /// 走老 kernel，回退对拍用；默认开）
+    dn_chunk: bool,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -957,6 +1010,7 @@ impl Qwen35Executor {
         let caps = wein_kernel::ops::ScratchCaps {
             reduce_floats: t_max * r_zc.max(r_gated),
             delta_l2_tokens: t_max,
+            delta_chunk_tokens: t_max,
         };
         let session = DeviceSession::open_tuned_with(tune_m, &caps)?;
         let gpu = session.gpu();
@@ -1186,6 +1240,14 @@ impl Qwen35Executor {
             samples: pin!(gpu.alloc_bytes(u32b(t_max))),
             lg_rows: pin!(gpu.alloc_bytes(u32b(LG_CAP))),
             sm_rows: pin!(gpu.alloc_bytes(u32b(t_max))),
+            dn_start: pin!(gpu.alloc_bytes(u32b(DN_CHUNK_ROWS))),
+            dn_count: pin!(gpu.alloc_bytes(u32b(DN_CHUNK_ROWS))),
+            dn_rid: pin!(gpu.alloc_bytes(u32b(DN_CHUNK_ROWS))),
+            dn_snap: pin!(gpu.alloc_bytes(u32b(DN_CHUNK_ROWS + 1))),
+            dno_start: pin!(gpu.alloc_bytes(u32b(t_max))),
+            dno_count: pin!(gpu.alloc_bytes(u32b(t_max))),
+            dno_rid: pin!(gpu.alloc_bytes(u32b(t_max))),
+            dno_specs: pin!(gpu.alloc_bytes(u32b(t_max))),
         };
         session.stream().sync(); // 状态池开局零化落定
         let (lin_row, conv_row) = (lin_row_bytes(&cfg), conv_row_bytes(&cfg));
@@ -1253,6 +1315,7 @@ impl Qwen35Executor {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32),
+            dn_chunk: std::env::var("WEIN_DN_CHUNK").map(|v| v != "0").unwrap_or(true),
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -1343,7 +1406,8 @@ impl Qwen35Executor {
         // 固化输入：纯 decode 桶形的纯函数
         let start: Vec<u32> = (0..b_max as u32).collect();
         let fx_start: DevBuf<'static> = pin!(gpu.alloc_from_slice(&start));
-        let fx_count: DevBuf<'static> = pin!(gpu.alloc_from_slice(&vec![1u32; b_max]));
+        let cnt1: Vec<u32> = vec![1u32; b_max];
+        let fx_count: DevBuf<'static> = pin!(gpu.alloc_from_slice(&cnt1));
         let fx_tpos: DevBuf<'static> = pin!(gpu.alloc_from_slice(&vec![0u32; b_max]));
         let fx_rows: DevBuf<'static> = pin!(gpu.alloc_from_slice(&start)); // argmax 采样行
         let ids_q: Vec<u32> =
@@ -1388,16 +1452,25 @@ impl Qwen35Executor {
             // 图内 lm_head 的 m 仍是桶大小、拓扑与缓冲布局逐位不变
             lg: None,
         };
+        // 图捕获的段表 host 镜像：合成纯 decode（count 全 1 < DN_CHUNK_MIN_SPAN
+        // ⇒ chunked 分派恒 None——chunked kernel 永不进图，图内 kernel 序与
+        // 旧拓扑逐位同）
+        let fx_tabs = SpanTabs {
+            start: &start,
+            count: &cnt1,
+            rid: &vec![sink_row; b_max],
+            spec: &vec![0u32; b_max],
+        };
         let voc = self.cfg.vocab_size as u32;
         let mut execs = Vec::with_capacity(buckets.len());
         let mut execs_smp = Vec::with_capacity(buckets.len());
         for &b in &buckets {
             // 预热：同形状直发一次（cuBLASLt heuristic/PTX 模块落缓存——gr4）
-            self.run_forward(b, b, &inp);
+            self.run_forward(b, b, &inp, &fx_tabs);
             stream.sync();
             // 捕获 → 实例化；采样烤进图尾：argmax s=B、采样行 [0..B)
             stream.begin_capture();
-            self.run_forward(b, b, &inp);
+            self.run_forward(b, b, &inp, &fx_tabs);
             self.session.table().argmax_rows.run(
                 &self.scr.logits, &fx_rows, &self.scr.am_scratch, &self.scr.am_out, voc, b, stream,
             );
@@ -1409,7 +1482,7 @@ impl Qwen35Executor {
             // 捕获区间内零分配/零同步（gr5 守卫）——sample_rows 只是一次
             // launch，参数/scratch/输出缓冲全部 open 期就位
             stream.begin_capture();
-            self.run_forward(b, b, &inp);
+            self.run_forward(b, b, &inp, &fx_tabs);
             self.session.table().argmax_rows.run(
                 &self.scr.logits, &fx_rows, &self.scr.am_scratch, &self.scr.am_out, voc, b, stream,
             );
@@ -2781,7 +2854,13 @@ impl Qwen35Executor {
             self.prof_upload_done(tu);
         }
         let tsub = Instant::now();
-        self.run_forward(t as u32, n_rows, &inp);
+        let spans = SpanTabs {
+            start: &row_start,
+            count: &row_count,
+            rid: &row_id,
+            spec: &span_spec,
+        };
+        self.run_forward(t as u32, n_rows, &inp, &spans);
         if prof_on {
             self.prof_note_submit(tsub);
         }
@@ -2893,9 +2972,89 @@ impl Qwen35Executor {
         Some(sel.into_iter().map(|x| x.0).collect())
     }
 
+    /// deltanet chunked 本步分派：eligible 段 = spec==0 且 span ≥
+    /// `DN_CHUNK_MIN_SPAN`（decode/投机链段天然出局），按 op 容量门（行 ≤
+    /// `DN_CHUNK_ROWS`、Σ块数 ≤ chunks_cap、批 token ≤ tokens_cap、形状
+    /// kd=vd=128/vh≤32/kh≤64——op 侧 assert 的 host 前置）贪心装入，装不下
+    /// 的余段走老路（**不 panic**）。子表就地上传一次：`mix.dn_*`（chunked
+    /// 段 + 块前缀和）与 `mix.dno_*`（余段 + 紧凑 specs——老 kernel 按子表
+    /// 行号读 specs，全量 specs_mix 不能复用，conv_state_roll 还在全表上读）。
+    /// None = 全走老路单发（`WEIN_DN_CHUNK=0` / 纯 decode / 小 span / 形状
+    /// 不在档 / 容量不足）——零上传零额外 launch，HEAD 位级不动
+    fn dn_chunk_plan(
+        &self,
+        t32: u32,
+        spans: &SpanTabs<'_>,
+        stream: &Stream,
+    ) -> Option<DnChunkPlan> {
+        if !self.dn_chunk {
+            return None;
+        }
+        let (kh, vh, kd, vd) = (
+            self.cfg.linear_num_k_heads,
+            self.cfg.linear_num_v_heads,
+            self.cfg.linear_k_dim,
+            self.cfg.linear_v_dim,
+        );
+        if kd != 128 || vd != 128 || vh > 32 || kh > 64 {
+            return None; // chunked 只支持 E2 形状（kernel 侧合同）
+        }
+        let (tok_cap, chunk_cap) = self.session.table().deltanet_chunked.caps();
+        if t32 as usize > tok_cap {
+            return None; // 容量不足自动回退老路（t_max 抬档没跟上时）
+        }
+        let mut c_start: Vec<u32> = Vec::with_capacity(DN_CHUNK_ROWS);
+        let mut c_count: Vec<u32> = Vec::with_capacity(DN_CHUNK_ROWS);
+        let mut c_rid: Vec<u32> = Vec::with_capacity(DN_CHUNK_ROWS);
+        let mut snap_off: Vec<u32> = Vec::with_capacity(DN_CHUNK_ROWS + 1);
+        snap_off.push(0);
+        let mut o_start: Vec<u32> = Vec::new();
+        let mut o_count: Vec<u32> = Vec::new();
+        let mut o_rid: Vec<u32> = Vec::new();
+        let mut o_spec: Vec<u32> = Vec::new();
+        for i in 0..spans.start.len() {
+            let (st, cnt, rid, spec) = (spans.start[i], spans.count[i], spans.rid[i], spans.spec[i]);
+            let nch = cnt.div_ceil(DN_CHUNK_BT);
+            let last = *snap_off.last().unwrap();
+            if spec == 0
+                && cnt >= DN_CHUNK_MIN_SPAN
+                && c_start.len() < DN_CHUNK_ROWS
+                && (last + nch) as usize <= chunk_cap
+            {
+                c_start.push(st);
+                c_count.push(cnt);
+                c_rid.push(rid);
+                snap_off.push(last + nch);
+            } else {
+                o_start.push(st);
+                o_count.push(cnt);
+                o_rid.push(rid);
+                o_spec.push(spec);
+            }
+        }
+        if c_start.is_empty() {
+            return None;
+        }
+        let mi = &self.mix;
+        mi.dn_start.upload_prefix_on(&c_start, stream);
+        mi.dn_count.upload_prefix_on(&c_count, stream);
+        mi.dn_rid.upload_prefix_on(&c_rid, stream);
+        mi.dn_snap.upload_prefix_on(&snap_off, stream);
+        let old_rows = o_start.len() as u32;
+        if old_rows > 0 {
+            mi.dno_start.upload_prefix_on(&o_start, stream);
+            mi.dno_count.upload_prefix_on(&o_count, stream);
+            mi.dno_rid.upload_prefix_on(&o_rid, stream);
+            mi.dno_specs.upload_prefix_on(&o_spec, stream);
+        }
+        Some(DnChunkPlan { rows: c_start.len() as u32, chunks: *snap_off.last().unwrap(), old_rows })
+    }
+
     /// 前向 kernel 序（embed → 32 层 → final norm + logits；不含采样/
-    /// sync/回读）——eager 直发与图捕获共用同一条序列（gr1 位一致合同）
-    fn run_forward(&self, t32: u32, n_rows: u32, inp: &FwdIn) {
+    /// sync/回读）——eager 直发与图捕获共用同一条序列（gr1 位一致合同）。
+    /// `spans` 是段表 host 镜像（chunked 分派输入）：图捕获传合成纯 decode
+    /// 表（count 全 1 ⇒ chunked 恒不触发 ⇒ 图内 kernel 序与旧拓扑逐位同）
+    fn run_forward(&self, t32: u32, n_rows: u32, inp: &FwdIn, spans: &SpanTabs<'_>) {
         let stream = self.session.stream();
         let tb = self.session.table();
         let eps = self.cfg.rms_eps;
@@ -2915,6 +3074,11 @@ impl Qwen35Executor {
         if trace {
             self.trace_x(&format!("s{step}-embed"), t32);
         }
+
+        // ── deltanet chunked 分派（每步一次：段表 → eligible 子表上传；
+        //     层循环只发 launch）。纯 decode / 小 span / WEIN_DN_CHUNK=0 /
+        //     容量不足 → None（老路单发，HEAD 位级不动）──
+        let dn_plan = self.dn_chunk_plan(t32, spans, stream);
 
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
         let mut lin_i = 0usize;
@@ -3039,12 +3203,41 @@ impl Qwen35Executor {
                     // 也划算），实际档位由 op 按"块数 ≈ 512"配比 + 容量/铺满/
                     // 几何三门钳制
                     let dn_split = if t32 > n_rows { 16 } else { 1 };
-                    tb.deltanet.run(
-                        &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa, &self.scr.bb,
-                        &w.a_log, &w.dtb, &self.lin_state[lin_i], &self.scr.core, inp.start,
-                        inp.count, inp.rid, n_rows, kh_n, vh_n, kd, vd, t32, L2_EPS, inp.specs,
-                        dn_split, stream,
-                    );
+                    match &dn_plan {
+                        Some(p) => {
+                            // 大 span prefill → chunked（BT=64 分块递推，容差
+                            // 路径）：eligible 子表（mix.dn_*）由分派期上传；
+                            // 余段同流串行发老 kernel——两路写不相交的状态行
+                            // （行分账）与 token 区间（core_out 按段切），
+                            // 池一致性无交叠。dn_split 仍按全步判（混合步里
+                            // decode 行的几何与 HEAD 一致）
+                            tb.deltanet_chunked.run(
+                                &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa,
+                                &self.scr.bb, &w.a_log, &w.dtb, &self.lin_state[lin_i],
+                                &self.scr.core, &self.mix.dn_start, &self.mix.dn_count,
+                                &self.mix.dn_rid, &self.mix.dn_snap, p.rows, p.chunks, kh_n,
+                                vh_n, kd, vd, t32, L2_EPS, DN_CHUNK_BT, DN_CHUNK_VSPLIT,
+                                stream,
+                            );
+                            if p.old_rows > 0 {
+                                tb.deltanet.run(
+                                    &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa,
+                                    &self.scr.bb, &w.a_log, &w.dtb, &self.lin_state[lin_i],
+                                    &self.scr.core, &self.mix.dno_start, &self.mix.dno_count,
+                                    &self.mix.dno_rid, p.old_rows, kh_n, vh_n, kd, vd, t32,
+                                    L2_EPS, &self.mix.dno_specs, dn_split, stream,
+                                );
+                            }
+                        }
+                        None => {
+                            tb.deltanet.run(
+                                &self.scr.qs, &self.scr.ks, &self.scr.vs, &self.scr.aa,
+                                &self.scr.bb, &w.a_log, &w.dtb, &self.lin_state[lin_i],
+                                &self.scr.core, inp.start, inp.count, inp.rid, n_rows, kh_n,
+                                vh_n, kd, vd, t32, L2_EPS, inp.specs, dn_split, stream,
+                            );
+                        }
+                    }
                     if trace {
                         // 定位解码递推偏差：conv 输出与 deltanet 输出（decode vs
                         // 整段预填的同 token 对拍——分叉首组件即病灶）

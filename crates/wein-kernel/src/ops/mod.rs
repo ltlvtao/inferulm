@@ -49,14 +49,20 @@ pub struct ScratchCaps {
     pub reduce_floats: usize,
     /// deltanet l2norm 前置 inv 的 token 容量（× k 头上限 × 2 f32）
     pub delta_l2_tokens: usize,
+    /// deltanet chunked（BT=64 分块递推）的 token 容量：gcum/u/w/snap
+    /// 线性放大项的总闸。exec 大块 prefill 按 t_max 抬档走
+    /// `resolve_tuned_with`；resolve_tuned 默认档给 DN_CHUNK_TOKENS_DEFAULT
+    pub delta_chunk_tokens: usize,
 }
 
 impl Default for ScratchCaps {
-    /// 历史 compile 期常量档（T_MAX=512）：rms 8192×256 槽 + l2 512 token
+    /// 历史 compile 期常量档（T_MAX=512）：rms 8192×256 槽 + l2 512 token +
+    /// chunked 默认档（小形状容差测试够用）
     fn default() -> Self {
         Self {
             reduce_floats: REDUCE_ROWS_CAP * 256,
             delta_l2_tokens: DELTA_L2_TOKENS_CAP,
+            delta_chunk_tokens: DN_CHUNK_TOKENS_DEFAULT,
         }
     }
 }
@@ -80,6 +86,7 @@ pub struct OpTable<'a> {
     pub conv1d_dw: Conv1dDwCuda<'a>,
     pub conv_state_roll: ConvStateRollCuda<'a>,
     pub deltanet: DeltanetCuda<'a>,
+    pub deltanet_chunked: DeltanetChunkedCuda<'a>,
     pub rms_norm_gated: RmsNormGatedCuda<'a>,
     pub argmax_rows: ArgmaxRowsCuda<'a>,
     pub sample_rows: SampleRowsCuda<'a>,
@@ -202,6 +209,7 @@ impl OpTable<'_> {
             scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * DELTA_SLOTS_PER_BLOCK * 4),
             inv: gpu.alloc_bytes(caps.delta_l2_tokens * DELTA_L2_KHEADS_CAP * 2 * 4),
         };
+        let deltanet_chunked = DeltanetChunkedCuda::new(gpu, &m, caps);
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
             f: m.func("rms_norm_gated"),
@@ -222,8 +230,8 @@ impl OpTable<'_> {
             }])?,
         )};
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
-            rms_norm_zc, rope_pt, sigmul, conv1d_dw, conv_state_roll, deltanet, rms_norm_gated,
-            argmax_rows, sample_rows })
+            rms_norm_zc, rope_pt, sigmul, conv1d_dw, conv_state_roll, deltanet, deltanet_chunked,
+            rms_norm_gated, argmax_rows, sample_rows })
     }
 }
 
@@ -352,6 +360,25 @@ const DELTA_L2_KHEADS_CAP: usize = 64;
 /// 前置 l2norm kernel 的块宽（一线程一 (token, k 头)，各持一条 j 升序
 /// 平方和链——无跨线程归约，宽窄只影响占用率）
 const DELTA_L2_BLOCK_DIM: u32 = 128;
+
+// ── deltanet chunked（BT=64 分块递推，FLA 同构）常量 ──
+/// chunked scratch 的默认 token 容量（resolve_tuned 无 caps 档）
+const DN_CHUNK_TOKENS_DEFAULT: usize = 512;
+/// BT 上限（prep 的解历史 xh[128] 钉死；A 三角 solve 是 O(BT³/3) 别盲目加大）
+const DN_CHUNK_BT_MAX: usize = 128;
+/// v 头容量（snap/u/w 按此定尺）
+const DN_CHUNK_VHEADS_CAP: usize = 32;
+/// kd=vd=128（chunked 只支持 E2 形状；host 侧 assert）
+const DN_CHUNK_DIM: usize = 128;
+/// 行容量（fwd_h 的块私有 scratch2：rows × vh × vsplit 块）
+const DN_CHUNK_ROWS_CAP: usize = 4;
+/// vsplit 上限（fwd_h 的 v 行切分——补块级并行度，链长 chunk 数不变）
+const DN_CHUNK_VSPLIT_MAX: usize = 8;
+/// fwd_h ① 两相部分和区（f32/块；2 任务 × 16 输出 × 32 lane × 8 warp——须与
+/// kernel 侧 stride 公式一致）
+const DN_H_PART_FLOATS: usize = 8192;
+/// 块数容量余量（行数 ≤ DN_CHUNK_ROWS_CAP 时 Σceil(cnt/BT) ≤ tokens/BT + 行数，取 +8）
+const DN_CHUNK_CHUNK_SLACK: usize = 8;
 
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
@@ -716,6 +743,226 @@ impl DeltanetOp for DeltanetCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "deltanet/cuda"
+    }
+}
+
+/// deltanet chunked（FLA 式 BT 分块递推，prefill 专用）：三次 launch——
+/// `dn_chunk_prep`（门控 scan + (I+A)⁻¹ 联立前代 → gcum/u/w）→ `dn_chunk_h`
+/// （块间串行状态推进，u 原位变 δ，逐块快照 bf16）→ `dn_chunk_o`（输出组装，
+/// 全并行）。前置 `dn_qk_l2norm` 与老路同款（复用入口、独立 inv 缓冲——
+/// resolve 期一并预分配）。只支持 kd=vd=128、v_heads≤32、rows≤4、全段
+/// specs==0（MTP 链不在档）；decode/小 span 走老 `DeltanetOp`（位级不动）。
+///
+/// 数学（与 kernel 侧注释同步）：逐 token 记 X=exp(a_log)·softplus(a+dt_bias)、
+/// λ=e^{−X}、β=sigmoid(b)（收 bf16 同 reference）；块内累计 C_t=Σ_{s≤t}X_s：
+/// ① A[t,s]=β_t(k̂_t·k̂_s)e^{C_s−C_t}（s<t）；② ū=(I+A)⁻¹(βv)、
+/// w=(I+A)⁻¹(βe^{−C}⊙k̂)；③ δ=ū−w·S₀ᵀ；S←e^{−C_last}S₀+Σe^{C_t−C_last}k̂_t⊗δ_t；
+/// ④ o_t=e^{−C_t}(S₀q̂_t)+Σ_{s≤t}(q̂_t·k̂_s)e^{C_s−C_t}δ_s，再 /√kd。
+pub trait DeltanetChunkedOp {
+    /// `snap_off`: [rows+1] u32——逐行块数前缀和（host 算好上传，[0]=0）；
+    /// `chunks` = snap_off[n_rows]；`bt` ∈ 16..=128；`vsplit` 是 fwd_h 的
+    /// v 行切分**上限**（run 内按 scratch2 容量钳到 2 幂）。返回钳后 vsplit。
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        a: &DevBuf,
+        b: &DevBuf,
+        a_log: &DevBuf,
+        dt_bias: &DevBuf,
+        state: &DevBuf,
+        core_out: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        row_id: &DevBuf,
+        snap_off: &DevBuf,
+        n_rows: u32,
+        chunks: u32,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        tokens: u32,
+        l2_eps: f32,
+        bt: u32,
+        vsplit: u32,
+        stream: &Stream,
+    ) -> u32;
+    /// (tokens_cap, chunks_cap)——exec 的门自查（超容回退老路，不静默截断）
+    fn caps(&self) -> (usize, usize);
+    fn name(&self) -> &'static str;
+}
+
+pub struct DeltanetChunkedCuda<'a> {
+    gpu: &'a Gpu,
+    f_prep: Func,
+    f_h: Func,
+    f_o: Func,
+    l2f: Func,
+    /// q/k l2norm 倒数 [tokens × DELTA_L2_KHEADS_CAP, 2] f32（本 op 独立份）
+    inv: DevBuf<'a>,
+    /// 块内累计门控 C [tokens, vh_cap] f32
+    gcum: DevBuf<'a>,
+    /// ū→δ（fwd_h 原位）[tokens, vh_cap, 128] f32
+    u: DevBuf<'a>,
+    /// w [tokens, vh_cap, 128] f32
+    w: DevBuf<'a>,
+    /// 块首状态快照 [chunks_cap, vh_cap, 128, 128] bf16（含 chunk 0 初态）
+    snap: DevBuf<'a>,
+    /// prep/o 共用的块私有 scratch（[chunks_cap×vh_cap 块, 5·BT_MAX] f32；
+    /// 两 kernel 同 grid 几何、同 stream 顺序 launch——prep 写完 o 才读）
+    scratch1: DevBuf<'a>,
+    /// fwd_h 的块私有 scratch（[rows×vh×vsplit 块] × (vrows·kd+BT) f32，
+    /// 按 ROWS×VH×(DIM²+VSPLIT·BT) 定尺——vsplit 越大块越多每块越小）
+    scratch2: DevBuf<'a>,
+    tokens_cap: usize,
+    chunks_cap: usize,
+}
+
+impl<'a> DeltanetChunkedCuda<'a> {
+    /// 按 caps.delta_chunk_tokens 定尺分配（0 视为默认档）。总量（t_max=8192、
+    /// vh=32 档）：inv 4.2 + gcum 1.05 + u 134.2 + w 134.2 + snap 142.6 +
+    /// scratch1 11.1 + scratch2 8.9 ≈ 436MB——跨层复用同一层缓冲，层间串行
+    fn new(gpu: &'a Gpu, m: &crate::cuda::Module<'a>, caps: &ScratchCaps) -> Self {
+        let t = if caps.delta_chunk_tokens == 0 {
+            DN_CHUNK_TOKENS_DEFAULT
+        } else {
+            caps.delta_chunk_tokens
+        };
+        let cch = t / 64 + DN_CHUNK_CHUNK_SLACK;
+        Self {
+            gpu,
+            f_prep: m.func("dn_chunk_prep"),
+            f_h: m.func("dn_chunk_h"),
+            f_o: m.func("dn_chunk_o"),
+            l2f: m.func("dn_qk_l2norm"),
+            inv: gpu.alloc_bytes(t * DELTA_L2_KHEADS_CAP * 2 * 4),
+            gcum: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * 4),
+            u: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * 4),
+            w: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * 4),
+            snap: gpu.alloc_bytes(cch * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * DN_CHUNK_DIM * 2),
+            scratch1: gpu.alloc_bytes(
+                cch * DN_CHUNK_VHEADS_CAP * 5 * DN_CHUNK_BT_MAX * 4,
+            ),
+            scratch2: gpu.alloc_bytes(
+                DN_CHUNK_ROWS_CAP
+                    * DN_CHUNK_VHEADS_CAP
+                    * (DN_CHUNK_DIM * DN_CHUNK_DIM
+                        + DN_CHUNK_VSPLIT_MAX * (DN_CHUNK_BT_MAX + DN_H_PART_FLOATS))
+                    * 4,
+            ),
+            tokens_cap: t,
+            chunks_cap: cch,
+        }
+    }
+}
+
+impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        a: &DevBuf,
+        b: &DevBuf,
+        a_log: &DevBuf,
+        dt_bias: &DevBuf,
+        state: &DevBuf,
+        core_out: &DevBuf,
+        row_start: &DevBuf,
+        row_count: &DevBuf,
+        row_id: &DevBuf,
+        snap_off: &DevBuf,
+        n_rows: u32,
+        chunks: u32,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        tokens: u32,
+        l2_eps: f32,
+        bt: u32,
+        vsplit: u32,
+        stream: &Stream,
+    ) -> u32 {
+        assert!(
+            k_dim as usize == DN_CHUNK_DIM && v_dim as usize == DN_CHUNK_DIM,
+            "deltanet_chunked 只支持 kd=vd=128（got kd={k_dim} vd={v_dim}）"
+        );
+        assert!(v_heads as usize <= DN_CHUNK_VHEADS_CAP, "v_heads={v_heads} 超容量 {DN_CHUNK_VHEADS_CAP}");
+        assert!(k_heads as usize <= DELTA_L2_KHEADS_CAP, "k_heads={k_heads} 超容量 {DELTA_L2_KHEADS_CAP}");
+        assert!(n_rows as usize <= DN_CHUNK_ROWS_CAP, "rows={n_rows} 超 fwd_h scratch 容量 {DN_CHUNK_ROWS_CAP}");
+        assert!(tokens as usize <= self.tokens_cap, "tokens={tokens} 超容量 {}（exec 门须回退老路）", self.tokens_cap);
+        assert!(chunks as usize <= self.chunks_cap, "chunks={chunks} 超容量 {}（BT 抬档或回退）", self.chunks_cap);
+        assert!((16..=DN_CHUNK_BT_MAX).contains(&(bt as usize)), "bt={bt} 须在 16..=128");
+        // A/M 矩阵别名容量（构造性满足：bt=64 恒真；bt=128 需 tokens 接近满容，
+        // 见 ops_i1 o35 注）——仍显式钉死防静默越界
+        let mat_bytes = chunks as usize * v_heads as usize * bt as usize * bt as usize * 4;
+        assert!(
+            mat_bytes <= self.snap.bytes(),
+            "A(chunks={chunks}×vh={v_heads}×bt={bt}) 超 snap 别名容量"
+        );
+        assert!(
+            mat_bytes <= self.w.bytes(),
+            "M(chunks={chunks}×vh={v_heads}×bt={bt}) 超 w 别名容量"
+        );
+        // vsplit 钳制：2 幂下探，直到 scratch2 容量装得下（vd=128 下整除恒真）
+        let h_slots = self.scratch2.bytes() / 4;
+        let mut sp = vsplit.clamp(1, DN_CHUNK_VSPLIT_MAX as u32);
+        loop {
+            let vrows = v_dim / sp;
+            let need = n_rows as usize * v_heads as usize * sp as usize * (vrows as usize * k_dim as usize + bt as usize + DN_H_PART_FLOATS);
+            if need <= h_slots || sp == 1 {
+                break;
+            }
+            sp /= 2;
+        }
+        // ① 前置 l2norm（invq/invk——与老路同 kernel 同序）
+        let n = tokens * k_heads;
+        let l2args = crate::kernel_args![*q, *k, self.inv, tokens, k_heads, k_dim, l2_eps];
+        self.gpu.launch(&self.l2f, n.div_ceil(DELTA_L2_BLOCK_DIM), DELTA_L2_BLOCK_DIM, &l2args, stream);
+        // ② prep：gcum/u/w + A 下三角进 snap 别名（prep 不读 snap，h 覆写——
+        //    同 stream 保序）；grid = 全局块 × k 头（A 的 Gram 跨 vh/kh 个 v 头
+        //    共用——块内逐 v 头 scan/rhs/尾乘/solve）；block = vd+kd = 256 恰满
+        assert!(v_heads % k_heads == 0, "v_heads 必须整除 k_heads（Gram 共用）");
+        let grid_co = chunks * k_heads; // o ① Gram 按 k 头共用（块内逐 v 头尾乘）
+        let prep_args = crate::kernel_args![
+            *k, *v, *a, *b, *a_log, *dt_bias, self.inv, self.gcum, self.u, self.w,
+            *row_start, *row_count, *snap_off, n_rows, chunks, k_heads, v_heads, k_dim, v_dim,
+            bt, self.snap, self.scratch1,
+        ];
+        self.gpu.launch(&self.f_prep, chunks * k_heads, 256, &prep_args, stream);
+        // ③ fwd_h：块间串行状态推进 + 快照 + 末态回池（grid = 行 × v 头 × vsplit）
+        let h_args = crate::kernel_args![
+            *k, self.inv, self.gcum, self.u, self.w, self.snap, *state,
+            *row_start, *row_count, *row_id, *snap_off, n_rows, k_heads, v_heads, k_dim, v_dim,
+            bt, sp, self.scratch2,
+        ];
+        // sp=8（vrows=16）：VW4 派发下 128 线程（4 warp）恰满行；小块多驻留
+        // （256 块 / 128 SM → 多块/SM 共驻，藏 ② tp 链载入延迟）
+        let h_bdim = if sp == 8 { 128u32 } else { 256u32 };
+        self.gpu.launch(&self.f_h, n_rows * v_heads * sp, h_bdim, &h_args, stream);
+        // ④ 输出组装（grid 同 prep；u 此时是 δ）。Mᵀ 走 w 别名（o 不读 w，
+        //    h 之后 w 已死，下一层 prep 覆写——同 stream 保序）；scratch1
+        //    传给 o 读 prep 的 eneg/epos 端点缩放（同 grid 几何同槽位）
+        let o_args = crate::kernel_args![
+            *q, *k, self.inv, self.gcum, self.u, self.snap, *core_out,
+            *row_start, *row_count, *snap_off, n_rows, chunks, k_heads, v_heads, k_dim, v_dim,
+            bt, self.w, self.scratch1,
+        ];
+        self.gpu.launch(&self.f_o, grid_co, 256, &o_args, stream);
+        sp
+    }
+
+    fn caps(&self) -> (usize, usize) {
+        (self.tokens_cap, self.chunks_cap)
+    }
+
+    fn name(&self) -> &'static str {
+        "deltanet_chunked/cuda"
     }
 }
 
