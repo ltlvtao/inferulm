@@ -106,14 +106,23 @@ fn k1_ptx_artifact_structure() {
         "paged_attn_qblk_n16r8j4",
         "paged_attn_qblk_n8r8j4",
         "paged_attn_qblk_n8r16j2",
+        // v3 档（smem K/V tile + shfl 归约）：prefill 长序列（WEIN_ATTN_V3 接线）
+        "paged_attn_v3_n16k16",
+        "paged_attn_v3_n16k8",
+        "paged_attn_v3_n8k16",
+        "paged_attn_v3_n8k8",
+        "paged_attn_v3_d32k16",
+        "paged_attn_v3_d32k8",
+        "paged_attn_v3_n32k16",
+        "paged_attn_v3_n32k8",
     ] {
         let head = format!(".entry {k}(");
         assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        50,
-        "导出 kernel 数应为 50（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2）"
+        58,
+        "导出 kernel 数应为 58（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2 + v3 档 8）"
     );
 }
 

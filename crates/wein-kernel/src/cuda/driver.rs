@@ -37,6 +37,8 @@ pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 /// cuFuncGetAttribute 的属性号（只列用到的）：local 溢出字节数与寄存器数
 /// ——qblk 档探针的 regs/spill 报告口径（与 ptxas -v 对拍过）
 pub const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
+/// shared 内存字节数（静态 .shared 总量——模块级符号归属判定用）
+pub const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
 pub const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
 
 #[derive(Debug)]

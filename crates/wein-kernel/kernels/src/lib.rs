@@ -43,6 +43,25 @@ unsafe extern "C" {
     fn shfl_idx_f32(mask: u32, a: f32, src: i32, clamp: i32) -> f32;
     #[link_name = "llvm.nvvm.shfl.sync.bfly.i32"]
     fn shfl_bfly(mask: u32, a: i32, offset: i32, clamp: i32) -> i32;
+    // warp 内屏障（smem p 缓冲 pass1 写 → pass2 读的可见性；shfl.sync 只有
+    // 收敛语义，内存序要 bar.warp.sync）
+    #[link_name = "llvm.nvvm.bar.warp.sync"]
+    fn bar_warp_sync(mask: u32);
+}
+
+/// f32 的 bfly shfl（位往返；v3 点积的段内归约用）
+#[inline(always)]
+fn shfl_bfly_f32(x: f32, off: i32) -> f32 {
+    f32::from_bits(unsafe { shfl_bfly(0xffff_ffff, x.to_bits() as i32, off, 31) } as u32)
+}
+
+/// 快速 exp（v3 容差档专用）：2^(x·log2e) 直落 `ex2.approx.f32`
+/// （llvm.exp2f32 在 nvptx 的唯一 HW 落点；相对误差 ~2^-22 ≪ rel2 门 3e-3）。
+/// 位级档（online/tile/decode）仍走精确 `expf`，一字不动。
+/// x ≤ 0 域：x=−inf → +0（MUFU 定义），上溢不可能。
+#[inline(always)]
+fn fexp(x: f32) -> f32 {
+    unsafe { core::intrinsics::exp2::<f32>(x * 1.4426950408889634) }
 }
 
 /// `.shared` 段静态数组：若 PTX 出模块级 `.shared` 符号，则 smem 可达
@@ -2359,6 +2378,1286 @@ qblk_export!(paged_attn_qblk_n16r8j2, 16, 8, 2, false);
 qblk_export!(paged_attn_qblk_n16r8j4, 16, 8, 4, false);
 qblk_export!(paged_attn_qblk_n8r8j4, 8, 8, 4, false);
 qblk_export!(paged_attn_qblk_n8r16j2, 8, 16, 2, false);
+
+// ───────── v3：smem K/V tile + shfl warp 归约（prefill 长序列容差档） ─────────
+// 解锁能力后的第三次几何迭代。对照：
+// · online（单遍）：块=(kv头, token 片, j 分片)，RPT 行/线程组共享 K 载，
+//   归约走 global scratch 两级折叠——每块每 KV 字节服务 RPT 行，流量贴 DRAM。
+// · qblk：循环互换后流量砍到 6.2GB/层，但 acc[RPT][ND] 超寄存器预算落
+//   local + scratch 折叠 ⇒ 反慢 4.2×。
+// · v3：**K/V tile 驻 smem**（KT 个 token × hd 维 f32，一道协作装载，
+//   全块 q 行消费——L2 重载 ÷passes、DRAM 只过一次）+ **点积归约走 shfl**
+//   （段内 log2(NV) 步 bfly，无 scratch 无块屏障）+ **acc/q/m/l 全驻寄存器**
+//   （pass=行批外层、tile 内层，跨 tile 续在线状态）。
+//
+// 线程映射（ND=16 维/lane、RL=2 行/lane 组，常量）：
+//   warp = 32 lane = GPW(=32/NV) 个行组 × NV 个维 lane；lane sl 持行内维
+//   [16·sl, 16·sl+16)。组每 j 步推 RL=2 行（K 的 4×F4 smem 读一次供 2 行）。
+//   pass p：warp w 认领行 [(p·nw+w)·RPW + g·RL, +RL)。块 = (kv头, Br=ntok
+//   token, j 分片 sp)；行 r → (token = r/ng, q 头 = r%ng)。
+//
+// smem 布局（swizzle 免 bank 冲突）：token jj 的 256 维 = 4·NV 个 F4；维 d
+// 的 F4 组 g4=d/4 落槽 (g4%4)·NV + g4/4 ⇒ 消费侧 lane sl 第 k 个 F4 读槽
+// k·NV+sl（16 lane 连续 256B 无冲突），恰好取回维 16·sl+4k+e。staging 侧
+// 按 16B(8 维) chunk 从 global 载 bf16、解包成 2×F4 写两个槽。
+// pbuf：每 warp [RPW][KT] f32 分值窗——pass1 写（组内 sl==0）、bar.warp.sync、
+// pass2 全 lane 广播读（兼作归约结果的组内广播）。
+//
+// 循环序：segment（块内多 seq 回退：逐段重跑，段外行 mask 成 −inf）→
+// pass（行批，状态驻寄存器跨 tile）→ tile（KT token，staging 后、消费后
+// 各一道 __syncthreads）→ pass1（QK 点积→bfly 归约→mask→pbuf）→
+// bar.warp.sync → pass2（tile max→mn/scale→p=fexp(s−mn)→acc+=p·V、l+=p）
+// → tile 末 rescale 收进 acc/l。
+//
+// 数值：与 online 同一套在线 softmax 代数，三处舍入差 ⇒ 容差档（o37 钉
+// rel2 ≤ 3e-3）：① p 直接对 mn 归一（online 是 p·echunk 两步）② exp 走
+// `fexp`（ex2.approx，rel ~2^-22）③ 点积归约从"d 升序单链"变 4 链树+bfly。
+// 掩码：无效 (行, j) 的 s=−inf（pass2 select 成 p=0，防 fma(0,NaN)）；
+// 全掩码 tile（mn=−inf）整 tile 跳过。jsplit 偏量语义照抄 online
+// （m=分片 running max、acc 不归一、空分片写 (−inf,0)），attn_combine 不改。
+#[link_section = ".shared"]
+static mut V3_K16: [F4; 16 * 64] = [F4([0.0; 4]); 16 * 64];
+#[link_section = ".shared"]
+static mut V3_V16: [F4; 16 * 64] = [F4([0.0; 4]); 16 * 64];
+/// pbuf：warp(≤12) × RPW(≤8) × KT(16)
+#[link_section = ".shared"]
+static mut V3_P16: [f32; 12 * 8 * 16] = [0.0; 12 * 8 * 16];
+#[link_section = ".shared"]
+static mut V3_K8: [F4; 8 * 64] = [F4([0.0; 4]); 8 * 64];
+#[link_section = ".shared"]
+static mut V3_V8: [F4; 8 * 64] = [F4([0.0; 4]); 8 * 64];
+#[link_section = ".shared"]
+static mut V3_P8: [f32; 12 * 8 * 8] = [0.0; 12 * 8 * 8];
+
+/// KT 档选 smem 组（const 折叠，死档不进 PTX）
+#[inline(always)]
+fn v3_smem<const KT: usize>() -> (*mut F4, *mut F4, *mut f32) {
+    let (k, v, p) = if KT == 16 {
+        unsafe {
+            (
+                core::ptr::addr_of_mut!(V3_K16) as usize,
+                core::ptr::addr_of_mut!(V3_V16) as usize,
+                core::ptr::addr_of_mut!(V3_P16) as usize,
+            )
+        }
+    } else {
+        unsafe {
+            (
+                core::ptr::addr_of_mut!(V3_K8) as usize,
+                core::ptr::addr_of_mut!(V3_V8) as usize,
+                core::ptr::addr_of_mut!(V3_P8) as usize,
+            )
+        }
+    };
+    (
+        core::ptr::with_exposed_provenance_mut::<F4>(k),
+        core::ptr::with_exposed_provenance_mut::<F4>(v),
+        core::ptr::with_exposed_provenance_mut::<f32>(p),
+    )
+}
+
+/// staging：global bf16 → smem f32（swizzle 落槽）。`ebase` = 元素偏移
+/// （token 槽 × he + kh·hd + 8c），`jj` = tile 内 token 序。
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn v3_stage8<const NV: usize>(
+    dst: *mut F4,
+    src: *const u8,
+    ebase: usize,
+    jj: usize,
+    c: usize,
+) {
+    let p = src as *const u16;
+    let a = bf16x4(*(p.add(ebase) as *const u64));
+    let b = bf16x4(*(p.add(ebase + 4) as *const u64));
+    let g0 = 2 * c;
+    let g1 = 2 * c + 1;
+    let tbase = jj * (NV * 4);
+    *dst.add(tbase + (g0 % 4) * NV + g0 / 4) =
+        F4([bf16_to_f32(a[0]), bf16_to_f32(a[1]), bf16_to_f32(a[2]), bf16_to_f32(a[3])]);
+    *dst.add(tbase + (g1 % 4) * NV + g1 / 4) =
+        F4([bf16_to_f32(b[0]), bf16_to_f32(b[1]), bf16_to_f32(b[2]), bf16_to_f32(b[3])]);
+}
+
+/// q 行 16 维切片载寄存器（const 索引小循环，照 online 档位驻留模式）
+#[inline(always)]
+unsafe fn v3_qload(q: *const u16, dst: &mut [f32; 16], qb: usize) {
+    let mut k = 0usize;
+    while k < 4 {
+        let qs = bf16x4(*(q.add(qb + 4 * k) as *const u64));
+        dst[4 * k] = bf16_to_f32(qs[0]);
+        dst[4 * k + 1] = bf16_to_f32(qs[1]);
+        dst[4 * k + 2] = bf16_to_f32(qs[2]);
+        dst[4 * k + 3] = bf16_to_f32(qs[3]);
+        k += 1;
+    }
+}
+
+/// 16 维切片点积 + 段内 bfly 归约（NV lane 同和）。
+/// 必须在 warp 收敛点调用：shfl.sync 全掩码，调用侧不得有分支遮蔽。
+#[inline(always)]
+fn v3_dot16<const NV: usize>(qr: &[f32; 16], k0: &F4, k1: &F4, k2: &F4, k3: &F4) -> f32 {
+    // 4 链树（链长 4，ILP 友好；容差档不要求 d 升序单链）
+    let mut a = fma(qr[0], k0.0[0], 0.0);
+    let mut b = fma(qr[1], k0.0[1], 0.0);
+    let mut c = fma(qr[2], k0.0[2], 0.0);
+    let mut d = fma(qr[3], k0.0[3], 0.0);
+    a = fma(qr[4], k1.0[0], a);
+    b = fma(qr[5], k1.0[1], b);
+    c = fma(qr[6], k1.0[2], c);
+    d = fma(qr[7], k1.0[3], d);
+    a = fma(qr[8], k2.0[0], a);
+    b = fma(qr[9], k2.0[1], b);
+    c = fma(qr[10], k2.0[2], c);
+    d = fma(qr[11], k2.0[3], d);
+    a = fma(qr[12], k3.0[0], a);
+    b = fma(qr[13], k3.0[1], b);
+    c = fma(qr[14], k3.0[2], c);
+    d = fma(qr[15], k3.0[3], d);
+    let mut s = (a + b) + (c + d);
+    // bfly 归约必须是 +=（远端值累加）；赋值版 4 步后 lane 拿到的是
+    // lane^(NV-1) 的原偏和（曾实测 s 塌成单 lane 分量，p̂ 全均匀）
+    let mut off = NV / 2;
+    while off > 0 {
+        s += shfl_bfly_f32(s, off as i32);
+        off /= 2;
+    }
+    s
+}
+
+/// acc[16] 标量 rescale（const 索引）
+#[inline(always)]
+fn v3_scale16(acc: &mut [f32; 16], s: f32) {
+    let mut l = 0usize;
+    while l < 16 {
+        acc[l] *= s;
+        l += 1;
+    }
+}
+
+/// acc += p·v（16 维，const 索引）
+#[inline(always)]
+fn v3_acc16(acc: &mut [f32; 16], p: f32, v0: &F4, v1: &F4, v2: &F4, v3: &F4) {
+    acc[0] = fma(p, v0.0[0], acc[0]);
+    acc[1] = fma(p, v0.0[1], acc[1]);
+    acc[2] = fma(p, v0.0[2], acc[2]);
+    acc[3] = fma(p, v0.0[3], acc[3]);
+    acc[4] = fma(p, v1.0[0], acc[4]);
+    acc[5] = fma(p, v1.0[1], acc[5]);
+    acc[6] = fma(p, v1.0[2], acc[6]);
+    acc[7] = fma(p, v1.0[3], acc[7]);
+    acc[8] = fma(p, v2.0[0], acc[8]);
+    acc[9] = fma(p, v2.0[1], acc[9]);
+    acc[10] = fma(p, v2.0[2], acc[10]);
+    acc[11] = fma(p, v2.0[3], acc[11]);
+    acc[12] = fma(p, v3.0[0], acc[12]);
+    acc[13] = fma(p, v3.0[1], acc[13]);
+    acc[14] = fma(p, v3.0[2], acc[14]);
+    acc[15] = fma(p, v3.0[3], acc[15]);
+}
+
+/// ex2 直落（pass2 的 p：q_scale·log2e 已折进 qs2/mnf，免 selp 免分支）
+#[inline(always)]
+fn fexp2(x: f32) -> f32 {
+    unsafe { core::intrinsics::exp2::<f32>(x) }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn v3_body<const NV: usize, const KT: usize>(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    _head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    _chunk: u32,
+    _scratch: *mut f32,
+) {
+    const RL: usize = 2;
+    let hd = NV * 16;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let ng = udiv(qh_n, kv_n);
+    let nt = ntok as usize; // = Br
+    let js = jsplit as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let gpw = 32 / NV; // 行组/warp
+    let rpw = gpw * RL; // 行/warp/pass
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = ntile - 1 - udiv(rest, js); // 反序：长 span 块先发射藏因果尾
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows = tn * ng;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+    let nw = udiv(bdim, 32);
+    let warp = udiv(tau, 32);
+    let lane32 = urem(tau, 32);
+    let g = udiv(lane32, NV); // 行组号
+    let sl = urem(lane32, NV); // 维 lane（持 [16sl, 16sl+16)）
+    let npass = udiv(rows + nw * rpw - 1, nw * rpw);
+    let (ksm, vsm, psm) = v3_smem::<KT>();
+    // pbuf 存 raw 点积（不乘 q_scale）；pass2 折叠：p = 2^(s·qs2 − mn·qs2)，
+    // 掩码位 s=−inf → fma(−inf,qs2,mnf)=−inf → ex2=+0，免 selp/免分支。
+    // 空 tile（mn=−inf）走 mnf=−inf 同式归零，acc/l 不被污染。
+    let qs2 = q_scale * 1.4426950408889634;
+
+    // 多 seq 回退：块内逐段（连续同 seq 的 token 段）重跑同一套 tile 机制，
+    // 段外行 mask 成 −inf（p=0 不污染状态）；uniform 快路 = 单段零浪费
+    let mut u0 = 0usize;
+    while u0 < tn {
+        let s_seq = *seq_ids.add(t0 + u0) as usize;
+        let mut u1 = u0 + 1;
+        while u1 < tn && *seq_ids.add(t0 + u1) as usize == s_seq {
+            u1 += 1;
+        }
+        let mut pmax = 0usize;
+        let mut u = u0;
+        while u < u1 {
+            let p = *positions.add(t0 + u) as usize;
+            pmax = if p > pmax { p } else { pmax };
+            u += 1;
+        }
+        let lspan = udiv(pmax + js, js);
+        let jmax = pmax + 1;
+        let j0 = sp * lspan;
+        let j1 = if j0 + lspan < jmax { j0 + lspan } else { jmax };
+        let mut pass = 0usize;
+        while pass < npass {
+            // 本 warp 本 pass 的行批：组 g 持 RL=2 行（rb、rb+1）。
+            // 行态全程标量/const 索引数组（运行时索引会落 local，online 档同款教训）。
+            let rb = (pass * nw + warp) * rpw + g * RL;
+            let tt0 = udiv(rb, ng);
+            let live0 = rb < rows && tt0 >= u0 && tt0 < u1;
+            let r1 = rb + 1;
+            let tt1 = udiv(r1, ng);
+            let live1 = r1 < rows && tt1 >= u0 && tt1 < u1;
+            let mut pr0 = 0usize;
+            let mut pr1 = 0usize;
+            let mut rg0 = 0usize;
+            let mut rg1 = 0usize;
+            let mut qreg0 = [0.0f32; 16];
+            let mut qreg1 = [0.0f32; 16];
+            if live0 {
+                pr0 = *positions.add(t0 + tt0) as usize;
+                rg0 = (t0 + tt0) * qh_n + kh * ng + urem(rb, ng);
+                v3_qload(q, &mut qreg0, rg0 * hd + 16 * sl);
+            }
+            if live1 {
+                pr1 = *positions.add(t0 + tt1) as usize;
+                rg1 = (t0 + tt1) * qh_n + kh * ng + urem(r1, ng);
+                v3_qload(q, &mut qreg1, rg1 * hd + 16 * sl);
+            }
+            let mut acc0 = [0.0f32; 16];
+            let mut acc1 = [0.0f32; 16];
+            let mut mrun0 = f32::NEG_INFINITY;
+            let mut mrun1 = f32::NEG_INFINITY;
+            let mut lrun0 = 0.0f32;
+            let mut lrun1 = 0.0f32;
+            let pb0 = (warp * rpw + g * RL) * KT;
+            let pb1 = pb0 + KT;
+            let mut c0 = j0;
+            while c0 < j1 {
+                let cc = if c0 + KT < j1 { KT } else { j1 - c0 };
+                // ── staging：K/V tile 协作装载（bf16→f32 解包 + swizzle）
+                let nch = NV * 2; // 每 token 的 16B chunk 数 = hd/8
+                let nent = cc * nch;
+                let mut e = tau;
+                while e < nent {
+                    let jj = udiv(e, nch);
+                    let c = urem(e, nch);
+                    let slot = slot_of(block_table, s_seq, c0 + jj, bpr, bs);
+                    let ebase = slot * he + kh * hd + c * 8;
+                    v3_stage8::<NV>(ksm, k_cache, ebase, jj, c);
+                    v3_stage8::<NV>(vsm, v_cache, ebase, jj, c);
+                    e += bdim;
+                }
+                _syncthreads();
+                // ── pass1：QK 点积（K 读一次供 RL 行）→ 段内 bfly 归约 → pbuf(raw)
+                // （jj 2× 展开实测反伤：regs 顶穿 128 → spill 增大 136→232B，弃）
+                let mut jj = 0usize;
+                while jj < cc {
+                    let kb = jj * (NV * 4) + sl;
+                    let kf0 = *ksm.add(kb);
+                    let kf1 = *ksm.add(kb + NV);
+                    let kf2 = *ksm.add(kb + 2 * NV);
+                    let kf3 = *ksm.add(kb + 3 * NV);
+                    let s0 = v3_dot16::<NV>(&qreg0, &kf0, &kf1, &kf2, &kf3);
+                    let s1 = v3_dot16::<NV>(&qreg1, &kf0, &kf1, &kf2, &kf3);
+                    let j = c0 + jj;
+                    let sc0 = if live0 && j <= pr0 { s0 } else { f32::NEG_INFINITY };
+                    let sc1 = if live1 && j <= pr1 { s1 } else { f32::NEG_INFINITY };
+                    if sl == 0 {
+                        *psm.add(pb0 + jj) = sc0;
+                        *psm.add(pb1 + jj) = sc1;
+                    }
+                    jj += 1;
+                }
+                bar_warp_sync(0xffff_ffff); // pbuf 写 → 读的 warp 内可见性
+                // ── pass2：tile max(raw 域) → 在线合并系数 → p·V（V 载一次供双行）
+                let mut tm0 = f32::NEG_INFINITY;
+                let mut tm1 = f32::NEG_INFINITY;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let x0 = *psm.add(pb0 + jj);
+                    let x1 = *psm.add(pb1 + jj);
+                    tm0 = if x0 > tm0 { x0 } else { tm0 };
+                    tm1 = if x1 > tm1 { x1 } else { tm1 };
+                    jj += 1;
+                }
+                let mn0 = if tm0 > mrun0 { tm0 } else { mrun0 };
+                let mn1 = if tm1 > mrun1 { tm1 } else { mrun1 };
+                // mrun=−inf ⟹ scale=0（acc 原本全 0）；mn≥mrun 恒成立（指数 ≤0）
+                let sc0 = if mrun0 == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    fexp((mrun0 - mn0) * q_scale)
+                };
+                let sc1 = if mrun1 == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    fexp((mrun1 - mn1) * q_scale)
+                };
+                v3_scale16(&mut acc0, sc0);
+                v3_scale16(&mut acc1, sc1);
+                lrun0 *= sc0;
+                lrun1 *= sc1;
+                let mnf0 = if mn0 == f32::NEG_INFINITY {
+                    f32::NEG_INFINITY
+                } else {
+                    -mn0 * qs2
+                };
+                let mnf1 = if mn1 == f32::NEG_INFINITY {
+                    f32::NEG_INFINITY
+                } else {
+                    -mn1 * qs2
+                };
+                let mut ls0 = 0.0f32;
+                let mut ls1 = 0.0f32;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let vb = jj * (NV * 4) + sl;
+                    let vf0 = *vsm.add(vb);
+                    let vf1 = *vsm.add(vb + NV);
+                    let vf2 = *vsm.add(vb + 2 * NV);
+                    let vf3 = *vsm.add(vb + 3 * NV);
+                    let p0 = fexp2(fma(*psm.add(pb0 + jj), qs2, mnf0));
+                    let p1 = fexp2(fma(*psm.add(pb1 + jj), qs2, mnf1));
+                    ls0 += p0;
+                    ls1 += p1;
+                    v3_acc16(&mut acc0, p0, &vf0, &vf1, &vf2, &vf3);
+                    v3_acc16(&mut acc1, p1, &vf0, &vf1, &vf2, &vf3);
+                    jj += 1;
+                }
+                lrun0 += ls0;
+                lrun1 += ls1;
+                mrun0 = mn0;
+                mrun1 = mn1;
+                _syncthreads();
+                c0 += KT;
+            }
+            // ── 段末落盘（js=1 写 out；js>1 写偏结果供 attn_combine，
+            // 空分片/全掩码行天然落 (−inf,0)：mrun=−inf、lrun=0、acc=0）
+            if js == 1 {
+                if live0 {
+                    let ob = rg0 * hd + 16 * sl;
+                    let mut l = 0usize;
+                    while l < 16 {
+                        *out.add(ob + l) = f32_to_bf16(acc0[l] / lrun0);
+                        l += 1;
+                    }
+                }
+                if live1 {
+                    let ob = rg1 * hd + 16 * sl;
+                    let mut l = 0usize;
+                    while l < 16 {
+                        *out.add(ob + l) = f32_to_bf16(acc1[l] / lrun1);
+                        l += 1;
+                    }
+                }
+            } else {
+                if live0 {
+                    let base = rg0 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun0 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun0;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 16 * sl);
+                    let mut l = 0usize;
+                    while l < 16 {
+                        *pa.add(l) = acc0[l];
+                        l += 1;
+                    }
+                }
+                if live1 {
+                    let base = rg1 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun1 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun1;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 16 * sl);
+                    let mut l = 0usize;
+                    while l < 16 {
+                        *pa.add(l) = acc1[l];
+                        l += 1;
+                    }
+                }
+            }
+            pass += 1;
+        }
+        u0 = u1;
+    }
+}
+
+macro_rules! v3_export {
+    ($name:ident, $nv:literal, $kt:literal) => {
+        /// v3 档（smem K/V tile + shfl 归约）：prefill 长序列容差档。
+        /// `ntok` = Br、`chunk`/`scratch` 忽略（ABI 与单遍档同形）。
+        /// hd = NV×16 由变体钉死（host 侧按 head_dim 选入口）。
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            q: *const u16,
+            k_cache: *const u8,
+            v_cache: *const u8,
+            block_table: *const u32,
+            seq_ids: *const u32,
+            positions: *const u32,
+            out: *mut u16,
+            part_acc: *mut f32,
+            part_ml: *mut f32,
+            q_scale: f32,
+            bpr: u32,
+            block_size: u32,
+            q_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            tokens: u32,
+            ntok: u32,
+            jsplit: u32,
+            chunk: u32,
+            scratch: *mut f32,
+        ) {
+            v3_body::<$nv, $kt>(
+                q, k_cache, v_cache, block_table, seq_ids, positions, out, part_acc, part_ml,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, ntok, jsplit,
+                chunk, scratch,
+            )
+        }
+    };
+}
+
+/// v3 档变体：NV=维 lane 数（hd/16）、KT=K/V tile token 数。
+/// KT=32 档未导：K+V 双 tile = 64KB 超静态 .shared 48KB/块硬顶
+/// （动态 smem+属性可解，但 sm_89 静态档先吃 16 的收益）
+v3_export!(paged_attn_v3_n16k16, 16, 16);
+v3_export!(paged_attn_v3_n16k8, 16, 8);
+v3_export!(paged_attn_v3_n8k16, 8, 16);
+v3_export!(paged_attn_v3_n8k8, 8, 8);
+
+// ═══ v3c：NV=32（全 warp 单一行组，gpw=1）× ND=8 维/lane × RL=4 行/lane ═══
+// 相对 n16 的两笔账：① gpw=1 ⟹ K/V 的 smem 读不被行组复制（n16 每 warp
+// 每 jj 两组合载 2KB 供 4 行；v3c 单组 1KB 供 4 行——(row,jj) smem 读减半）
+// ② 点积 8 fma + 5 级 bfly、PV 8 fma：(row,jj) 指令 ~17 vs n16 ~30。
+// q/acc 状态 4 行 × 8 维 = 64 寄存器全程标量化（运行时索引必落 local，
+// 纪律同 n16/online）。smem 槽 swizzle slot(g)=(g%2)·32+g/2（g = 4 维组号
+// ∈[0,64) 双射；lane sl 读 g=2sl,2sl+1 ⟹ 槽 sl 与 32+sl，LDS.128 相位内
+// bank 4sl%32 互异无冲突）。在线 softmax/jsplit 偏量/掩码 −inf/ex2 折叠
+// 语义与 v3/online 逐字一致，attn_combine 不改。hd=256 专用（NV·ND=256）。
+
+/// v3c staging：global bf16 → smem f32（槽 (g%2)·32+g/2 落位）
+#[inline(always)]
+unsafe fn v3c_stage8(dst: *mut F4, src: *const u8, ebase: usize, jj: usize, c: usize) {
+    let p = src as *const u16;
+    let a = bf16x4(*(p.add(ebase) as *const u64));
+    let b = bf16x4(*(p.add(ebase + 4) as *const u64));
+    let tbase = jj * 64;
+    *dst.add(tbase + c) =
+        F4([bf16_to_f32(a[0]), bf16_to_f32(a[1]), bf16_to_f32(a[2]), bf16_to_f32(a[3])]);
+    *dst.add(tbase + 32 + c) =
+        F4([bf16_to_f32(b[0]), bf16_to_f32(b[1]), bf16_to_f32(b[2]), bf16_to_f32(b[3])]);
+}
+
+/// q 行 8 维切片载寄存器（const 索引小循环）
+#[inline(always)]
+unsafe fn v3c_qload(q: *const u16, dst: &mut [f32; 8], qb: usize) {
+    let mut k = 0usize;
+    while k < 2 {
+        let qs = bf16x4(*(q.add(qb + 4 * k) as *const u64));
+        dst[4 * k] = bf16_to_f32(qs[0]);
+        dst[4 * k + 1] = bf16_to_f32(qs[1]);
+        dst[4 * k + 2] = bf16_to_f32(qs[2]);
+        dst[4 * k + 3] = bf16_to_f32(qs[3]);
+        k += 1;
+    }
+}
+
+/// 8 维点积 + 全 warp bfly 归约（5 级；全 lane 同和）。
+/// 必须在 warp 收敛点调用：shfl.sync 全掩码，调用侧不得有分支遮蔽。
+/// bfly 归约必须是 +=（远端值累加）——赋值版只拿到远端偏和。
+#[inline(always)]
+fn v3c_dot8(qr: &[f32; 8], k0: &F4, k1: &F4) -> f32 {
+    let mut a = fma(qr[0], k0.0[0], 0.0);
+    let mut b = fma(qr[1], k0.0[1], 0.0);
+    a = fma(qr[2], k0.0[2], a);
+    b = fma(qr[3], k0.0[3], b);
+    a = fma(qr[4], k1.0[0], a);
+    b = fma(qr[5], k1.0[1], b);
+    a = fma(qr[6], k1.0[2], a);
+    b = fma(qr[7], k1.0[3], b);
+    let mut s = a + b;
+    s += shfl_bfly_f32(s, 16);
+    s += shfl_bfly_f32(s, 8);
+    s += shfl_bfly_f32(s, 4);
+    s += shfl_bfly_f32(s, 2);
+    s += shfl_bfly_f32(s, 1);
+    s
+}
+
+/// acc[8] 标量 rescale（const 索引）
+#[inline(always)]
+fn v3c_scale8(acc: &mut [f32; 8], s: f32) {
+    let mut l = 0usize;
+    while l < 8 {
+        acc[l] *= s;
+        l += 1;
+    }
+}
+
+/// acc += p·v（8 维，const 索引）
+#[inline(always)]
+fn v3c_acc8(acc: &mut [f32; 8], p: f32, v0: &F4, v1: &F4) {
+    acc[0] = fma(p, v0.0[0], acc[0]);
+    acc[1] = fma(p, v0.0[1], acc[1]);
+    acc[2] = fma(p, v0.0[2], acc[2]);
+    acc[3] = fma(p, v0.0[3], acc[3]);
+    acc[4] = fma(p, v1.0[0], acc[4]);
+    acc[5] = fma(p, v1.0[1], acc[5]);
+    acc[6] = fma(p, v1.0[2], acc[6]);
+    acc[7] = fma(p, v1.0[3], acc[7]);
+}
+
+/// v3c 主循环：结构逐行对位 v3_body（见上），差异只在行几何
+/// （RL=4、ND=8、gpw=1、staging nch=hd/8=32、槽 swizzle）。
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn v3c_body<const KT: usize>(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    _head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    _chunk: u32,
+    _scratch: *mut f32,
+) {
+    const RL: usize = 4;
+    let hd = 256usize;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let ng = udiv(qh_n, kv_n);
+    let nt = ntok as usize; // = Br
+    let js = jsplit as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = ntile - 1 - udiv(rest, js); // 反序：长 span 块先发射藏因果尾
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows = tn * ng;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+    let nw = udiv(bdim, 32);
+    let warp = udiv(tau, 32);
+    let sl = urem(tau, 32); // 维 lane（持 [8sl, 8sl+8)）
+    let npass = udiv(rows + nw * RL - 1, nw * RL);
+    let (ksm, vsm, psm) = v3_smem::<KT>();
+    // pbuf 存 raw 点积（不乘 q_scale）；pass2 折叠：p = 2^(s·qs2 − mn·qs2)，
+    // 掩码位 s=−inf → fma(−inf,qs2,mnf)=−inf → ex2=+0，免 selp/免分支。
+    // 空 tile（mn=−inf）走 mnf=−inf 同式归零，acc/l 不被污染。
+    let qs2 = q_scale * 1.4426950408889634;
+
+    // 多 seq 回退：块内逐段（连续同 seq 的 token 段）重跑同一套 tile 机制，
+    // 段外行 mask 成 −inf（p=0 不污染状态）；uniform 快路 = 单段零浪费
+    let mut u0 = 0usize;
+    while u0 < tn {
+        let s_seq = *seq_ids.add(t0 + u0) as usize;
+        let mut u1 = u0 + 1;
+        while u1 < tn && *seq_ids.add(t0 + u1) as usize == s_seq {
+            u1 += 1;
+        }
+        let mut pmax = 0usize;
+        let mut u = u0;
+        while u < u1 {
+            let p = *positions.add(t0 + u) as usize;
+            pmax = if p > pmax { p } else { pmax };
+            u += 1;
+        }
+        let lspan = udiv(pmax + js, js);
+        let jmax = pmax + 1;
+        let j0 = sp * lspan;
+        let j1 = if j0 + lspan < jmax { j0 + lspan } else { jmax };
+        let mut pass = 0usize;
+        while pass < npass {
+            // 本 warp 本 pass 的行批：RL=4 行全标量化（运行时索引会落 local）。
+            let rb = (pass * nw + warp) * RL;
+            let tt0 = udiv(rb, ng);
+            let live0 = rb < rows && tt0 >= u0 && tt0 < u1;
+            let r1 = rb + 1;
+            let tt1 = udiv(r1, ng);
+            let live1 = r1 < rows && tt1 >= u0 && tt1 < u1;
+            let r2 = rb + 2;
+            let tt2 = udiv(r2, ng);
+            let live2 = r2 < rows && tt2 >= u0 && tt2 < u1;
+            let r3 = rb + 3;
+            let tt3 = udiv(r3, ng);
+            let live3 = r3 < rows && tt3 >= u0 && tt3 < u1;
+            let mut pr0 = 0usize;
+            let mut pr1 = 0usize;
+            let mut pr2 = 0usize;
+            let mut pr3 = 0usize;
+            let mut rg0 = 0usize;
+            let mut rg1 = 0usize;
+            let mut rg2 = 0usize;
+            let mut rg3 = 0usize;
+            let mut qreg0 = [0.0f32; 8];
+            let mut qreg1 = [0.0f32; 8];
+            let mut qreg2 = [0.0f32; 8];
+            let mut qreg3 = [0.0f32; 8];
+            if live0 {
+                pr0 = *positions.add(t0 + tt0) as usize;
+                rg0 = (t0 + tt0) * qh_n + kh * ng + urem(rb, ng);
+                v3c_qload(q, &mut qreg0, rg0 * hd + 8 * sl);
+            }
+            if live1 {
+                pr1 = *positions.add(t0 + tt1) as usize;
+                rg1 = (t0 + tt1) * qh_n + kh * ng + urem(r1, ng);
+                v3c_qload(q, &mut qreg1, rg1 * hd + 8 * sl);
+            }
+            if live2 {
+                pr2 = *positions.add(t0 + tt2) as usize;
+                rg2 = (t0 + tt2) * qh_n + kh * ng + urem(r2, ng);
+                v3c_qload(q, &mut qreg2, rg2 * hd + 8 * sl);
+            }
+            if live3 {
+                pr3 = *positions.add(t0 + tt3) as usize;
+                rg3 = (t0 + tt3) * qh_n + kh * ng + urem(r3, ng);
+                v3c_qload(q, &mut qreg3, rg3 * hd + 8 * sl);
+            }
+            let mut acc0 = [0.0f32; 8];
+            let mut acc1 = [0.0f32; 8];
+            let mut acc2 = [0.0f32; 8];
+            let mut acc3 = [0.0f32; 8];
+            let mut mrun0 = f32::NEG_INFINITY;
+            let mut mrun1 = f32::NEG_INFINITY;
+            let mut mrun2 = f32::NEG_INFINITY;
+            let mut mrun3 = f32::NEG_INFINITY;
+            let mut lrun0 = 0.0f32;
+            let mut lrun1 = 0.0f32;
+            let mut lrun2 = 0.0f32;
+            let mut lrun3 = 0.0f32;
+            let pb0 = (warp * RL) * KT;
+            let pb1 = pb0 + KT;
+            let pb2 = pb1 + KT;
+            let pb3 = pb2 + KT;
+            let mut c0 = j0;
+            while c0 < j1 {
+                let cc = if c0 + KT < j1 { KT } else { j1 - c0 };
+                // ── staging：K/V tile 协作装载（bf16→f32 解包 + swizzle）
+                let nch = 32usize; // 每 token 的 16B chunk 数 = hd/8
+                let nent = cc * nch;
+                let mut e = tau;
+                while e < nent {
+                    let jj = e / 32;
+                    let c = e % 32;
+                    let slot = slot_of(block_table, s_seq, c0 + jj, bpr, bs);
+                    let ebase = slot * he + kh * hd + c * 8;
+                    v3c_stage8(ksm, k_cache, ebase, jj, c);
+                    v3c_stage8(vsm, v_cache, ebase, jj, c);
+                    e += bdim;
+                }
+                _syncthreads();
+                // ── pass1：QK 点积（K 读一次供 RL=4 行）→ 全 warp bfly → pbuf(raw)
+                let mut jj = 0usize;
+                while jj < cc {
+                    let kb = jj * 64 + sl;
+                    let kf0 = *ksm.add(kb);
+                    let kf1 = *ksm.add(kb + 32);
+                    let s0 = v3c_dot8(&qreg0, &kf0, &kf1);
+                    let s1 = v3c_dot8(&qreg1, &kf0, &kf1);
+                    let s2 = v3c_dot8(&qreg2, &kf0, &kf1);
+                    let s3 = v3c_dot8(&qreg3, &kf0, &kf1);
+                    let j = c0 + jj;
+                    let sc0 = if live0 && j <= pr0 { s0 } else { f32::NEG_INFINITY };
+                    let sc1 = if live1 && j <= pr1 { s1 } else { f32::NEG_INFINITY };
+                    let sc2 = if live2 && j <= pr2 { s2 } else { f32::NEG_INFINITY };
+                    let sc3 = if live3 && j <= pr3 { s3 } else { f32::NEG_INFINITY };
+                    if sl == 0 {
+                        *psm.add(pb0 + jj) = sc0;
+                        *psm.add(pb1 + jj) = sc1;
+                        *psm.add(pb2 + jj) = sc2;
+                        *psm.add(pb3 + jj) = sc3;
+                    }
+                    jj += 1;
+                }
+                bar_warp_sync(0xffff_ffff); // pbuf 写 → 读的 warp 内可见性
+                // ── pass2：tile max(raw 域) → 在线合并系数 → p·V（V 载一次供四行）
+                let mut tm0 = f32::NEG_INFINITY;
+                let mut tm1 = f32::NEG_INFINITY;
+                let mut tm2 = f32::NEG_INFINITY;
+                let mut tm3 = f32::NEG_INFINITY;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let x0 = *psm.add(pb0 + jj);
+                    let x1 = *psm.add(pb1 + jj);
+                    let x2 = *psm.add(pb2 + jj);
+                    let x3 = *psm.add(pb3 + jj);
+                    tm0 = if x0 > tm0 { x0 } else { tm0 };
+                    tm1 = if x1 > tm1 { x1 } else { tm1 };
+                    tm2 = if x2 > tm2 { x2 } else { tm2 };
+                    tm3 = if x3 > tm3 { x3 } else { tm3 };
+                    jj += 1;
+                }
+                let mn0 = if tm0 > mrun0 { tm0 } else { mrun0 };
+                let mn1 = if tm1 > mrun1 { tm1 } else { mrun1 };
+                let mn2 = if tm2 > mrun2 { tm2 } else { mrun2 };
+                let mn3 = if tm3 > mrun3 { tm3 } else { mrun3 };
+                // mrun=−inf ⟹ scale=0（acc 原本全 0）；mn≥mrun 恒成立（指数 ≤0）
+                let sc0 = if mrun0 == f32::NEG_INFINITY { 0.0 } else { fexp((mrun0 - mn0) * q_scale) };
+                let sc1 = if mrun1 == f32::NEG_INFINITY { 0.0 } else { fexp((mrun1 - mn1) * q_scale) };
+                let sc2 = if mrun2 == f32::NEG_INFINITY { 0.0 } else { fexp((mrun2 - mn2) * q_scale) };
+                let sc3 = if mrun3 == f32::NEG_INFINITY { 0.0 } else { fexp((mrun3 - mn3) * q_scale) };
+                v3c_scale8(&mut acc0, sc0);
+                v3c_scale8(&mut acc1, sc1);
+                v3c_scale8(&mut acc2, sc2);
+                v3c_scale8(&mut acc3, sc3);
+                lrun0 *= sc0;
+                lrun1 *= sc1;
+                lrun2 *= sc2;
+                lrun3 *= sc3;
+                let mnf0 = if mn0 == f32::NEG_INFINITY { f32::NEG_INFINITY } else { -mn0 * qs2 };
+                let mnf1 = if mn1 == f32::NEG_INFINITY { f32::NEG_INFINITY } else { -mn1 * qs2 };
+                let mnf2 = if mn2 == f32::NEG_INFINITY { f32::NEG_INFINITY } else { -mn2 * qs2 };
+                let mnf3 = if mn3 == f32::NEG_INFINITY { f32::NEG_INFINITY } else { -mn3 * qs2 };
+                let mut ls0 = 0.0f32;
+                let mut ls1 = 0.0f32;
+                let mut ls2 = 0.0f32;
+                let mut ls3 = 0.0f32;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let vb = jj * 64 + sl;
+                    let vf0 = *vsm.add(vb);
+                    let vf1 = *vsm.add(vb + 32);
+                    let p0 = fexp2(fma(*psm.add(pb0 + jj), qs2, mnf0));
+                    let p1 = fexp2(fma(*psm.add(pb1 + jj), qs2, mnf1));
+                    let p2 = fexp2(fma(*psm.add(pb2 + jj), qs2, mnf2));
+                    let p3 = fexp2(fma(*psm.add(pb3 + jj), qs2, mnf3));
+                    ls0 += p0;
+                    ls1 += p1;
+                    ls2 += p2;
+                    ls3 += p3;
+                    v3c_acc8(&mut acc0, p0, &vf0, &vf1);
+                    v3c_acc8(&mut acc1, p1, &vf0, &vf1);
+                    v3c_acc8(&mut acc2, p2, &vf0, &vf1);
+                    v3c_acc8(&mut acc3, p3, &vf0, &vf1);
+                    jj += 1;
+                }
+                lrun0 += ls0;
+                lrun1 += ls1;
+                lrun2 += ls2;
+                lrun3 += ls3;
+                mrun0 = mn0;
+                mrun1 = mn1;
+                mrun2 = mn2;
+                mrun3 = mn3;
+                _syncthreads();
+                c0 += KT;
+            }
+            // ── 段末落盘（js=1 写 out；js>1 写偏结果供 attn_combine，
+            // 空分片/全掩码行天然落 (−inf,0)：mrun=−inf、lrun=0、acc=0）
+            if js == 1 {
+                if live0 {
+                    let ob = rg0 * hd + 8 * sl;
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *out.add(ob + l) = f32_to_bf16(acc0[l] / lrun0);
+                        l += 1;
+                    }
+                }
+                if live1 {
+                    let ob = rg1 * hd + 8 * sl;
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *out.add(ob + l) = f32_to_bf16(acc1[l] / lrun1);
+                        l += 1;
+                    }
+                }
+                if live2 {
+                    let ob = rg2 * hd + 8 * sl;
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *out.add(ob + l) = f32_to_bf16(acc2[l] / lrun2);
+                        l += 1;
+                    }
+                }
+                if live3 {
+                    let ob = rg3 * hd + 8 * sl;
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *out.add(ob + l) = f32_to_bf16(acc3[l] / lrun3);
+                        l += 1;
+                    }
+                }
+            } else {
+                if live0 {
+                    let base = rg0 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun0 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun0;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 8 * sl);
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *pa.add(l) = acc0[l];
+                        l += 1;
+                    }
+                }
+                if live1 {
+                    let base = rg1 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun1 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun1;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 8 * sl);
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *pa.add(l) = acc1[l];
+                        l += 1;
+                    }
+                }
+                if live2 {
+                    let base = rg2 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun2 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun2;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 8 * sl);
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *pa.add(l) = acc2[l];
+                        l += 1;
+                    }
+                }
+                if live3 {
+                    let base = rg3 * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun3 * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun3;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 8 * sl);
+                    let mut l = 0usize;
+                    while l < 8 {
+                        *pa.add(l) = acc3[l];
+                        l += 1;
+                    }
+                }
+            }
+            pass += 1;
+        }
+        u0 = u1;
+    }
+}
+
+macro_rules! v3c_export {
+    ($name:ident, $kt:literal) => {
+        /// v3c 档（NV=32 单行组 + RL=4）：prefill 长序列容差档，hd=256 专用。
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            q: *const u16,
+            k_cache: *const u8,
+            v_cache: *const u8,
+            block_table: *const u32,
+            seq_ids: *const u32,
+            positions: *const u32,
+            out: *mut u16,
+            part_acc: *mut f32,
+            part_ml: *mut f32,
+            q_scale: f32,
+            bpr: u32,
+            block_size: u32,
+            q_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            tokens: u32,
+            ntok: u32,
+            jsplit: u32,
+            chunk: u32,
+            scratch: *mut f32,
+        ) {
+            v3c_body::<$kt>(
+                q, k_cache, v_cache, block_table, seq_ids, positions, out, part_acc, part_ml,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, ntok, jsplit,
+                chunk, scratch,
+            )
+        }
+    };
+}
+
+v3c_export!(paged_attn_v3_n32k16, 16);
+v3c_export!(paged_attn_v3_n32k8, 8);
+
+// ═══ v3b：ND=32 维/lane × NV=8 lane/行组 × RL=1（hd=256 专用档）═══
+// 与 v3 的几何差异：warp 的 32 lane = 4 行组 × 8 维 lane，每条 shfl 链 3 级
+// （v3 是 4 级），一条 warp 指令同步推进 4 行（v3 是 2 组×RL2 行间串行）。
+// pbuf 存 raw 点积、掩码 −inf、ex2 折叠 q_scale·log2e、jsplit 偏量语义
+// 与 v3/online 完全一致。行态标量化纪律同 v3（运行时索引数组会落 local）。
+
+/// v3b staging：token 槽 = NV×8 个 F4（ND=32）。槽位 = 转置 swizzle
+/// slot(g) = NV·(g%NV) + g/NV（g = F4 chunk 号 ∈ [0,64)）：
+/// 对 NV=8 是 [0,64) 双射（旧式 (g%4)·NV+g/4 在 NV=8 时 g/4≥NV 碰撞），
+/// 且 lane sl 读 chunk g=NV·sl+i ⟹ slot%NV=sl，v4 载跨 lane 无 bank 冲突。
+#[inline(always)]
+unsafe fn v3b_stage8<const NV: usize>(
+    dst: *mut F4,
+    src: *const u8,
+    ebase: usize,
+    jj: usize,
+    c: usize,
+) {
+    let p = src as *const u16;
+    let a = bf16x4(*(p.add(ebase) as *const u64));
+    let b = bf16x4(*(p.add(ebase + 4) as *const u64));
+    let g0 = 2 * c;
+    let g1 = 2 * c + 1;
+    let tbase = jj * (NV * 8);
+    *dst.add(tbase + (g0 % NV) * NV + g0 / NV) =
+        F4([bf16_to_f32(a[0]), bf16_to_f32(a[1]), bf16_to_f32(a[2]), bf16_to_f32(a[3])]);
+    *dst.add(tbase + (g1 % NV) * NV + g1 / NV) =
+        F4([bf16_to_f32(b[0]), bf16_to_f32(b[1]), bf16_to_f32(b[2]), bf16_to_f32(b[3])]);
+}
+
+/// q 行 32 维切片载寄存器
+#[inline(always)]
+unsafe fn v3b_qload(q: *const u16, dst: &mut [f32; 32], qb: usize) {
+    let mut k = 0usize;
+    while k < 8 {
+        let qs = bf16x4(*(q.add(qb + 4 * k) as *const u64));
+        dst[4 * k] = bf16_to_f32(qs[0]);
+        dst[4 * k + 1] = bf16_to_f32(qs[1]);
+        dst[4 * k + 2] = bf16_to_f32(qs[2]);
+        dst[4 * k + 3] = bf16_to_f32(qs[3]);
+        k += 1;
+    }
+}
+
+/// 32 维切片点积 + 段内 bfly 归约（3 级，NV lane 同和）。收敛点调用。
+/// sb = tile 内 F4 槽基（jj·NV·8 + sl）；转置槽位映射下：
+/// sb+m·NV = 槽 8m+sl 持维 [32sl+4m, +4)，
+/// sb+m·NV+NV·(NV/2) = 槽 8(m+4)+sl 持维 [32sl+16+4m, +4)。
+#[inline(always)]
+fn v3b_dot32<const NV: usize>(qr: &[f32; 32], ksm: *mut F4, sb: usize) -> f32 {
+    let mut ch = [0.0f32; 4];
+    let mut m = 0usize;
+    while m < 4 {
+        let k0 = unsafe { *ksm.add(sb + m * NV) };
+        let k1 = unsafe { *ksm.add(sb + m * NV + NV * (NV / 2)) };
+        ch[0] = fma(qr[4 * m], k0.0[0], ch[0]);
+        ch[1] = fma(qr[4 * m + 1], k0.0[1], ch[1]);
+        ch[2] = fma(qr[4 * m + 2], k0.0[2], ch[2]);
+        ch[3] = fma(qr[4 * m + 3], k0.0[3], ch[3]);
+        ch[0] = fma(qr[16 + 4 * m], k1.0[0], ch[0]);
+        ch[1] = fma(qr[16 + 4 * m + 1], k1.0[1], ch[1]);
+        ch[2] = fma(qr[16 + 4 * m + 2], k1.0[2], ch[2]);
+        ch[3] = fma(qr[16 + 4 * m + 3], k1.0[3], ch[3]);
+        m += 1;
+    }
+    let mut s = (ch[0] + ch[1]) + (ch[2] + ch[3]);
+    let mut off = NV / 2;
+    while off > 0 {
+        s += shfl_bfly_f32(s, off as i32);
+        off /= 2;
+    }
+    s
+}
+
+/// acc[32] += p·v 已内联在 v3b_body 的 pass2（槽位映射同 v3b_dot32）。
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn v3b_body<const NV: usize, const KT: usize>(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    _head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    _chunk: u32,
+    _scratch: *mut f32,
+) {
+    let hd = NV * 32;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let ng = udiv(qh_n, kv_n);
+    let nt = ntok as usize; // = Br
+    let js = jsplit as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let gpw = 32 / NV; // 行组/warp（RL=1 ⟹ 行/warp/pass）
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = ntile - 1 - udiv(rest, js); // 反序：长 span 块先发射藏因果尾
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows = tn * ng;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+    let nw = udiv(bdim, 32);
+    let warp = udiv(tau, 32);
+    let lane32 = urem(tau, 32);
+    let g = udiv(lane32, NV); // 行组号
+    let sl = urem(lane32, NV); // 维 lane（持 [32sl, 32sl+32)）
+    let npass = udiv(rows + nw * gpw - 1, nw * gpw);
+    let (ksm, vsm, psm) = v3_smem::<KT>();
+    let qs2 = q_scale * 1.4426950408889634;
+
+    let mut u0 = 0usize;
+    while u0 < tn {
+        let s_seq = *seq_ids.add(t0 + u0) as usize;
+        let mut u1 = u0 + 1;
+        while u1 < tn && *seq_ids.add(t0 + u1) as usize == s_seq {
+            u1 += 1;
+        }
+        let mut pmax = 0usize;
+        let mut u = u0;
+        while u < u1 {
+            let p = *positions.add(t0 + u) as usize;
+            pmax = if p > pmax { p } else { pmax };
+            u += 1;
+        }
+        let lspan = udiv(pmax + js, js);
+        let jmax = pmax + 1;
+        let j0 = sp * lspan;
+        let j1 = if j0 + lspan < jmax { j0 + lspan } else { jmax };
+        let mut pass = 0usize;
+        while pass < npass {
+            let row = (pass * nw + warp) * gpw + g;
+            let tt = udiv(row, ng);
+            let live = row < rows && tt >= u0 && tt < u1;
+            let mut pr = 0usize;
+            let mut rg = 0usize;
+            let mut qreg = [0.0f32; 32];
+            if live {
+                pr = *positions.add(t0 + tt) as usize;
+                rg = (t0 + tt) * qh_n + kh * ng + urem(row, ng);
+                v3b_qload(q, &mut qreg, rg * hd + 32 * sl);
+            }
+            let mut acc = [0.0f32; 32];
+            let mut mrun = f32::NEG_INFINITY;
+            let mut lrun = 0.0f32;
+            let pb = (warp * gpw + g) * KT;
+            let mut c0 = j0;
+            while c0 < j1 {
+                let cc = if c0 + KT < j1 { KT } else { j1 - c0 };
+                // staging（nch = hd/8 = NV×4 chunk/token）
+                let nch = NV * 4;
+                let nent = cc * nch;
+                let mut e = tau;
+                while e < nent {
+                    let jj = udiv(e, nch);
+                    let c = urem(e, nch);
+                    let slot = slot_of(block_table, s_seq, c0 + jj, bpr, bs);
+                    let ebase = slot * he + kh * hd + c * 8;
+                    v3b_stage8::<NV>(ksm, k_cache, ebase, jj, c);
+                    v3b_stage8::<NV>(vsm, v_cache, ebase, jj, c);
+                    e += bdim;
+                }
+                _syncthreads();
+                // pass1：QK + 3 级 bfly + 融合 tile max（全 lane 冗余同值）→ pbuf(raw)
+                let mut tm = f32::NEG_INFINITY;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let s = v3b_dot32::<NV>(&qreg, ksm, jj * (NV * 8) + sl);
+                    let j = c0 + jj;
+                    let sc = if live && j <= pr { s } else { f32::NEG_INFINITY };
+                    tm = if sc > tm { sc } else { tm };
+                    if sl == 0 {
+                        *psm.add(pb + jj) = sc;
+                    }
+                    jj += 1;
+                }
+                bar_warp_sync(0xffff_ffff); // pbuf 写 → 读的 warp 内可见性
+                // pass2：在线合并系数 → p·V（ex2 折叠；空 tile 走 mnf=−inf 归零）
+                let mn = if tm > mrun { tm } else { mrun };
+                let sc = if mrun == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    fexp((mrun - mn) * q_scale)
+                };
+                let mut l = 0usize;
+                while l < 32 {
+                    acc[l] *= sc;
+                    l += 1;
+                }
+                lrun *= sc;
+                let mnf = if mn == f32::NEG_INFINITY {
+                    f32::NEG_INFINITY
+                } else {
+                    -mn * qs2
+                };
+                let mut ls = 0.0f32;
+                let mut jj = 0usize;
+                while jj < cc {
+                    let p = fexp2(fma(*psm.add(pb + jj), qs2, mnf));
+                    ls += p;
+                    let vb = jj * (NV * 8) + sl;
+                    let mut m = 0usize;
+                    while m < 4 {
+                        let v0 = *vsm.add(vb + m * NV);
+                        let v1 = *vsm.add(vb + m * NV + NV * (NV / 2));
+                        acc[4 * m] = fma(p, v0.0[0], acc[4 * m]);
+                        acc[4 * m + 1] = fma(p, v0.0[1], acc[4 * m + 1]);
+                        acc[4 * m + 2] = fma(p, v0.0[2], acc[4 * m + 2]);
+                        acc[4 * m + 3] = fma(p, v0.0[3], acc[4 * m + 3]);
+                        acc[16 + 4 * m] = fma(p, v1.0[0], acc[16 + 4 * m]);
+                        acc[16 + 4 * m + 1] = fma(p, v1.0[1], acc[16 + 4 * m + 1]);
+                        acc[16 + 4 * m + 2] = fma(p, v1.0[2], acc[16 + 4 * m + 2]);
+                        acc[16 + 4 * m + 3] = fma(p, v1.0[3], acc[16 + 4 * m + 3]);
+                        m += 1;
+                    }
+                    jj += 1;
+                }
+                lrun += ls;
+                mrun = mn;
+                _syncthreads();
+                c0 += KT;
+            }
+            // 段末落盘（js=1 写 out；js>1 偏结果，空分片天然 (−inf,0)）
+            if live {
+                if js == 1 {
+                    let ob = rg * hd + 32 * sl;
+                    let mut l = 0usize;
+                    while l < 32 {
+                        *out.add(ob + l) = f32_to_bf16(acc[l] / lrun);
+                        l += 1;
+                    }
+                } else {
+                    let base = rg * js + sp;
+                    if sl == 0 {
+                        *part_ml.add(base * 2) = mrun * q_scale;
+                        *part_ml.add(base * 2 + 1) = lrun;
+                    }
+                    let pa = part_acc.add(base * PART_HD_STRIDE + 32 * sl);
+                    let mut l = 0usize;
+                    while l < 32 {
+                        *pa.add(l) = acc[l];
+                        l += 1;
+                    }
+                }
+            }
+            pass += 1;
+        }
+        u0 = u1;
+    }
+}
+
+macro_rules! v3b_export {
+    ($name:ident, $nv:literal, $kt:literal) => {
+        /// v3b 档（ND=32/NV=8/RL=1）：prefill 长序列容差档，hd=256 专用。
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            q: *const u16,
+            k_cache: *const u8,
+            v_cache: *const u8,
+            block_table: *const u32,
+            seq_ids: *const u32,
+            positions: *const u32,
+            out: *mut u16,
+            part_acc: *mut f32,
+            part_ml: *mut f32,
+            q_scale: f32,
+            bpr: u32,
+            block_size: u32,
+            q_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            tokens: u32,
+            ntok: u32,
+            jsplit: u32,
+            chunk: u32,
+            scratch: *mut f32,
+        ) {
+            v3b_body::<$nv, $kt>(
+                q, k_cache, v_cache, block_table, seq_ids, positions, out, part_acc, part_ml,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, ntok, jsplit,
+                chunk, scratch,
+            )
+        }
+    };
+}
+
+v3b_export!(paged_attn_v3_d32k16, 8, 16);
+v3b_export!(paged_attn_v3_d32k8, 8, 8);
+
 
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
 /// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的

@@ -77,6 +77,30 @@ fn main() {
     }
     prompt.truncate(n);
 
+    // A/B 模式（WEIN_AB=1，配 WEIN_RADIX=0 保两轮皆冷）：v3 关/开交替冷跑，
+    // 同进程对照 TTFT/段表/贪心分叉（attn_long 每次调用现读 WEIN_ATTN_V3）
+    if envn("WEIN_AB", 0) == 1 {
+        // 暖场（gemm 调优/L2/模块惰性都在首轮；短 prompt 一发，结果不入表）
+        let warm = &prompt[..256.min(prompt.len())];
+        std::env::set_var("WEIN_ATTN_V3", "0");
+        let _ = run_turn(&mut ex, 99, warm, 1, 256);
+        let a = run_turn(&mut ex, 1, &prompt, gen, chunk);
+        std::env::set_var("WEIN_ATTN_V3", "1");
+        let b = run_turn(&mut ex, 2, &prompt, gen, chunk);
+        let div = a.tokens.iter().zip(b.tokens.iter()).filter(|(x, y)| x != y).count();
+        let p50a = p50(&a.gen_ms);
+        let p50b = p50(&b.gen_ms);
+        println!("\n| 臂 | WEIN_ATTN_V3 | 前缀命中 | TTFT ms | ITL p50 ms |");
+        println!("|---|---|---|---|---|");
+        println!("| 旧（在线 n8r4） | 0 | {} | {:.1} | {:.2} |", a.hit, a.ttft_ms, p50a);
+        println!("| 新（v3） | 1 | {} | {:.1} | {:.2} |", b.hit, b.ttft_ms, p50b);
+        println!(
+            "\n贪心 {}t 分叉数：{}/{}（v3 是容差档，分叉允许存在，如实报数）",
+            gen, div, a.tokens.len().min(b.tokens.len())
+        );
+        return;
+    }
+
     // 冷跑（chunk）、第二次（radix 命中）、第三次（另一个 chunk 粒度）
     let t1 = run_turn(&mut ex, 1, &prompt, gen, chunk);
     let t2 = run_turn(&mut ex, 2, &prompt, gen, chunk);

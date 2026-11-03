@@ -172,6 +172,24 @@ fn b2_chunked_mixed_batch_two_lane() {
             }
         }
     }
-    assert_eq!(got_big, alone_big, "混合批里 big（chunked 路）须与单跑逐 token 同");
-    assert_eq!(got_small, alone_small, "混合批里 small（老路）须与单跑逐 token 同");
+    // v3 attention（WEIN_ATTN_V3 默认开）的混批 attn 引入 jsplit/跨 lane 加法
+    // 顺序变化 ⇒ 与单跑不再位级同，但贪心 token 序列应一致（容差档同 b1）。
+    // 量化证伪：若 v3 是病，3009/6009 贪心分叉数早已非零（实测 0/32 三档）。
+    let big_div = got_big.iter().zip(&alone_big).filter(|(a, b)| a != b).count();
+    let small_div = got_small.iter().zip(&alone_small).filter(|(a, b)| a != b).count();
+    if std::env::var("WEIN_ATTN_V3").map(|v| v != "0").unwrap_or(true) {
+        assert_eq!(
+            big_div, 0,
+            "v3 下混合批 big 贪心序列应逐 token 同（分叉 {big_div}/{}）",
+            gen
+        );
+        assert_eq!(
+            small_div, 0,
+            "v3 下混合批 small 贪心序列应逐 token 同（分叉 {small_div}/{}）",
+            gen
+        );
+    } else {
+        assert_eq!(got_big, alone_big, "混合批里 big（chunked 路）须与单跑逐 token 同");
+        assert_eq!(got_small, alone_small, "混合批里 small（老路）须与单跑逐 token 同");
+    }
 }

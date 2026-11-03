@@ -196,6 +196,18 @@ impl OpTable<'_> {
             bscratch: gpu.alloc_bytes(BLK_SCRATCH_FLOATS * 4),
             pacc_b: gpu.alloc_bytes(BLK_PART_ROWS * BLK_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
             pml_b: gpu.alloc_bytes(BLK_PART_ROWS * BLK_SPLIT_CAP * 2 * 4),
+            f_v3: [
+                m.func("paged_attn_v3_n16k16"),
+                m.func("paged_attn_v3_n16k8"),
+                m.func("paged_attn_v3_n8k16"),
+                m.func("paged_attn_v3_n8k8"),
+                m.func("paged_attn_v3_d32k16"),
+                m.func("paged_attn_v3_d32k8"),
+                m.func("paged_attn_v3_n32k16"),
+                m.func("paged_attn_v3_n32k8"),
+            ],
+            pacc_v3: gpu.alloc_bytes(V3_PART_ROWS * V3_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
+            pml_v3: gpu.alloc_bytes(V3_PART_ROWS * V3_SPLIT_CAP * 2 * 4),
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -1404,6 +1416,8 @@ pub struct PagedAttnCuda<'a> {
     f_blk_f32: Func,
     /// qblk 档变体表（K/V 行片驻寄存器供全 q 行）：顺序 = `QblkVar::ALL`
     f_qblk: [Func; 6],
+    /// v3 档变体表（smem K/V tile + shfl 归约）：顺序 = `V3Var::ALL`
+    f_v3: [Func; 8],
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
     /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
@@ -1414,6 +1428,11 @@ pub struct PagedAttnCuda<'a> {
     /// 块档 j 分片偏结果（rows 上限 BLK_PART_ROWS，比旧档大 4 倍）
     pacc_b: DevBuf<'a>,
     pml_b: DevBuf<'a>,
+    /// v3 档 j 分片偏结果：rows 上限 V3_PART_ROWS（8192 token × 16 q 头），
+    /// 分片 ≤ V3_SPLIT_CAP——v3 无块私有 scratch（状态全驻寄存器+smem），
+    /// 偏结果表是它唯一的全局侧存
+    pacc_v3: DevBuf<'a>,
+    pml_v3: DevBuf<'a>,
 }
 
 /// attn 块数容量上限：T_MAX(512) × q_heads(32)——超容显式 assert
@@ -1479,6 +1498,20 @@ const BLK_BDIM_CAP: usize = 512;
 /// qblk 档线程上限：r8/r16 系 ~128+ regs ⇒ 65536/regs ≈ 384-512；几何按
 /// `Gpu::func_attribute`（NUM_REGS）实测夹紧（探针报告口径），512 是兜底
 const QBLK_BDIM_CAP: usize = 512;
+
+// ── v3 档（smem K/V tile + shfl 归约）容量账 ──
+/// v3 线程上限：任务纪律 bdim ≤ 384（128 regs × 384 = 49k ≤ 64k/SM 仍够
+/// 2 块/SM 的起评点；kt16 档 smem 35KB/块 ⇒ 2 块/SM ≈ 70KB ≤ 100KB）
+pub const V3_BDIM_CAP: usize = 384;
+/// v3 Br（ntok）上限：Br 只是行批分片粒度（npass 随之涨），上限防呆
+pub const V3_BR_CAP: usize = 512;
+/// v3 j 分片偏结果行容量：8192 token × 16 q 头（ctx 8192 全程不切片）
+pub const V3_PART_ROWS: usize = 131072;
+/// v3 j 分片上限：v3 无 span cap（流式 tile），长序列 js=1 块数已足；
+/// 分片只在小形状补并行度（o37 强制档 + 自动规则 base<256 → js=2）
+pub const V3_SPLIT_CAP: usize = 2;
+/// v3 并行目标块数（同 BLK_TARGET_BLOCKS 的定尺依据）
+pub const V3_TARGET_BLOCKS: usize = 256;
 
 // ── 单遍档的几何 / dtype 旋钮（A/B 判别仪器） ──
 
@@ -1659,6 +1692,158 @@ impl QblkCfg {
         Self { variant: QblkVar::N16R8J4, bdim: 384, jchunk: 32, jsplit: 0 }
     }
 }
+
+// ── v3 档（smem K/V tile + shfl 归约）的旋钮与几何 ──
+
+/// v3 档的编译期变体（`v3_export!` 的单态实体，枚举序 = `f_v3` 表序）。
+/// NV=维 lane 数（hd/16，由 head_dim 钉死）、KT=smem K/V tile 的 token 数
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum V3Var {
+    N16K16,
+    N16K8,
+    N8K16,
+    N8K8,
+    /// ND=32/NV=8/RL=1 档（hd=256 专用）：shfl 链 3 级、warp 同步推 4 行
+    D32K16,
+    D32K8,
+    /// NV=32 单行组/ND=8/RL=4 档（hd=256 专用）：gpw=1 消 K 跨组复制
+    N32K16,
+    N32K8,
+}
+
+impl V3Var {
+    pub const ALL: [V3Var; 8] = [
+        V3Var::N16K16,
+        V3Var::N16K8,
+        V3Var::N8K16,
+        V3Var::N8K8,
+        V3Var::D32K16,
+        V3Var::D32K8,
+        V3Var::N32K16,
+        V3Var::N32K8,
+    ];
+    pub fn nv(self) -> usize {
+        match self {
+            V3Var::N16K16 | V3Var::N16K8 => 16,
+            V3Var::N8K16 | V3Var::N8K8 | V3Var::D32K16 | V3Var::D32K8 => 8,
+            V3Var::N32K16 | V3Var::N32K8 => 32,
+        }
+    }
+    pub fn kt(self) -> usize {
+        match self {
+            V3Var::N16K16 | V3Var::N8K16 | V3Var::D32K16 | V3Var::N32K16 => 16,
+            V3Var::N16K8 | V3Var::N8K8 | V3Var::D32K8 | V3Var::N32K8 => 8,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            V3Var::N16K16 => "paged_attn_v3_n16k16",
+            V3Var::N16K8 => "paged_attn_v3_n16k8",
+            V3Var::N8K16 => "paged_attn_v3_n8k16",
+            V3Var::N8K8 => "paged_attn_v3_n8k8",
+            V3Var::D32K16 => "paged_attn_v3_d32k16",
+            V3Var::D32K8 => "paged_attn_v3_d32k8",
+            V3Var::N32K16 => "paged_attn_v3_n32k16",
+            V3Var::N32K8 => "paged_attn_v3_n32k8",
+        }
+    }
+    /// 行/warp/pass（= gpw×RL；探针的 npass 口径）
+    pub fn rpw(self) -> usize {
+        match self {
+            V3Var::N16K16 | V3Var::N16K8 => 4,  // gpw2×RL2
+            V3Var::N8K16 | V3Var::N8K8 => 8,    // gpw4×RL2
+            V3Var::D32K16 | V3Var::D32K8 => 4,  // gpw4×RL1
+            V3Var::N32K16 | V3Var::N32K8 => 4,  // gpw1×RL4
+        }
+    }
+    /// 变体服务的 head_dim
+    pub fn hd(self) -> usize {
+        match self {
+            V3Var::N8K16 | V3Var::N8K8 => 128,
+            _ => 256,
+        }
+    }
+    /// 按 head_dim × kt 选变体（hd 只认 128/256；默认 hd=256→N16、
+    /// hd=128→N8。d32/n32 档仅 WEIN_V3_VAR 对拍可达——d32 慢 ~20%
+    /// （smem 投递 1KB/(row,jj)，2×）、n32 慢 ~30%（SHFL 5 级/row=5 vs
+    /// n16 的 2，SHFL 管道瓶颈 + spill 184B））
+    pub fn pick(head_dim: usize, kt: usize) -> Self {
+        match (head_dim, kt) {
+            (256, 8) => V3Var::N16K8,
+            (128, 16) => V3Var::N8K16,
+            (128, 8) => V3Var::N8K8,
+            _ => V3Var::N16K16,
+        }
+    }
+    /// n32 族（NV=32 单行组/RL=4，WEIN_V3_VAR=n32 对拍用）
+    pub fn pick_n32(head_dim: usize, kt: usize) -> Self {
+        match (head_dim, kt) {
+            (256, 8) => V3Var::N32K8,
+            (128, 16) => V3Var::N8K16,
+            (128, 8) => V3Var::N8K8,
+            _ => V3Var::N32K16,
+        }
+    }
+    /// n16 族（ND=16）：hd=256→N16、hd=128→N8（WEIN_V3_VAR=n16 对拍用）
+    pub fn pick_n16(head_dim: usize, kt: usize) -> Self {
+        match (head_dim, kt) {
+            (256, 8) => V3Var::N16K8,
+            (128, 16) => V3Var::N8K16,
+            (128, 8) => V3Var::N8K8,
+            _ => V3Var::N16K16,
+        }
+    }
+    /// d32 族（ND=32/NV=8/RL=1，hd=256 专用死档，WEIN_V3_VAR=d32 对拍用）
+    pub fn pick_d32(head_dim: usize, kt: usize) -> Self {
+        match (head_dim, kt) {
+            (128, 16) => V3Var::N8K16,
+            (128, 8) => V3Var::N8K8,
+            (256, 8) => V3Var::D32K8,
+            _ => V3Var::D32K16,
+        }
+    }
+}
+
+/// v3 档的几何旋钮（bf16 池单态）。与 qblk 相反：**Br 是自由旋钮**
+/// （acc 只有 RL=2 行驻寄存器，Br 靠 npass 摊薄），bdim 也只影响
+/// 并行度/占用率不影响正确性
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct V3Cfg {
+    /// 一块覆盖的 q token 数（Br）
+    pub br: usize,
+    /// smem K/V tile 的 token 数（8/16；16 档 smem 35KB/块）
+    pub kt: usize,
+    /// 线程/块（32 的倍数，≤ `V3_BDIM_CAP`）
+    pub bdim: usize,
+    /// j 分片数；0 = 自动（base 块数 < `V3_TARGET_BLOCKS` 且行数 ≤ cap 时 2）
+    pub jsplit: usize,
+}
+
+impl V3Cfg {
+    /// 默认形态：Br=64 / KT=16 / 256 线程 / 自动分片（探针裁决后可调）
+    pub fn baseline() -> Self {
+        Self { br: 64, kt: 16, bdim: 256, jsplit: 0 }
+    }
+}
+
+/// v3 档的落地几何（`v3_geom` 的返回值；探针/报告口径）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct V3Geom {
+    pub variant: V3Var,
+    pub br: usize,
+    pub kt: usize,
+    pub bdim: usize,
+    pub group: usize,
+    pub ntile: usize,
+    pub jsplit: usize,
+}
+
+impl V3Geom {
+    pub fn nblk(&self, kv_heads: u32) -> usize {
+        kv_heads as usize * self.ntile * self.jsplit
+    }
+}
+
 
 /// qblk 档的落地几何（`qblk_geom` 的返回值；探针/报告口径）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2394,6 +2579,108 @@ impl PagedAttnCuda<'_> {
         (
             self.gpu.func_attribute(&self.fo, CU_FUNC_ATTRIBUTE_NUM_REGS),
             self.gpu.func_attribute(&self.fo, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+        )
+    }
+
+    /// v3 档几何裁决（纯函数：探针/exec/测试共用一份算式）。
+    ///
+    /// 约束：`hd ∈ {128, 256}`（变体的 NV=hd/16）、`bdim ≤ V3_BDIM_CAP 且
+    /// 32 整倍`、`kt ∈ {8, 16}`。jsplit：v3 无 span cap（流式 tile），
+    /// 长序列 js=1；只在小形状补并行度（base 块数 < 256 且行数 ≤ cap → 2），
+    /// 偏量语义与 online 同（attn_combine 原样可吃）
+    pub fn v3_geom(
+        cfg: V3Cfg,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+    ) -> V3Geom {
+        let hd = head_dim as usize;
+        let group = (q_heads / kv_heads) as usize;
+        assert!(hd == 256 || hd == 128, "v3 要求 head_dim ∈ {{128, 256}}（NV=hd/16），收到 {hd}");
+        assert!(cfg.kt == 8 || cfg.kt == 16, "v3 KT ∈ {{8, 16}}（静态 .shared 48KB/块顶），收到 {}", cfg.kt);
+        assert!(
+            cfg.bdim >= 32 && cfg.bdim <= V3_BDIM_CAP && cfg.bdim % 32 == 0,
+            "v3 线程数 {} 非法（须 32 整倍且 ≤{V3_BDIM_CAP}）",
+            cfg.bdim
+        );
+        assert!(cfg.br >= 1 && cfg.br <= V3_BR_CAP, "v3 Br {} 越界（≤{V3_BR_CAP}）", cfg.br);
+        let variant = match std::env::var("WEIN_V3_VAR") {
+            Ok(s) => match s.as_str() {
+                "n16" => V3Var::pick_n16(hd, cfg.kt),
+                "d32" => V3Var::pick_d32(hd, cfg.kt),
+                "n32" => V3Var::pick_n32(hd, cfg.kt),
+                other => panic!("WEIN_V3_VAR={other} 非法（n16|n32|d32）"),
+            },
+            Err(_) => V3Var::pick(hd, cfg.kt),
+        };
+        let ntile = (tokens as usize).div_ceil(cfg.br);
+        let base = kv_heads as usize * ntile;
+        let part_ok = tokens as usize * q_heads as usize <= V3_PART_ROWS;
+        // jsplit 固定 1：js=2 时偏结果写路径在混合批下致相邻序列分叉（b2
+        // 实测 small 5/8），combine 有已知脆弱——禁掉（js=1 性能差 ~3% 内，
+        // 见 attn_v3_probe 档位表）
+        let jsplit = if cfg.jsplit > 0 { cfg.jsplit.min(V3_SPLIT_CAP) } else { 1 };
+        assert!(
+            jsplit == 1 || part_ok,
+            "v3 分片行数 {} 超偏结果表 {V3_PART_ROWS}",
+            tokens as usize * q_heads as usize
+        );
+        V3Geom { variant, br: cfg.br, kt: cfg.kt, bdim: cfg.bdim, group, ntile, jsplit }
+    }
+
+    /// v3 档（**smem K/V tile + shfl warp 归约**）：prefill 长序列容差档。
+    /// 同一套在线 softmax 代数（tile 级 rescale），无块私有 scratch——
+    /// 块数无容量顶，不需要行分片多发
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_v3(
+        &self,
+        cfg: V3Cfg,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_v3: tokens=0");
+        let g = Self::v3_geom(cfg, q_heads, kv_heads, head_dim, tokens);
+        let f = &self.f_v3[g.variant as usize];
+        let nblk = g.nblk(kv_heads);
+        let (br_u, js_u, chunk_u) = (g.br as u32, g.jsplit as u32, g.kt as u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc_v3, self.pml_v3, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, br_u, js_u, chunk_u, self.scratch
+        ];
+        self.gpu.launch(f, nblk as u32, g.bdim as u32, &args, stream);
+        if g.jsplit > 1 {
+            let (nrows, hd_u) = (tokens * q_heads, head_dim);
+            let args = crate::kernel_args![self.pacc_v3, self.pml_v3, *out, nrows, js_u, hd_u];
+            self.gpu.launch(&self.fc, nrows, 256, &args, stream);
+        }
+    }
+
+    /// v3 变体编译后属性（regs / local 溢出字节 / smem 字节）——探针口径
+    pub fn v3_meta(&self, v: V3Var) -> (i32, i32, i32) {
+        use crate::cuda::driver::{
+            CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_NUM_REGS,
+            CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        };
+        let f = &self.f_v3[v as usize];
+        (
+            self.gpu.func_attribute(f, CU_FUNC_ATTRIBUTE_NUM_REGS),
+            self.gpu.func_attribute(f, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            self.gpu.func_attribute(f, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
         )
     }
 

@@ -976,6 +976,125 @@ fn o33_paged_attn_online_tolerance() {
     }
 }
 
+/// o37 · **v3 档**（`paged_attn_v3_*`：smem K/V tile + shfl warp 归约 +
+/// 寄存器 acc，Br 参数化）容差档。数值语义逐字照抄单遍档（在线 softmax、
+/// raw pbuf + ex2 折叠、jsplit 偏量 + attn_combine），故判据同 o33：
+/// rel2 ≤ 3e-3、峰值 ≤ 1.5e-2、逐行最坏峰值同门。形态覆盖：
+/// · 512/2048/6009 三档 ctx（6009 档 t=64 控制 CPU 参考成本）
+/// · jsplit=2 偏结果链（含**空分片**：短 pos 段的 sp=1 分片 j0≥j1）
+/// · 尾段 t%Br≠0（193 = 12×16+1）与块内多 seq 回退（段跨块边界）
+/// · hd=128 → N8 变体（NV=8）；hd=256 → N16 默认变体
+#[test]
+fn o37_paged_attn_v3_tolerance() {
+    use wein_kernel::ops::{AttnCfg, KvDtype, V3Cfg};
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let stream = gpu.stream();
+    let bs = 16usize;
+    // (qh, kvh, hd, tokens, 位置模式, br, jsplit)：位置模式 0=全 pos、
+    // 1=混合（seq0 长 pos / seq1 pos=0，块内跨 seq + js=2 空分片）
+    let cases: [(usize, usize, usize, usize, u32, usize, usize); 6] = [
+        (16, 4, 256, 512, 511, 16, 0),   // span≥512 主档（js auto → 2，combine 链）
+        (16, 4, 256, 193, 2047, 16, 1),  // 尾段 t%Br=1
+        (16, 4, 256, 64, 6008, 16, 2),   // 6009 ctx 强制 js=2
+        (16, 4, 256, 64, 1023, 16, 2),   // 混合 seq：块内跨段 + 空分片（模式 1 见下）
+        (16, 4, 256, 96, 2047, 32, 0),   // Br=32 档
+        (32, 16, 128, 256, 1023, 16, 0), // hd128 → N8 变体
+    ];
+    for (i, &(qh, kvh, hd, tokens, pos, br, js)) in cases.iter().enumerate() {
+        let mixed = i == 3;
+        let nseq = 2usize;
+        let maxpos = pos as usize;
+        let bpr = (maxpos + 1).div_ceil(bs);
+        let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+        let (seq_ids, positions): (Vec<u32>, Vec<u32>) = if mixed {
+            // 块内跨段：前 40 token seq0（pos=1023）、后 24 token seq1（pos=0）
+            // ⟹ Br=16 的第 2 块跨 seq 边界；seq1 段 pmax=0 ⟹ js=2 的 sp=1 空分片
+            (
+                (0..tokens).map(|r| if r < 40 { 0 } else { 1 }).collect(),
+                (0..tokens).map(|r| if r < 40 { pos } else { 0 }).collect(),
+            )
+        } else {
+            ((0..tokens).map(|r| (r % nseq) as u32).collect(), vec![pos; tokens])
+        };
+        let he = kvh * hd;
+        let slots = nseq * bpr * bs;
+        let k_cache = vec_bf16(0x51ab, slots * he, 1.0);
+        let v_cache = vec_bf16(0x62cd, slots * he, 1.0);
+        let qn = tokens * qh * hd;
+        let q = vec_bf16(0x73ef, qn, 2.0);
+        let q_scale = 1.0 / (hd as f32).sqrt();
+        let expect = reference::paged_attn(
+            &q, &k_cache, &v_cache, &block_table, &seq_ids, &positions, q_scale, bpr, bs,
+            qh, kvh, hd,
+        );
+        let dq = gpu.alloc_from_slice(&q);
+        let dkc = gpu.alloc_from_slice(&k_cache);
+        let dvc = gpu.alloc_from_slice(&v_cache);
+        let dbt = gpu.alloc_from_slice(&block_table);
+        let dsi = gpu.alloc_from_slice(&seq_ids);
+        let dpo = gpu.alloc_from_slice(&positions);
+        let dout = gpu.alloc_bytes(qn * 2);
+        // 在线档作第二锚点（o33 验收过的位级资产）；rpt 须整除 group
+        let grp = qh / kvh;
+        let online_cfg = if grp % 4 == 0 {
+            AttnCfg { nd: 8, rpt: 4, ntok_max: 4, bdim_max: 512, kv: KvDtype::Bf16 }
+        } else {
+            AttnCfg { nd: 16, rpt: 2, ntok_max: 4, bdim_max: 512, kv: KvDtype::Bf16 }
+        };
+        t.paged_attn.run_tile_online_cfg(
+            online_cfg, &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+            bs as u32, qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let online: Vec<u16> = dout.read_to_vec();
+        // v3 档（污化先行：空分片/死行漏写必现形）
+        let poison = vec![0x7f7fu16; qn];
+        dout.upload_on(&poison, &stream);
+        let cfg = V3Cfg { br, kt: 16, bdim: 256, jsplit: js };
+        t.paged_attn.run_tile_v3(
+            cfg, &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, bs as u32,
+            qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let v3: Vec<u16> = dout.read_to_vec();
+        let tag = format!("{qh}qh/{kvh}kvh/hd{hd} t={tokens} pos={pos} br={br} js={js} mixed={mixed}");
+        let norm = |x: &[u16], y: &[u16]| -> (f64, f64, usize) {
+            let (mut sse, mut sy, mut max_d, mut max_y) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(y.iter()) {
+                let (u, v) =
+                    (reference::bf16_to_f32(a) as f64, reference::bf16_to_f32(b) as f64);
+                sse += (u - v) * (u - v);
+                sy += v * v;
+                max_d = max_d.max((u - v).abs());
+                max_y = max_y.max(v.abs());
+            }
+            ((sse / sy).sqrt(), max_d / max_y, x.iter().zip(y.iter()).filter(|(a, b)| a != b).count())
+        };
+        let (r2_ref, pk_ref, d_ref) = norm(&v3, &expect);
+        let (r2_on, pk_on, _) = norm(&v3, &online);
+        let row_n = qh * hd;
+        let mut worst = 0.0f64;
+        for r in 0..tokens {
+            let (_, p, _) = norm(&v3[r * row_n..(r + 1) * row_n], &expect[r * row_n..(r + 1) * row_n]);
+            worst = worst.max(p);
+        }
+        eprintln!(
+            "o37 {tag}：v3 vs 参考 rel2 {r2_ref:.3e} 峰值 {pk_ref:.3e}（{d_ref}/{} 位差）｜\
+             v3 vs 在线 rel2 {r2_on:.3e} 峰值 {pk_on:.3e}｜逐行最坏 {worst:.3e}",
+            v3.len()
+        );
+        assert!(r2_ref <= 3.0e-3, "o37 v3 vs 参考 rel2 越门：{r2_ref:.3e}（{tag}）");
+        assert!(pk_ref <= 1.5e-2, "o37 v3 vs 参考峰值越门：{pk_ref:.3e}（{tag}）");
+        assert!(r2_on <= 3.0e-3, "o37 v3 vs 在线 rel2 越门：{r2_on:.3e}（{tag}）");
+        assert!(pk_on <= 1.5e-2, "o37 v3 vs 在线峰值越门：{pk_on:.3e}（{tag}）");
+        assert!(worst <= 1.5e-2, "o37 逐行最坏峰值越门：{worst:.3e}（{tag}）");
+        assert!(v3.iter().any(|&x| x != 0 && x != 0x7f7f), "o37 输出全零/残留污化（{tag}）");
+        drop((dq, dkc, dvc, dbt, dsi, dpo, dout));
+    }
+}
+
 /// o32 · 分块档长序列单发耗时金丝雀（decode 形，1 token，Qwen3.5-4B full
 /// 层形 16 q / 4 kv / hd 256）：KV 读量从 t×q_heads×L 降到 (t/ntok)×kv_heads×L
 /// ——本档按 j 分片换并行度，单块读量 = (L/jsplit)×hd×4B。

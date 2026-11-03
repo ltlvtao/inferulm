@@ -188,6 +188,29 @@ fn attn_blk_from_env(var: &str, kv: wein_kernel::ops::KvDtype) -> Option<wein_ke
     }
     Some(cfg)
 }
+/// v3 档配置（`WEIN_ATTN_V3_CFG`）解析：`br=16,kt=16,bdim=256,js=0`
+/// （js=0 = 自动分片）。缺省 = n16 族 Br16/KT16/256 线程自动分片档
+/// （探针裁决的 6009 最优几何）
+fn attn_v3_from_env(var: &str) -> wein_kernel::ops::V3Cfg {
+    use wein_kernel::ops::V3Cfg;
+    let mut cfg = V3Cfg { br: 16, kt: 16, bdim: 256, jsplit: 0 };
+    let Ok(s) = std::env::var(var) else { return cfg };
+    for tok in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let (k, v) = tok
+            .split_once('=')
+            .unwrap_or_else(|| panic!("未知 WEIN_ATTN_V3_CFG 项：{tok}（br=/kt=/bdim=/js=）"));
+        let n: usize = v.parse().expect("WEIN_ATTN_V3_CFG 数值");
+        match k {
+            "br" => cfg.br = n,
+            "kt" => cfg.kt = n,
+            "bdim" => cfg.bdim = n,
+            "js" => cfg.jsplit = n,
+            _ => panic!("未知 WEIN_ATTN_V3_CFG 项：{tok}（br=/kt=/bdim=/js=）"),
+        }
+    }
+    cfg
+}
+
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
@@ -833,6 +856,14 @@ pub struct Qwen35Executor {
     attn_blk: Option<wein_kernel::ops::BlkCfg>,
     /// 块档的启用门限（t = 本步 token 数；`WEIN_ATTN_BLK_T`，默认 32）
     attn_blk_min_t: u32,
+    /// v3 档（`paged_attn_v3_*`：smem K/V tile + shfl warp 归约 + 寄存器
+    /// acc）：只在**单遍档 + prefill + t ≥ `attn_v3_min_t` + bf16 池 +
+    /// hd∈{128,256}** 时接管（几何由 `WEIN_ATTN_V3_CFG` 给；开关
+    /// `WEIN_ATTN_V3=0` 每次调用现读，支撑进程内 A/B）。decode 形（t≤4）
+    /// 与两遍位级档（`WEIN_ATTN_ONLINE=0`）永不走它——语义一字不改
+    attn_v3: wein_kernel::ops::V3Cfg,
+    /// v3 档的启用门限（t = 本步 token 数；`WEIN_ATTN_V3_T`，默认 512）
+    attn_v3_min_t: u32,
     /// deltanet chunked 总开关（`WEIN_DN_CHUNK=0` 关——大 span prefill 一律
     /// 走老 kernel，回退对拍用；默认开）
     dn_chunk: bool,
@@ -964,10 +995,28 @@ impl Qwen35Executor {
         kvh: u32,
         hd: u32,
         t: u32,
+        has_decode_row: bool,
         stream: &Stream,
     ) {
         // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        // v3 档（smem K/V tile + shfl 归约）：单遍档 + **纯 prefill 批** +
+        // t≥门限 + bf16 池 + hd∈{128,256} 时接管。开关每次调用现读（进程内
+        // A/B）。含 decode 行的混合批禁 v3：decode 行在 v3 的 jsplit 下会被
+        // 切碎 ⇒ 与单跑分叉（b2 混批实测 5/8），回落 online 与单跑位级同
+        if self.attn_online
+            && !has_decode_row
+            && t >= self.attn_v3_min_t
+            && self.attn_cfg.kv == wein_kernel::ops::KvDtype::Bf16
+            && (hd == 128 || hd == 256)
+            && std::env::var("WEIN_ATTN_V3").map(|v| v != "0").unwrap_or(true)
+        {
+            a.run_tile_v3(
+                self.attn_v3, q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh,
+                hd, t, stream,
+            );
+            return;
+        }
         // 块档（Br 参数化、O/P 落块私有 scratch）：只在**单遍档 + prefill +
         // t≥门限**时接管。decode 形（t≤4）与 `WEIN_ATTN_ONLINE=0` 的两遍
         // 位级档在这一行下面，语义一字不改
@@ -1315,6 +1364,11 @@ impl Qwen35Executor {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32),
+            attn_v3: attn_v3_from_env("WEIN_ATTN_V3_CFG"),
+            attn_v3_min_t: std::env::var("WEIN_ATTN_V3_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512),
             dn_chunk: std::env::var("WEIN_DN_CHUNK").map(|v| v != "0").unwrap_or(true),
             last_lg_rows: Vec::new(),
             lin_state,
@@ -3139,6 +3193,7 @@ impl Qwen35Executor {
                             &tb.paged_attn, &self.scr.qh, &self.k_pool[full_i],
                             &self.v_pool[full_i], inp.bt, inp.seqs, inp.pos, &self.scr.attn,
                             self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
+                            spans.count.iter().any(|&c| c == 1),
                             stream,
                         );
                     } else {
@@ -3642,7 +3697,7 @@ impl Qwen35Executor {
             self.attn_long(
                 &tb.paged_attn, &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt,
                 inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(),
-                qh_n, kvh, hd, t32, stream,
+                qh_n, kvh, hd, t32, true, stream,
             );
         } else {
             tb.paged_attn.run(

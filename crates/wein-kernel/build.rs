@@ -130,30 +130,38 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     let ptx = std::fs::read_to_string(ptx_src).expect("读 PTX 产物");
     let mut in_fn = false;
     let mut patched_count = 0usize;
-    let out: String = ptx
-        .lines()
-        .map(|l| {
-            if l.starts_with(".visible .entry ") {
-                in_fn = true;
+    // v3 entry 插 .maxntid 512（.version 7.0 无 .maxnreg）：逼 ptxas 把 regs
+    // 压到 65536/512=128 → bdim≤512 均可发射且 bdim256 得 2 块/SM 占用。
+    let mut v3_pending = false;
+    let mut lines_out: Vec<String> = Vec::with_capacity(ptx.len() / 24);
+    for l in ptx.lines() {
+        if l.starts_with(".visible .entry ") {
+            in_fn = true;
+            if l.starts_with(".visible .entry paged_attn_v3_") {
+                v3_pending = true;
             }
-            let mut line = l.to_string();
-            let has_sym = names.iter().any(|n| l.contains(n.as_str()));
-            if has_sym && l.contains(".global") {
-                line = l.replace(".global", ".shared");
-                patched_count += 1;
-            } else if has_sym && l.contains("mov.b64") {
-                line = l.replace("mov.b64", "cvta.shared.u64");
-                patched_count += 1;
-            } else if in_fn && (l.contains("st.global") || l.contains("ld.global")) {
-                line = l.replace("st.global", "st").replace("ld.global", "ld");
-            }
-            if in_fn && l == "}" {
-                in_fn = false;
-            }
-            line
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        }
+        let mut line = l.to_string();
+        let has_sym = names.iter().any(|n| l.contains(n.as_str()));
+        if has_sym && l.contains(".global") {
+            line = l.replace(".global", ".shared");
+            patched_count += 1;
+        } else if has_sym && l.contains("mov.b64") {
+            line = l.replace("mov.b64", "cvta.shared.u64");
+            patched_count += 1;
+        } else if in_fn && (l.contains("st.global") || l.contains("ld.global")) {
+            line = l.replace("st.global", "st").replace("ld.global", "ld");
+        }
+        lines_out.push(line);
+        if v3_pending && l.trim_start().starts_with(')') {
+            lines_out.push(".maxntid 512, 1, 1".to_string());
+            v3_pending = false;
+        }
+        if in_fn && l == "}" {
+            in_fn = false;
+        }
+    }
+    let out = lines_out.join("\n");
     for n in &names {
         assert!(
             out.contains(&format!(".shared") ) || patched_count > 0,
