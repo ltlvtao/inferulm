@@ -132,6 +132,11 @@ impl Gpu {
             .launch(f.handle, (grid, 1, 1), (block, 1, 1), args, stream.handle)
             .expect("cuLaunchKernel");
     }
+
+    /// 编译后 kernel 属性（regs / local 溢出字节——属性号见 `driver`）
+    pub fn func_attribute(&self, f: &Func, attr: i32) -> i32 {
+        self.drv.func_attribute(f.handle, attr).expect("cuFuncGetAttribute")
+    }
 }
 
 /// 已加载模块（CUmodule 句柄）——kernel 按名取用

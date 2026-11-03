@@ -1812,6 +1812,495 @@ blk_export!(paged_attn_blk, 4, 4, false);
 /// 块档 f32 池（与 bf16 池数值逐位同值：只改载入形状）
 blk_export!(paged_attn_blk_f32, 4, 4, true);
 
+// ───────────── qblk 档（K/V 行驻寄存器供全 q 行）：prefill 长序列 ─────────────
+// 几何病根：现役 prefill（online 档 ntok=4/rpt=4）每块 16 行却流式读整个
+// 前缀 ⇒ KV 流量 ∝ (T/ntok)·T（贴几何地板）；blk 档 Br 上去了但每 pass
+// 重载+重解 K/V（指令吞吐墙）。本档做**循环互换**：块 = (kv 头, Br token
+// 片, j 分片)，j 行外层**载一次 K/V 行片（ND 维）进寄存器**，内层全 RPT
+// 行消费——K/V 每字节每块只读一次（流量 ∝ (T/Br)·T），点积按 lane 切 ND
+// 维、跨 lane 的 nv 路 partial 落块私有 fs 由读者线程串行折叠（工作集
+// rows_nom×JTR×nv f32，L1 驻）。在线 softmax 与 online/blk 同族：每 chunk
+// 一次 rescale；p = expf(sc − mn) 直接以新 max mn 为基（echunk 并进 p——
+// 数学同值、舍入路径不同 ⇒ 对单遍档是**容差档**，判据同 o33）。
+// 混合段块（tile 跨请求边界）自动回退**逐 pass 槽位**的慢路（正确性优先，
+// 频率 = 段边界块；单请求 prefill 全走快路）。
+//
+// 分工（线程 (组 rg, lane) 持 RPT 行 × ND 维）：
+//   · D：j-tile（JTR 个 j）一轮——快路 K 行经 sb[u=0] 槽位载入寄存器、
+//     每 (行, j) 一条 ND 维 partial 落 fs → 屏障 → 折叠线程串行加 nv 路
+//     ×q_scale 落 pb 原始分 → 屏障 → 下一轮
+//   · M/P（行属主，无屏障）：扫本 chunk 自己行的有效 j 段取 max → mn/scale
+//     → pb 原地 expf(sc − mn)；acc/lrun 预乘 scale
+//   · V：j 行外层 V 行片载寄存器一次，内层 RPT 行 `acc += p·v` 单 fma
+//   · 片末 mrun = mn（rescale 收在 chunk 边界）
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn qblk_body<const ND: usize, const RPT: usize, const JTR: usize, const WIDE: bool>(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    stride: u32,
+    scratch: *mut f32,
+) {
+    let hd = head_dim as usize;
+    let qh_n = q_heads as usize;
+    let kv_n = kv_heads as usize;
+    let group = udiv(qh_n, kv_n);
+    let nt = ntok as usize;
+    let js = jsplit as usize;
+    let cap = chunk as usize;
+    let toks = tokens as usize;
+    let bdim = _block_dim_x() as usize;
+    let tau = _thread_idx_x() as usize;
+    let ntile = udiv(toks + nt - 1, nt);
+    let blk = _block_idx_x() as usize;
+    if blk >= kv_n * ntile * js {
+        return;
+    }
+    let kh = udiv(blk, ntile * js);
+    let rest = urem(blk, ntile * js);
+    let tile = udiv(rest, js);
+    let sp = urem(rest, js);
+    let t0 = tile * nt;
+    let tn = if t0 + nt < toks { nt } else { toks - t0 };
+    let rows_nom = nt * group;
+    let rows = tn * group;
+    let npass = udiv(RPT, group);
+    let nv = udiv(hd, ND);
+    let ngrp = udiv(bdim, nv);
+    let rg = udiv(tau, nv);
+    let lane = urem(tau, nv);
+    let r0 = rg * RPT;
+    let tt0 = rg * npass;
+    let vr = r0 < rows;
+    let d0 = lane * ND;
+    let (bpr, bs) = (bpr as usize, block_size as usize);
+    let he = kv_n * hd;
+
+    // j 轴分段（与 online/blk 同式）
+    let mut pmax = 0usize;
+    let mut u = 0usize;
+    while u < tn {
+        let p = *positions.add(t0 + u) as usize;
+        pmax = if p > pmax { p } else { pmax };
+        u += 1;
+    }
+    let lspan = udiv(pmax + js, js);
+    let jmax = pmax + 1;
+    let j0 = sp * lspan;
+    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    if j0 >= j1 {
+        if js > 1 {
+            let mut p = 0usize;
+            while p < npass {
+                let tt = tt0 + p;
+                if tt < tn && lane == 0 {
+                    let mut k = 0usize;
+                    while k < group {
+                        let rglob = (t0 + tt) * qh_n + kh * group + k;
+                        *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
+                        *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
+                        k += 1;
+                    }
+                }
+                p += 1;
+            }
+        }
+        return;
+    }
+    // uniform-seq 判定（块级一次）：整片同请求 ⇒ K/V 行片可全行共享（快路）
+    let s0 = *seq_ids.add(t0) as usize;
+    let mut uniform = true;
+    let mut u = 1usize;
+    while u < tn {
+        if *seq_ids.add(t0 + u) as usize != s0 {
+            uniform = false;
+        }
+        u += 1;
+    }
+
+    // 块私有 scratch 布局（host 侧 `ops::qblk_stride` 同式；stride 由 host 传入）：
+    //   pb[rows_nom × cap]（原始分，行主：r·cap + (j−c0)）+ pe[rows_nom × cap]
+    //   （p = expf(sc − mn)，与 pb **分区**——同组 nv 条 lane 冗余跑 M/P，
+    //   原地改写 pb 会踩仍在 max 扫的兄弟 lane：pe 分区 + 仅 lane 0 写，
+    //   P/V 间一道屏障收口）+ fs[rows_nom × JTR × nv]（(r·JTR+jj)·nv + lane
+    //   ——nv 连续供折叠串行读）+ sb[nt × cap]（槽位表）
+    let sc = scratch.add(blk * stride as usize);
+    let pb = sc;
+    let pe = pb.add(rows_nom * cap);
+    let fs = pe.add(rows_nom * cap);
+    let sb = fs.add(rows_nom * JTR * nv);
+
+    // 在线状态（每行一份，跨 chunk 续；l 由每线程按同一 j 序冗余累加）
+    let mut mrun = [f32::NEG_INFINITY; RPT];
+    let mut lrun = [0.0f32; RPT];
+    let mut acc = [[0.0f32; ND]; RPT];
+    // 行组基（组内第 k 行 = token tt0 + k/group、q 头 kh·group + k%group）
+    let mut qb0 = 0usize;
+    if vr {
+        qb0 = ((t0 + tt0) * qh_n + kh * group) * hd;
+    }
+
+    let mut c0 = j0;
+    while c0 < j1 {
+        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+        let cc = c1 - c0 + 1;
+        _syncthreads(); // 读侧屏障（槽位表要重填）
+        tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
+        _syncthreads();
+
+        // 行常量预计算（每 chunk 一次）：prk=行位置上界、vtk=行有效、
+        // qok=行 q 元素基（(p·qh_n+g)·hd）——D/V/M 内层全部零除法零位载
+        let mut prk = [0usize; RPT];
+        let mut vtk = [false; RPT];
+        let mut qok = [0usize; RPT];
+        {
+            let mut k = 0usize;
+            while k < RPT {
+                let p = udiv(k, group);
+                let tt = tt0 + p;
+                if tt < tn {
+                    prk[k] = *positions.add(t0 + tt) as usize;
+                    vtk[k] = true;
+                }
+                qok[k] = qb0 + (p * qh_n + urem(k, group)) * hd;
+                k += 1;
+            }
+        }
+
+        // ── D：分值（j-tile 轮转：K 行片载一次供全行 → fs → 折叠 → pb）
+        let mut jb = c0;
+        while jb <= c1 {
+            let je = if jb + JTR - 1 < c1 { jb + JTR - 1 } else { c1 };
+            let jtcc = je - jb + 1;
+            if vr {
+                if uniform {
+                    // 快路：槽位查一次（u=0 行），K 行片全行共享；行枚举
+                    // const-RPT（寄存器数组可解索）+ prk/vtk/qok 寄存器索引
+                    let mut jj = 0usize;
+                    while jj < jtcc {
+                        let kb = *sb.add(jb - c0 + jj) as usize * he + kh * hd + d0;
+                        let kt = kv_ld::<ND, WIDE>(k_cache, kb);
+                        let jjabs = jb + jj;
+                        let mut k = 0usize;
+                        while k < RPT {
+                            if vtk[k] && jjabs <= prk[k] {
+                                let qs = kv_ld::<ND, false>(q as *const u8, qok[k] + d0);
+                                let mut s = 0.0f32;
+                                let mut l = 0usize;
+                                while l < ND {
+                                    s = fma(qs[l], kt[l], s);
+                                    l += 1;
+                                }
+                                *fs.add(((r0 + k) * JTR + jj) * nv + lane) = s;
+                            }
+                            k += 1;
+                        }
+                        jj += 1;
+                    }
+                } else {
+                    // 慢路（混合段边界块）：槽位逐 token——正确性路径
+                    let mut p = 0usize;
+                    while p < npass {
+                        let tt = tt0 + p;
+                        if tt < tn {
+                            let pr = *positions.add(t0 + tt) as usize;
+                            let mut jj = 0usize;
+                            while jj < jtcc {
+                                if jb + jj <= pr {
+                                    let kb = *sb.add(tt * cc + (jb - c0 + jj)) as usize * he
+                                        + kh * hd
+                                        + d0;
+                                    let kt = kv_ld::<ND, WIDE>(k_cache, kb);
+                                    let mut g = 0usize;
+                                    while g < group {
+                                        let k = p * group + g;
+                                        let qs = kv_ld::<ND, false>(
+                                            q as *const u8,
+                                            qb0 + (p * qh_n + g) * hd + d0,
+                                        );
+                                        let mut s = 0.0f32;
+                                        let mut l = 0usize;
+                                        while l < ND {
+                                            s = fma(qs[l], kt[l], s);
+                                            l += 1;
+                                        }
+                                        *fs.add(((r0 + k) * JTR + jj) * nv + lane) = s;
+                                        g += 1;
+                                    }
+                                }
+                                jj += 1;
+                            }
+                        }
+                        p += 1;
+                    }
+                }
+            }
+            _syncthreads();
+            // 折叠：线程摊 (行, jj) 对——nv 路 partial 串行加（lane 升序，
+            // 确定性）×q_scale 落 pb 原始分
+            // 对枚举递增：jtcc | bdim（bdim%32==0）⇒ e+=bdim 即 r+=bdim/jtcc、
+            // jj 不变；group | dr 时 ttr 也递增（非整除走除法回退路）
+            let dr = udiv(bdim, jtcc);
+            let jb0 = jb - c0;
+            let r0p = udiv(tau, jtcc);
+            let jj = urem(tau, jtcc);
+            let jjabs = jb + jj;
+            if r0p < rows && urem(dr, group) == 0 {
+                let mut r = r0p;
+                while r < rows {
+                    let ttr = t0 + udiv(r, group);
+                    let fsb = (r * JTR + jj) * nv;
+                    let pbb = r * cap + jb0 + jj;
+                    if jjabs <= *positions.add(ttr) as usize {
+                        let fb = fs.add(fsb);
+                        let mut s = 0.0f32;
+                        let mut l = 0usize;
+                        while l < nv {
+                            s = *fb.add(l) + s;
+                            l += 1;
+                        }
+                        *pb.add(pbb) = s * q_scale;
+                    }
+                    r += dr;
+                }
+            } else {
+                let mut e = tau;
+                while e < rows * jtcc {
+                    let r = udiv(e, jtcc);
+                    let j = urem(e, jtcc);
+                    if jb + j <= *positions.add(t0 + udiv(r, group)) as usize {
+                        let fb = fs.add((r * JTR + j) * nv);
+                        let mut s = 0.0f32;
+                        let mut l = 0usize;
+                        while l < nv {
+                            s = *fb.add(l) + s;
+                            l += 1;
+                        }
+                        *pb.add(r * cap + (jb - c0 + j)) = s * q_scale;
+                    }
+                    e += bdim;
+                }
+            }
+            _syncthreads();
+            jb = je + 1;
+        }
+
+        // ── M/P（行属主，无屏障；pb 本行段只被本线程读写）：本 chunk 行 max →
+        // 在线系数 → pb 原地 p = expf(sc − mn)（echunk 并入 p）→ acc/l 预缩
+        let mut mn = [0.0f32; RPT];
+        let mut scl = [0.0f32; RPT];
+        if vr {
+            let mut k = 0usize;
+            while k < RPT {
+                if vtk[k] {
+                    let pr = prk[k];
+                    if pr >= c0 {
+                        let jrr = (if pr < c1 { pr } else { c1 }) - c0;
+                        let rb = pb.add((r0 + k) * cap);
+                        let mut m = f32::NEG_INFINITY;
+                        let mut jj = 0usize;
+                        while jj <= jrr {
+                            let x = *rb.add(jj);
+                            m = if x > m { x } else { m };
+                            jj += 1;
+                        }
+                        let x = if m > mrun[k] { m } else { mrun[k] };
+                        mn[k] = x;
+                        scl[k] = if mrun[k] == f32::NEG_INFINITY { 0.0 } else { expf(mrun[k] - x) };
+                        // P：p = expf(分值 − mn) 落 **pe 分区**（仅 lane 0 写——
+                        // 同组 lane 冗余原地改写 pb 会互踩 max 扫读）
+                        if lane == 0 {
+                            let reb = pe.add((r0 + k) * cap);
+                            let mut jj = 0usize;
+                            while jj <= jrr {
+                                *reb.add(jj) = expf(*rb.add(jj) - x);
+                                jj += 1;
+                            }
+                        }
+                        lrun[k] = lrun[k] * scl[k];
+                        let mut l = 0usize;
+                        while l < ND {
+                            acc[k][l] = acc[k][l] * scl[k];
+                            l += 1;
+                        }
+                    } else {
+                        // 空片（本行本 chunk 无有效 j）：状态原样过（scale=1）
+                        mn[k] = mrun[k];
+                        scl[k] = 1.0;
+                    }
+                } else {
+                    mn[k] = mrun[k];
+                    scl[k] = 1.0;
+                }
+                k += 1;
+            }
+        }
+
+        // P（lane 0 写 pe）→ V（全 lane 读 pe）：一道屏障收口
+        _syncthreads();
+        // ── V：加权 V（V 行片载一次供全行；p 在 pe，单 fma 累加）
+        if vr {
+            if uniform {
+                let mut j = c0;
+                while j <= c1 {
+                    let vb = *sb.add(j - c0) as usize * he + kh * hd + d0;
+                    let vt = kv_ld::<ND, WIDE>(v_cache, vb);
+                    let mut k = 0usize;
+                    while k < RPT {
+                        if vtk[k] && j <= prk[k] {
+                            let p = *pe.add((r0 + k) * cap + (j - c0));
+                            let mut l = 0usize;
+                            while l < ND {
+                                acc[k][l] = fma(p, vt[l], acc[k][l]);
+                                l += 1;
+                            }
+                            lrun[k] = p + lrun[k];
+                        }
+                        k += 1;
+                    }
+                    j += 1;
+                }
+            } else {
+                // k=p·group+g 的 group 是运行期值，SCEV 证不出 k<RPT ⇒
+                // 数组索引留 panic 桩（PTX 成 call，禁项）——外层裸指针免检
+                let accp = acc.as_mut_ptr();
+                let lrp = lrun.as_mut_ptr();
+                let mut p = 0usize;
+                while p < npass {
+                    let tt = tt0 + p;
+                    if tt < tn {
+                        let pr = *positions.add(t0 + tt) as usize;
+                        let mut j = c0;
+                        while j <= pr && j <= c1 {
+                            let vb = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
+                            let vt = kv_ld::<ND, WIDE>(v_cache, vb);
+                            let mut g = 0usize;
+                            while g < group {
+                                let k = p * group + g;
+                                let pv = *pe.add((r0 + k) * cap + (j - c0));
+                                let arow = &mut *accp.add(k);
+                                let mut l = 0usize;
+                                while l < ND {
+                                    arow[l] = fma(pv, vt[l], arow[l]);
+                                    l += 1;
+                                }
+                                *lrp.add(k) = pv + *lrp.add(k);
+                                g += 1;
+                            }
+                            j += 1;
+                        }
+                    }
+                    p += 1;
+                }
+            }
+        }
+        let mut k = 0usize;
+        while k < RPT {
+            mrun[k] = mn[k];
+            k += 1;
+        }
+        _syncthreads(); // pb/fs 下一 chunk 重写前的写侧屏障
+        c0 = c1 + 1;
+    }
+
+    // 落结果（js=1 直落 out；否则偏量表由 attn_combine 合并——语义同 online 档）
+    if vr {
+        let mut k = 0usize;
+        while k < RPT {
+            let tt = tt0 + udiv(k, group);
+            if tt < tn {
+                if js == 1 {
+                    let qo = qb0 + (udiv(k, group) * qh_n + urem(k, group)) * hd;
+                    let mut l = 0usize;
+                    while l < ND {
+                        *out.add(qo + d0 + l) = f32_to_bf16(acc[k][l] / lrun[k]);
+                        l += 1;
+                    }
+                } else {
+                    let rglob = (t0 + tt) * qh_n + kh * group + urem(k, group);
+                    let base = rglob * js + sp;
+                    if lane == 0 {
+                        *part_ml.add(base * 2) = mrun[k];
+                        *part_ml.add(base * 2 + 1) = lrun[k];
+                    }
+                    let pb0 = part_acc.add(base * PART_HD_STRIDE + d0);
+                    let mut l = 0usize;
+                    while l < ND {
+                        *pb0.add(l) = acc[k][l];
+                        l += 1;
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
+macro_rules! qblk_export {
+    ($name:ident, $nd:literal, $rpt:literal, $jtr:literal, $wide:literal) => {
+        /// qblk 档（K/V 行片驻寄存器供全 q 行）：prefill 长序列专用。
+        /// `ntok` = Br（= bdim/nv × RPT/group，host 侧 `qblk_geom` 裁决）、
+        /// `chunk` = j 片宽、`stride` = 每块 scratch 槽数（ABI 与块档同形）。
+        #[no_mangle]
+        pub unsafe extern "ptx-kernel" fn $name(
+            q: *const u16,
+            k_cache: *const u8,
+            v_cache: *const u8,
+            block_table: *const u32,
+            seq_ids: *const u32,
+            positions: *const u32,
+            out: *mut u16,
+            part_acc: *mut f32,
+            part_ml: *mut f32,
+            q_scale: f32,
+            bpr: u32,
+            block_size: u32,
+            q_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            tokens: u32,
+            ntok: u32,
+            jsplit: u32,
+            chunk: u32,
+            stride: u32,
+            scratch: *mut f32,
+        ) {
+            qblk_body::<$nd, $rpt, $jtr, $wide>(
+                q, k_cache, v_cache, block_table, seq_ids, positions, out, part_acc, part_ml,
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, tokens, ntok, jsplit,
+                chunk, stride, scratch,
+            )
+        }
+    };
+}
+
+/// qblk 档变体（bf16 池；ND 维/lane、RPT 行/线程组、JTR = 折叠批宽）。
+/// 寄存器主项 = acc[RPT][ND]：r4 系 64 档（bdim 512 可 2 块/SM）、r8 系
+/// 128 档（bdim 384 上限 170 内的冲量档——Br=48 的载体）
+qblk_export!(paged_attn_qblk_n16r4j2, 16, 4, 2, false);
+qblk_export!(paged_attn_qblk_n16r4j4, 16, 4, 4, false);
+qblk_export!(paged_attn_qblk_n16r8j2, 16, 8, 2, false);
+qblk_export!(paged_attn_qblk_n16r8j4, 16, 8, 4, false);
+qblk_export!(paged_attn_qblk_n8r8j4, 8, 8, 4, false);
+qblk_export!(paged_attn_qblk_n8r16j2, 8, 16, 2, false);
+
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
 /// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的
 /// 上界 = ROWS_CAP/group）。四项的定尺依据：

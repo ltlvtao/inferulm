@@ -182,6 +182,14 @@ impl OpTable<'_> {
             fc: m.func("attn_combine"),
             f_blk: m.func("paged_attn_blk"),
             f_blk_f32: m.func("paged_attn_blk_f32"),
+            f_qblk: [
+                m.func("paged_attn_qblk_n16r4j2"),
+                m.func("paged_attn_qblk_n16r4j4"),
+                m.func("paged_attn_qblk_n16r8j2"),
+                m.func("paged_attn_qblk_n16r8j4"),
+                m.func("paged_attn_qblk_n8r8j4"),
+                m.func("paged_attn_qblk_n8r16j2"),
+            ],
             tscratch: gpu.alloc_bytes(ATTN_TILE_BLOCK_CAP * ATTN_TILE_SLOTS * 4),
             pacc: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
             pml: gpu.alloc_bytes(ATTN_TILE_PART_ROWS * ATTN_TILE_SPLIT_CAP * 2 * 4),
@@ -1394,6 +1402,8 @@ pub struct PagedAttnCuda<'a> {
     /// bf16/f32 池两档，ABI 与单遍档只差一个 `stride`（每块 scratch 槽数）
     f_blk: Func,
     f_blk_f32: Func,
+    /// qblk 档变体表（K/V 行片驻寄存器供全 q 行）：顺序 = `QblkVar::ALL`
+    f_qblk: [Func; 6],
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
     /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
@@ -1466,6 +1476,9 @@ pub const BLK_SPLIT_CAP: usize = 16;
 pub const BLK_TARGET_BLOCKS: usize = 256;
 /// 块档线程上限：`paged_attn_blk` 实测 128 regs（0 spill）⇒ 65536/128 = 512
 const BLK_BDIM_CAP: usize = 512;
+/// qblk 档线程上限：r8/r16 系 ~128+ regs ⇒ 65536/regs ≈ 384-512；几何按
+/// `Gpu::func_attribute`（NUM_REGS）实测夹紧（探针报告口径），512 是兜底
+const QBLK_BDIM_CAP: usize = 512;
 
 // ── 单遍档的几何 / dtype 旋钮（A/B 判别仪器） ──
 
@@ -1566,6 +1579,112 @@ impl BlkGeom {
         kv_heads as usize * self.ntile * self.jsplit
     }
     /// 块档 scratch 实付字节（块数 × 每块字节）
+    pub fn scratch_bytes(&self, kv_heads: u32) -> usize {
+        self.nblk(kv_heads) * self.stride * 4
+    }
+}
+
+// ── qblk 档（K/V 行片驻寄存器供全 q 行）的旋钮与几何 ──
+
+/// qblk 档的编译期变体（`qblk_export!` 的单态实体，枚举序 = `f_qblk` 表序）。
+/// ND=每线程维数、RPT=每线程组 q 行数（须为 group 整倍）、JTR=折叠批宽
+/// （fs 工作集 = rows_nom×JTR×nv f32——JTR 越小越 L1 友好、sync 越密）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QblkVar {
+    N16R4J2,
+    N16R4J4,
+    N16R8J2,
+    N16R8J4,
+    N8R8J4,
+    N8R16J2,
+}
+
+impl QblkVar {
+    pub const ALL: [QblkVar; 6] = [
+        QblkVar::N16R4J2,
+        QblkVar::N16R4J4,
+        QblkVar::N16R8J2,
+        QblkVar::N16R8J4,
+        QblkVar::N8R8J4,
+        QblkVar::N8R16J2,
+    ];
+    pub fn nd(self) -> usize {
+        match self {
+            QblkVar::N16R4J2 | QblkVar::N16R4J4 | QblkVar::N16R8J2 | QblkVar::N16R8J4 => 16,
+            QblkVar::N8R8J4 | QblkVar::N8R16J2 => 8,
+        }
+    }
+    pub fn rpt(self) -> usize {
+        match self {
+            QblkVar::N16R4J2 | QblkVar::N16R4J4 => 4,
+            QblkVar::N16R8J2 | QblkVar::N16R8J4 | QblkVar::N8R8J4 => 8,
+            QblkVar::N8R16J2 => 16,
+        }
+    }
+    pub fn jtr(self) -> usize {
+        match self {
+            QblkVar::N16R4J2 | QblkVar::N16R8J2 | QblkVar::N8R16J2 => 2,
+            QblkVar::N16R4J4 | QblkVar::N16R8J4 | QblkVar::N8R8J4 => 4,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            QblkVar::N16R4J2 => "paged_attn_qblk_n16r4j2",
+            QblkVar::N16R4J4 => "paged_attn_qblk_n16r4j4",
+            QblkVar::N16R8J2 => "paged_attn_qblk_n16r8j2",
+            QblkVar::N16R8J4 => "paged_attn_qblk_n16r8j4",
+            QblkVar::N8R8J4 => "paged_attn_qblk_n8r8j4",
+            QblkVar::N8R16J2 => "paged_attn_qblk_n8r16j2",
+        }
+    }
+}
+
+/// qblk 档的几何旋钮（bf16 池单态——f32 池须走单遍/块档）。Br 不在旋钮里：
+/// **Br 由变体 × bdim 派生**（Br = bdim/nv × RPT/group）——寄存器账
+/// （acc[RPT][ND] 每线程）是硬墙，Br 不是自由度
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QblkCfg {
+    pub variant: QblkVar,
+    /// 线程/块（ngrp = bdim/nv 组；bdim×regs ≤ 65536 夹住档位）
+    pub bdim: usize,
+    /// j 片宽（每片一次 rescale；pb 工作集 = rows_nom×cap f32）
+    pub jchunk: usize,
+    /// j 分片数；0 = 按 `BLK_TARGET_BLOCKS` 自动补并行度
+    pub jsplit: usize,
+}
+
+impl QblkCfg {
+    /// 默认形态：n16r8j4 / 384 线程 / j 片 32（探针裁决后的落点可调）
+    pub fn baseline() -> Self {
+        Self { variant: QblkVar::N16R8J4, bdim: 384, jchunk: 32, jsplit: 0 }
+    }
+}
+
+/// qblk 档的落地几何（`qblk_geom` 的返回值；探针/报告口径）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QblkGeom {
+    /// 一块覆盖的 q token 数 = ngrp × npass（派生值）
+    pub br: usize,
+    pub nd: usize,
+    pub rpt: usize,
+    pub jtr: usize,
+    pub group: usize,
+    pub nv: usize,
+    pub ngrp: usize,
+    pub npass: usize,
+    pub rows_nom: usize,
+    pub bdim: usize,
+    pub ntile: usize,
+    pub jsplit: usize,
+    pub cap: usize,
+    /// 每块 scratch 槽数（f32）：pb + fs + 槽位表
+    pub stride: usize,
+}
+
+impl QblkGeom {
+    pub fn nblk(&self, kv_heads: u32) -> usize {
+        kv_heads as usize * self.ntile * self.jsplit
+    }
     pub fn scratch_bytes(&self, kv_heads: u32) -> usize {
         self.nblk(kv_heads) * self.stride * 4
     }
@@ -2068,6 +2187,214 @@ impl PagedAttnCuda<'_> {
             let args = crate::kernel_args![self.pacc_b, self.pml_b, *out, nrows, js_u, hd_u];
             self.gpu.launch(&self.fc, nrows, 256, &args, stream);
         }
+    }
+
+    /// qblk 档几何裁决（纯函数：探针/exec/测试共用一份算式）。
+    ///
+    /// 映射：nv = hd/nd、ngrp = bdim/nv、npass = rpt/group、
+    /// **Br = ngrp×npass（派生）**、rows_nom = ngrp×rpt。约束：
+    /// · `hd % nd == 0`、`group | rpt`、`bdim % nv == 0 且 % 32 == 0`
+    /// · `cap ≥ jtr`（fs 折叠批的批宽下限）
+    /// · 块数 × 每块 slot ≤ `BLK_SCRATCH_FLOATS`（超了降 j 分片）
+    /// · j 分片偏结果表：`tokens×q_heads ≤ BLK_PART_ROWS`（同块档）
+    pub fn qblk_geom(
+        cfg: QblkCfg,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+    ) -> QblkGeom {
+        let group = (q_heads / kv_heads) as usize;
+        let hd = head_dim as usize;
+        let (nd, rpt, jtr) = (cfg.variant.nd(), cfg.variant.rpt(), cfg.variant.jtr());
+        assert!(hd % nd == 0 && hd <= ATTN_TILE_HD_CAP, "qblk 要求 head_dim%{nd}==0 且 ≤{ATTN_TILE_HD_CAP}");
+        assert!(rpt % group == 0, "qblk 变体 RPT={rpt} 须为 group={group} 的整倍");
+        let nv = hd / nd;
+        let ngrp = (cfg.bdim.min(QBLK_BDIM_CAP).max(nv) / nv).max(1);
+        let bdim = ngrp * nv;
+        assert!(bdim % 32 == 0 && bdim >= 32, "qblk 线程数 {bdim} 须为 32 的倍数（bdim=ngrp×nv）");
+        let npass = rpt / group;
+        let br = ngrp * npass;
+        let rows_nom = ngrp * rpt;
+        let cap = cfg.jchunk;
+        assert!(cap >= jtr, "qblk j 片宽 {cap} 须 ≥ 折叠批宽 jtr={jtr}");
+        let ntile = (tokens as usize + br - 1) / br;
+        let base = kv_heads as usize * ntile;
+        let stride = Self::qblk_stride(rows_nom, cap, jtr, nv, br);
+        let part_ok = tokens as usize * q_heads as usize <= BLK_PART_ROWS;
+        let mut jsplit = if !part_ok {
+            1
+        } else if cfg.jsplit > 0 {
+            cfg.jsplit.min(BLK_SPLIT_CAP)
+        } else {
+            ((BLK_TARGET_BLOCKS + base - 1) / base).clamp(1, BLK_SPLIT_CAP)
+        };
+        while jsplit > 1 && base * jsplit * stride > BLK_SCRATCH_FLOATS {
+            jsplit -= 1;
+        }
+        assert!(
+            base * jsplit * stride <= BLK_SCRATCH_FLOATS,
+            "qblk scratch 越界：{} 块 × {stride} 槽 > {BLK_SCRATCH_FLOATS}（降 bdim/jchunk）",
+            base * jsplit
+        );
+        QblkGeom { br, nd, rpt, jtr, group, nv, ngrp, npass, rows_nom, bdim, ntile, jsplit, cap, stride }
+    }
+
+    /// 每块 scratch 槽数（f32）：与 kernel 侧 `qblk_body` 的布局**逐项同式**
+    /// pb[rows×cap]（原始分）+ pe[rows×cap]（p 值——分区防 lane 互踩）+
+    /// fs[rows×JTR×nv]（折叠 partial）+ sb[br×cap]（槽位表）
+    pub const fn qblk_stride(rows_nom: usize, cap: usize, jtr: usize, nv: usize, br: usize) -> usize {
+        2 * rows_nom * cap + rows_nom * jtr * nv + br * cap
+    }
+
+    /// qblk 档（**K/V 行片驻寄存器供全 q 行**）：prefill 长序列专用。
+    /// 与单遍/块档同一套在线 softmax 代数（chunk 级 rescale），K/V 每字节
+    /// 每块只读一次（j 行外层载寄存器、全行消费）；bf16 池单态
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_qblk(
+        &self,
+        cfg: QblkCfg,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let g = Self::qblk_geom(cfg, q_heads, kv_heads, head_dim, tokens);
+        let f = &self.f_qblk[cfg.variant as usize];
+        self.launch_qblk(
+            f, &g, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+            block_size, q_heads, kv_heads, head_dim, tokens, stream,
+        );
+    }
+
+    /// qblk 装订：ABI 与块档同形（stride 插在 chunk 后）。行分片（slab）
+    /// 同 `launch_blk`：t 超出单片 scratch 容量时按 token 行切片多发，
+    /// 片内几何沿用整批裁决值，算术序不变
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qblk(
+        &self,
+        f: &Func,
+        g: &QblkGeom,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_qblk: tokens=0");
+        let per =
+            ((BLK_SCRATCH_FLOATS / g.stride / (kv_heads as usize * g.jsplit)) * g.br).max(g.br);
+        if tokens as usize <= per {
+            self.launch_qblk_span(
+                f, g, q, k_cache, v_cache, block_table, seq_ids, positions, out, q_scale, bpr,
+                block_size, q_heads, kv_heads, head_dim, tokens, stream,
+            );
+            return;
+        }
+        let row = (q_heads * head_dim) as usize * 2;
+        let mut start = 0usize;
+        while start < tokens as usize {
+            let len = per.min(tokens as usize - start);
+            self.launch_qblk_span(
+                f, g,
+                &q.narrow(start * row, len * row),
+                k_cache,
+                v_cache,
+                block_table,
+                &seq_ids.narrow(start * 4, len * 4),
+                &positions.narrow(start * 4, len * 4),
+                &out.narrow(start * row, len * row),
+                q_scale, bpr, block_size, q_heads, kv_heads, head_dim, len as u32, stream,
+            );
+            start += len;
+        }
+    }
+
+    /// 单次发射（qblk 行分片的片体）
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qblk_span(
+        &self,
+        f: &Func,
+        g: &QblkGeom,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_qblk: tokens=0");
+        let nblk = kv_heads as usize * tokens.div_ceil(g.br as u32) as usize * g.jsplit;
+        assert!(nblk * g.stride <= BLK_SCRATCH_FLOATS, "qblk scratch 越界：{nblk} 块");
+        if g.jsplit > 1 {
+            assert!(
+                tokens as usize * q_heads as usize <= BLK_PART_ROWS,
+                "qblk 分片行数 {} 超偏结果表 {BLK_PART_ROWS}",
+                tokens as usize * q_heads as usize
+            );
+        }
+        let (br_u, js_u, chunk_u, st_u) =
+            (g.br as u32, g.jsplit as u32, g.cap as u32, g.stride as u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc_b, self.pml_b, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, br_u, js_u, chunk_u, st_u, self.bscratch
+        ];
+        self.gpu.launch(f, nblk as u32, g.bdim as u32, &args, stream);
+        if g.jsplit > 1 {
+            let (nrows, hd_u) = (tokens * q_heads, head_dim);
+            let args = crate::kernel_args![self.pacc_b, self.pml_b, *out, nrows, js_u, hd_u];
+            self.gpu.launch(&self.fc, nrows, 256, &args, stream);
+        }
+    }
+
+    /// qblk 变体编译后属性（regs / local 溢出字节）——探针的 spill 报告口径
+    pub fn qblk_meta(&self, v: QblkVar) -> (i32, i32) {
+        use crate::cuda::driver::{CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_NUM_REGS};
+        let f = &self.f_qblk[v as usize];
+        (
+            self.gpu.func_attribute(f, CU_FUNC_ATTRIBUTE_NUM_REGS),
+            self.gpu.func_attribute(f, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+        )
+    }
+
+    /// 基线单遍档（`paged_attn_online`）编译后属性——探针对照口径
+    pub fn online_meta(&self) -> (i32, i32) {
+        use crate::cuda::driver::{CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_NUM_REGS};
+        (
+            self.gpu.func_attribute(&self.fo, CU_FUNC_ATTRIBUTE_NUM_REGS),
+            self.gpu.func_attribute(&self.fo, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+        )
     }
 
     /// 分块档公共装订（两遍/单遍同一份 launch 账）：

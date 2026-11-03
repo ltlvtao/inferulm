@@ -99,14 +99,21 @@ fn k1_ptx_artifact_structure() {
         // 块档（Br 参数化、O/P 落块私有 scratch）：prefill 长序列
         "paged_attn_blk",
         "paged_attn_blk_f32",
+        // qblk 档（K/V 行片驻寄存器供全 q 行）：探针/库增量，未接线
+        "paged_attn_qblk_n16r4j2",
+        "paged_attn_qblk_n16r4j4",
+        "paged_attn_qblk_n16r8j2",
+        "paged_attn_qblk_n16r8j4",
+        "paged_attn_qblk_n8r8j4",
+        "paged_attn_qblk_n8r16j2",
     ] {
         let head = format!(".entry {k}(");
         assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        42,
-        "导出 kernel 数应为 42（24 + attention A/B 档 15 + deltanet chunked 3：dn_chunk_prep/h/o）"
+        48,
+        "导出 kernel 数应为 48（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6）"
     );
 }
 

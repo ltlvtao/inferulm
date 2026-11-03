@@ -34,6 +34,11 @@ struct CuMemcpyAttrs {
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
+/// cuFuncGetAttribute 的属性号（只列用到的）：local 溢出字节数与寄存器数
+/// ——qblk 档探针的 regs/spill 报告口径（与 ptxas -v 对拍过）
+pub const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
+pub const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
+
 #[derive(Debug)]
 pub struct CuError {
     pub code: CuResult,
@@ -66,6 +71,8 @@ pub struct Driver {
     ) -> CuResult,
     cu_module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResult,
+    cu_func_get_attribute:
+        unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResult,
     cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> CuResult,
     cu_mem_free: unsafe extern "C" fn(u64) -> CuResult,
     cu_memcpy_htod: unsafe extern "C" fn(u64, *const c_void, usize) -> CuResult,
@@ -141,6 +148,7 @@ impl Driver {
                 cu_ctx_set_current: try_get(&lib, &["cuCtxSetCurrent"])?,
                 cu_module_load_data_ex: try_get(&lib, &["cuModuleLoadDataEx"])?,
                 cu_module_get_function: try_get(&lib, &["cuModuleGetFunction"])?,
+                cu_func_get_attribute: try_get(&lib, &["cuFuncGetAttribute"])?,
                 cu_mem_alloc: try_get(&lib, &["cuMemAlloc_v2", "cuMemAlloc"])?,
                 cu_mem_free: try_get(&lib, &["cuMemFree_v2", "cuMemFree"])?,
                 cu_memcpy_htod: try_get(&lib, &["cuMemcpyHtoD_v2", "cuMemcpyHtoD"])?,
@@ -258,6 +266,11 @@ impl Driver {
             "cuModuleGetFunction",
         )?;
         Ok(f)
+    }
+    pub(crate) fn func_attribute(&self, f: *mut c_void, attr: c_int) -> Result<i32, CuError> {
+        let mut v = 0i32;
+        self.check(unsafe { (self.cu_func_get_attribute)(&mut v, attr, f) }, "cuFuncGetAttribute")?;
+        Ok(v)
     }
     pub(crate) fn mem_alloc(&self, bytes: usize) -> Result<u64, CuError> {
         let mut ptr = 0u64;
