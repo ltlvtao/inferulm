@@ -112,8 +112,8 @@ fn k1_ptx_artifact_structure() {
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        48,
-        "导出 kernel 数应为 48（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6）"
+        50,
+        "导出 kernel 数应为 50（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2）"
     );
 }
 
@@ -166,6 +166,18 @@ fn k2_intrinsics_lowered_to_ptx() {
     assert!(
         host_calls.is_empty(),
         "PTX 出现宿主调用：{host_calls:?}（no_std kernel 不应有 call）"
+    );
+    // shfl/smem 能力门：旁路（link_llvm_intrinsics + build.rs 段改写）经
+    // shfl_probe 验收后钉死——① shfl.sync 出现 ② SMEM_PROBE 以 .shared 声明
+    // ③ 产物内不得再留 ld.global/st.global（改写全函数体扫过一遍）。
+    assert!(ptx.matches("shfl.sync").count() >= 6, "shfl.sync 未落 PTX（旁路回归）");
+    assert!(
+        ptx.lines().any(|l| l.contains("SMEM_PROBE") && l.contains(".shared")),
+        "SMEM_PROBE 未以 .shared 声明（build.rs 改写回归）"
+    );
+    assert!(
+        !ptx.contains("st.global") && !ptx.contains("ld.global"),
+        "产物仍含 ld/st.global：cvta 泛型化未全扫（可能仍有 generic 语义漏洞）"
     );
 }
 

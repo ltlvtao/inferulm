@@ -20,6 +20,8 @@
 // `f32::mul_add` 在本 nightly 上的落脚是 `core::f32::math::mul_add`
 // （core_float_math #137578；见下方 fma()）
 #![feature(core_float_math)]
+// llvm.nvvm intrinsic 旁路（shfl 等，stdarch nvptx 未覆盖）——实验性链接
+#![feature(link_llvm_intrinsics)]
 // 状态池 bf16 后 4×bf16 走 u64 整载/整存（ld/st.global.b64——paged_attn
 // 同习语；portable_simd 的 f32x4 容器已随 f32 池退役）
 
@@ -29,6 +31,63 @@ use core::arch::nvptx::{_block_dim_x, _block_idx_x, _syncthreads, _thread_idx_x}
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     unsafe { core::arch::nvptx::trap() }
+}
+
+// —— 能力探针：warp shuffle（stdarch nvptx 无 shfl，走 llvm.nvvm intrinsic
+//    link_name 旁路）。若可用，跨线程归约可用 5 步 warp 链替代 scratch 两级
+//    折叠（attention 点积 / lm_head splitK / deltanet 折叠的共同解锁）。
+unsafe extern "C" {
+    #[link_name = "llvm.nvvm.shfl.sync.down.i32"]
+    fn shfl_down(mask: u32, a: i32, offset: i32, clamp: i32) -> i32;
+    #[link_name = "llvm.nvvm.shfl.sync.idx.f32"]
+    fn shfl_idx_f32(mask: u32, a: f32, src: i32, clamp: i32) -> f32;
+    #[link_name = "llvm.nvvm.shfl.sync.bfly.i32"]
+    fn shfl_bfly(mask: u32, a: i32, offset: i32, clamp: i32) -> i32;
+}
+
+/// `.shared` 段静态数组：若 PTX 出模块级 `.shared` 符号，则 smem 可达
+/// （K/V tile 广播 tiling 的地基）。
+#[link_section = ".shared"]
+static mut SMEM_PROBE: [u32; 64] = [0; 64];
+
+/// smem 探针：每线程写 tid 到 SMEM[tid]，同步后读 SMEM[tid^1] 回写。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn smem_probe(out: *mut u32) {
+    let t = unsafe { _thread_idx_x() } as usize;
+    unsafe {
+        // usize 往返 → 泛型地址空间指针（ld/st 不带 .global 限定，
+        // 配合 PTX 侧 cvta.shared 改写使用）
+        let base = core::ptr::addr_of_mut!(SMEM_PROBE) as usize;
+        let p = core::ptr::with_exposed_provenance_mut::<u32>(base);
+        *p.add(t) = t as u32;
+        _syncthreads();
+        *out.add(t) = *p.add(t ^ 1);
+    }
+}
+
+/// 每 lane v=lane+1，5 步 shfl.down 归约：全部 lane 应得 Σ=528。
+/// 第二个写口验证 shfl.idx.f32（lane 0 广播 f32 到全 warp）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn shfl_probe(out_i: *mut i32, out_f: *mut f32) {
+    let t = unsafe { _thread_idx_x() };
+    let lane = t as i32;
+    let mut v = lane + 1;
+    let mut off = 16;
+    while off > 0 {
+        v += unsafe { shfl_down(0xffff_ffff, v, off, 31) };
+        off /= 2;
+    }
+    unsafe { *out_i.add(t as usize) = v };
+    // bfly 归约：全 lane 同和（down 只有 lane 0 是全和）
+    let mut w = lane + 1;
+    let mut xo = 16;
+    while xo > 0 {
+        w += unsafe { shfl_bfly(0xffff_ffff, w, xo, 31) };
+        xo /= 2;
+    }
+    let x = if lane == 0 { 3.5f32 } else { -1.0f32 };
+    let y = unsafe { shfl_idx_f32(0xffff_ffff, x, 0, 31) };
+    unsafe { *out_f.add(t as usize) = y + w as f32 };
 }
 
 /// 全局线程 id（一维 grid）

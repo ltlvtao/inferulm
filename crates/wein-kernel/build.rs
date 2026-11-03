@@ -88,8 +88,80 @@ fn main() {
     assert_eq!(ptx.len(), 1, "应恰有一个 .ptx 产物，实得 {ptx:?}");
 
     let dst = out.join("wein_kernels.ptx");
-    std::fs::copy(&ptx[0], &dst).expect("拷贝 PTX 产物");
+    // PTX 文本级 patch：把源里 `#[link_section=".shared"]` 标记的数组从
+    // `.global` 重写为 `.shared`（nvptx 后端不识别该段名，直出 .global）。
+    // 配套三处改写：① 声明 .global→.shared ② 取址 mov.b64→cvta.shared.u64
+    // ③ 引用该符号的函数体内 ld/st 去 .global（泛型空间——cvta 后指针在
+    // generic 空间）。符号名单由源文件扫描而来（新增 smem 数组自动进表）。
+    patch_smem_symbols(&ptx[0], &dst, &kernels.join("src/lib.rs"));
     println!("cargo:rustc-env=WEIN_PTX={}", dst.display());
+}
+
+/// 扫描源文件取 `#[link_section = ".shared"]` 标记的静态数组名，把 PTX 里
+/// 这些符号的三处形态改写为真共享内存。改写失败（找不到符号）直接 panic——
+/// 不许静默产出跑不动的 PTX。
+fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
+    let src = std::fs::read_to_string(lib_rs).expect("读 kernels src");
+    // 符号名：#[link_section = ".shared"] 紧随的 static mut NAME
+    let mut names: Vec<String> = Vec::new();
+    let mut mark = false;
+    for line in src.lines() {
+        let t = line.trim();
+        if t.contains("#[link_section = \".shared\"]") {
+            mark = true;
+            continue;
+        }
+        if mark {
+            if let Some(rest) = t.strip_prefix("static mut ") {
+                let name: String =
+                    rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+            mark = false;
+        }
+    }
+    if names.is_empty() {
+        // 无 smem 数组：原样拷贝
+        std::fs::copy(ptx_src, dst).expect("拷贝 PTX 产物");
+        return;
+    }
+    let ptx = std::fs::read_to_string(ptx_src).expect("读 PTX 产物");
+    let mut in_fn = false;
+    let mut patched_count = 0usize;
+    let out: String = ptx
+        .lines()
+        .map(|l| {
+            if l.starts_with(".visible .entry ") {
+                in_fn = true;
+            }
+            let mut line = l.to_string();
+            let has_sym = names.iter().any(|n| l.contains(n.as_str()));
+            if has_sym && l.contains(".global") {
+                line = l.replace(".global", ".shared");
+                patched_count += 1;
+            } else if has_sym && l.contains("mov.b64") {
+                line = l.replace("mov.b64", "cvta.shared.u64");
+                patched_count += 1;
+            } else if in_fn && (l.contains("st.global") || l.contains("ld.global")) {
+                line = l.replace("st.global", "st").replace("ld.global", "ld");
+            }
+            if in_fn && l == "}" {
+                in_fn = false;
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for n in &names {
+        assert!(
+            out.contains(&format!(".shared") ) || patched_count > 0,
+            "smem 符号 {n} 未在 PTX 中改写"
+        );
+    }
+    std::fs::write(dst, out).expect("写改写后 PTX");
+    println!("cargo:warning=smem 改写：{:?}（{patched_count} 处）", names);
 }
 
 /// 定位能跑到 nightly 的 cargo：
