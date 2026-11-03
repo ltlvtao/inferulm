@@ -486,6 +486,18 @@ pub unsafe extern "ptx-kernel" fn mul(a: *const u16, b: *const u16, out: *mut u1
     }
 }
 
+/// silu + mul 融合（SwiGLU 激活，silu(g)·u 两发并一发）：act 的 bf16
+/// 中间舍入保留（分离路径落 act 缓冲再读回），逐表达式逐序复刻
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn silu_mul(g: *const u16, u: *const u16, out: *mut u16, n: u32) {
+    let i = tid() as usize;
+    if i < n as usize {
+        let v = bf16_to_f32(*g.add(i));
+        let act = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+        *out.add(i) = f32_to_bf16(bf16_to_f32(act) * bf16_to_f32(*u.add(i)));
+    }
+}
+
 /// KV scatter write：新 token 的 K/V 按 (seq,pos) 页表寻址写入 paged 池。
 /// 一线程一 (t,e) 槽内元素——纯拷贝，未触及槽位不碰（池属调度层所有）
 #[no_mangle]
@@ -3804,6 +3816,80 @@ pub unsafe extern "ptx-kernel" fn rms_norm_zc(
         let o = bf16_to_f32(*x.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
         *out.add(base + i) = f32_to_bf16(o);
         i += bdim;
+    }
+}
+
+/// add + rms_norm_zc 融合（残差后 ln2 / final norm，两发并一发）。
+/// 位级合同：sum = f32→bf16 舍入(f32(a)+f32(b)) 落 sum_out（与 add kernel
+/// 逐位同）；归约与输出从 sum_out 读回 round 后的 bf16（两 kernel 分离
+/// 路径 norm 从 bf16 缓冲读回同语义）——block_sum_strided 树、inv 与
+/// 输出表达式逐字复刻 rms_norm_zc，块几何同（block-per-row）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn add_norm_zc(
+    a: *const u16,
+    b: *const u16,
+    w: *const u16,
+    sum_out: *mut u16,
+    norm_out: *mut u16,
+    hidden: u32,
+    eps: f32,
+    rows: u32,
+    scratch: *mut f32,
+) {
+    let row = _block_idx_x() as usize;
+    if row >= rows as usize {
+        return;
+    }
+    let t = _thread_idx_x() as usize;
+    let bdim = _block_dim_x() as usize;
+    let h = hidden as usize;
+    let base = row * h;
+    unsafe {
+        let mut i = t;
+        while i < h {
+            *sum_out.add(base + i) =
+                f32_to_bf16(bf16_to_f32(*a.add(base + i)) + bf16_to_f32(*b.add(base + i)));
+            i += bdim;
+        }
+        // 写/读同线程同地址（同跨步占有）——无需屏障即读到自写值
+        let total = block_sum_strided(sum_out, scratch, row, base, h, t, bdim);
+        let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
+        let mut i = t;
+        while i < h {
+            let o = bf16_to_f32(*sum_out.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
+            *norm_out.add(base + i) = f32_to_bf16(o);
+            i += bdim;
+        }
+    }
+}
+
+/// linear 层 conv 输出去交错（3×embed gather 并一发）：src [t, 2·kd+vd]
+/// 每 token 交错 q|k|v，一发拆到 q [t,kd]、k [t,kd]、v [t,vd]——纯位
+/// 搬运无算术（与按行 gather 逐位同）
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn dn_split_qkv(
+    src: *const u16,
+    q: *mut u16,
+    k: *mut u16,
+    v: *mut u16,
+    k_dim: u32,
+    v_dim: u32,
+    tokens: u32,
+) {
+    let (kd, vd) = (k_dim as usize, v_dim as usize);
+    let cd = 2 * kd + vd;
+    let i = tid() as usize;
+    if i >= tokens as usize * cd {
+        return;
+    }
+    let (t, e) = (udiv(i, cd), urem(i, cd));
+    let s = *src.add(i);
+    if e < kd {
+        *q.add(t * kd + e) = s;
+    } else if e < 2 * kd {
+        *k.add(t * kd + (e - kd)) = s;
+    } else {
+        *v.add(t * vd + (e - 2 * kd)) = s;
     }
 }
 

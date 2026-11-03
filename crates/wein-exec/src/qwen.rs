@@ -38,9 +38,9 @@ use wein_engine::{Executor, SampleParams, StepError};
 use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
-    AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp, EmbedOp,
-    GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormGatedOp, RmsNormZcOp, RopePtOp, SampleRowsOp,
-    SigmulOp, SiluOp,
+    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp,
+    DeltanetOp, DnSplitQkvOp, EmbedOp, GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormGatedOp,
+    RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluMulOp, SiluOp,
 };
 use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
@@ -867,6 +867,10 @@ pub struct Qwen35Executor {
     /// deltanet chunked 总开关（`WEIN_DN_CHUNK=0` 关——大 span prefill 一律
     /// 走老 kernel，回退对拍用；默认开）
     dn_chunk: bool,
+    /// 碎算子融合总开关（`WEIN_FUSED=0` 关——add+norm_zc / silu+mul /
+    /// qkv 去交错三融合全部回退旧三路，A/B 对拍用；默认开。open 期一次
+    /// 定死：图捕获与 eager 共用 run_forward 的同一条分支）
+    fused: bool,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -1370,6 +1374,7 @@ impl Qwen35Executor {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512),
             dn_chunk: std::env::var("WEIN_DN_CHUNK").map(|v| v != "0").unwrap_or(true),
+            fused: std::env::var("WEIN_FUSED").map(|v| v != "0").unwrap_or(true),
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -2849,9 +2854,16 @@ impl Qwen35Executor {
             .flat_map(|tt| (0..nqh).map(move |h| (tt * 2 * nqh + 2 * h + 1) as u32))
             .collect();
         // linear qkv [T, 2048|2048|4096] → q/k 各 [T,2048]、v [T,4096]
-        let ids_lq: Vec<u32> = (0..t).map(|tt| (tt * 4) as u32).collect();
-        let ids_lk: Vec<u32> = (0..t).map(|tt| (tt * 4 + 1) as u32).collect();
-        let ids_lv: Vec<u32> = (0..t).map(|tt| (tt * 2 + 1) as u32).collect();
+        //（融合档 dn_split_qkv 不吃下标表——表构筑/上传一并跳过）
+        let (ids_lq, ids_lk, ids_lv) = if self.fused {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                (0..t).map(|tt| (tt * 4) as u32).collect(),
+                (0..t).map(|tt| (tt * 4 + 1) as u32).collect(),
+                (0..t).map(|tt| (tt * 2 + 1) as u32).collect(),
+            )
+        };
         let tu = Instant::now();
         // 常驻输入表前缀覆写（零分配：open 期一次分配，见 MixIn 注释）
         let mi = &self.mix;
@@ -2866,9 +2878,11 @@ impl Qwen35Executor {
         mi.tpos.upload_prefix_on(&tok_pos, stream);
         mi.iq.upload_prefix_on(&ids_q, stream);
         mi.ig.upload_prefix_on(&ids_gate, stream);
-        mi.ilq.upload_prefix_on(&ids_lq, stream);
-        mi.ilk.upload_prefix_on(&ids_lk, stream);
-        mi.ilv.upload_prefix_on(&ids_lv, stream);
+        if !self.fused {
+            mi.ilq.upload_prefix_on(&ids_lq, stream);
+            mi.ilk.upload_prefix_on(&ids_lk, stream);
+            mi.ilv.upload_prefix_on(&ids_lv, stream);
+        }
         // logits 行表（仅非恒等步：恒等时 lm_head 直接吃 n2，行表用不上）
         if !lg_ident {
             mi.lg_rows.upload_prefix_on(&lg_rows, stream);
@@ -3137,6 +3151,7 @@ impl Qwen35Executor {
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
         let mut lin_i = 0usize;
         let mut full_i = 0usize;
+        let last_li = self.layers.len() - 1;
         for (li, layer) in self.layers.iter().enumerate() {
             self.prof_mark("norm");
             tb.rms_norm_zc.run(&self.scr.x, &layer.ln1, &self.scr.n1, t32, h, eps, stream);
@@ -3242,9 +3257,16 @@ impl Qwen35Executor {
                         self.cfg.conv_kernel, n_rows, inp.specs, stream,
                     );
                     self.prof_mark("gather");
-                    tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
-                    tb.embed.run(inp.ilk, &self.scr.qkvc, &self.scr.ks, keyd, t32, stream);
-                    tb.embed.run(inp.ilv, &self.scr.qkvc, &self.scr.vs, vald, t32, stream);
+                    if self.fused {
+                        tb.dn_split_qkv.run(
+                            &self.scr.qkvc, &self.scr.qs, &self.scr.ks, &self.scr.vs, keyd, vald,
+                            t32, stream,
+                        );
+                    } else {
+                        tb.embed.run(inp.ilq, &self.scr.qkvc, &self.scr.qs, keyd, t32, stream);
+                        tb.embed.run(inp.ilk, &self.scr.qkvc, &self.scr.ks, keyd, t32, stream);
+                        tb.embed.run(inp.ilv, &self.scr.qkvc, &self.scr.vs, vald, t32, stream);
+                    }
                     self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.z, &self.scr.z, t32, vald, h, stream);
                     tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
@@ -3310,26 +3332,50 @@ impl Qwen35Executor {
                 }
             }
             self.prof_mark("eltw");
-            tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, t32 * h, stream);
-            self.prof_mark("norm");
-            tb.rms_norm_zc.run(&self.scr.h2, &layer.ln2, &self.scr.n2, t32, h, eps, stream);
+            if self.fused {
+                // site A：注意力输出残差 + ln2（add 与 rms_norm_zc 两发并一发）
+                tb.add_norm_zc.run(
+                    &self.scr.x, &self.scr.o, &layer.ln2, &self.scr.h2, &self.scr.n2, t32, h, eps,
+                    stream,
+                );
+            } else {
+                tb.add.run(&self.scr.x, &self.scr.o, &self.scr.h2, t32 * h, stream);
+                self.prof_mark("norm");
+                tb.rms_norm_zc.run(&self.scr.h2, &layer.ln2, &self.scr.n2, t32, h, eps, stream);
+            }
             self.prof_mark("gemm");
             tb.gemm.run_wt(&self.scr.n2, &layer.wg, &self.scr.g, t32, ii, h, stream);
             tb.gemm.run_wt(&self.scr.n2, &layer.wu, &self.scr.u, t32, ii, h, stream);
             self.prof_mark("eltw");
-            tb.silu.run(&self.scr.g, &self.scr.act, t32 * ii, stream);
-            tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t32 * ii, stream);
+            if self.fused {
+                tb.silu_mul.run(&self.scr.g, &self.scr.u, &self.scr.m, t32 * ii, stream);
+            } else {
+                tb.silu.run(&self.scr.g, &self.scr.act, t32 * ii, stream);
+                tb.mul.run(&self.scr.act, &self.scr.u, &self.scr.m, t32 * ii, stream);
+            }
             self.prof_mark("gemm");
             tb.gemm.run_wt(&self.scr.m, &layer.wd, &self.scr.d, t32, h, ii, stream);
             self.prof_mark("eltw");
-            tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.x, t32 * h, stream);
+            if self.fused && li == last_li {
+                // 模型尾：末层残差 + final norm 在旧拓扑的尾 add 位置一发完成
+                //（kernel 流序不变——旧路径此处 add、循环外 norm，中间无 kernel）
+                tb.add_norm_zc.run(
+                    &self.scr.h2, &self.scr.d, &self.norm_f, &self.scr.x, &self.scr.n2, t32, h,
+                    eps, stream,
+                );
+            } else {
+                // site B（每层尾 add + 下一层 ln1）不融合（trace_x 时序/循环重构风险）
+                tb.add.run(&self.scr.h2, &self.scr.d, &self.scr.x, t32 * h, stream);
+            }
             if trace {
                 self.trace_x(&format!("s{step}-layer-{li:02}"), t32);
             }
         }
         // ── final norm + logits（tie：embed 兼作 lm_head 的 W[n,k]）──
-        self.prof_mark("norm");
-        tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
+        if !self.fused {
+            self.prof_mark("norm");
+            tb.rms_norm_zc.run(&self.scr.x, &self.norm_f, &self.scr.n2, t32, h, eps, stream);
+        }
         self.prof_mark("logits");
         // 只对**需要出 token 的行**做 248K 词表投影：混合/纯 prefill 步里
         // 段中被丢掉的中间行（chunk 前 255 行）不参与 lm_head。行先按

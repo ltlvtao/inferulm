@@ -21,9 +21,9 @@
 #![allow(dead_code)]
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
-    ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp, GemmOp, OpTable,
-    RmsNormGatedOp,
-    RmsNormZcOp, RopePtOp, SigmulOp,
+    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp,
+    DnSplitQkvOp, EmbedOp, GemmOp, MulOp, OpTable, RmsNormGatedOp, RmsNormZcOp, RopePtOp,
+    SigmulOp, SiluMulOp, SiluOp,
 };
 use wein_kernel::reference;
 use wein_platform::{Device, HardwareProfile};
@@ -768,4 +768,108 @@ fn o35_deltanet_chunked_tolerance() {
     o35_case(2, 4, &[0], &[500], 128, 8);
     // 双行 300+133（非整块尾 ×2、行间状态独立、snap_off 前缀）
     o35_case(1, 2, &[0, 300], &[300, 133], 64, 8);
+}
+
+/// o36 · 三融合算子 vs 两发分离位级对拍（WEIN_FUSED 接线的位级合同）：
+/// add_norm_zc / silu_mul / dn_split_qkv 与旧 kernel 序列逐位 ==
+#[test]
+fn o36_fused_ops_bitwise() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+
+    // ── add_norm_zc vs add → rms_norm_zc（含 hidden<bdim 的闲线程树）──
+    for (rows, hidden) in [(3usize, 65usize), (17, 256), (29, 2560)] {
+        let n = rows * hidden;
+        let a = vec_bf16(0x1101, n, 3.0);
+        let b = vec_bf16(0x2202, n, 3.0);
+        let w = vec_bf16(0x3303, hidden, 0.5);
+        let (da, db, dw) = (
+            gpu.alloc_from_slice(&a),
+            gpu.alloc_from_slice(&b),
+            gpu.alloc_from_slice(&w),
+        );
+        let dsum = gpu.alloc_bytes(n * 2);
+        t.add.run(&da, &db, &dsum, n as u32, &stream);
+        let dnorm = gpu.alloc_bytes(n * 2);
+        t.rms_norm_zc.run(&dsum, &dw, &dnorm, rows as u32, hidden as u32, 1e-6, &stream);
+        let (dsum2, dnorm2) = (gpu.alloc_bytes(n * 2), gpu.alloc_bytes(n * 2));
+        t.add_norm_zc.run(
+            &da, &db, &dw, &dsum2, &dnorm2, rows as u32, hidden as u32, 1e-6, &stream,
+        );
+        stream.sync();
+        assert_bits(
+            &format!("add_norm_zc sum {rows}x{hidden}"),
+            &dsum2.read_to_vec(),
+            &dsum.read_to_vec(),
+        );
+        assert_bits(
+            &format!("add_norm_zc norm {rows}x{hidden}"),
+            &dnorm2.read_to_vec(),
+            &dnorm.read_to_vec(),
+        );
+    }
+
+    // ── silu_mul vs silu → mul（act 的 bf16 中间舍入两侧同在）──
+    for n in [1000usize, 9216 * 3] {
+        let g = vec_bf16(0x4404, n, 3.0);
+        let u = vec_bf16(0x5505, n, 2.0);
+        let (dg, du) = (gpu.alloc_from_slice(&g), gpu.alloc_from_slice(&u));
+        let dact = gpu.alloc_bytes(n * 2);
+        t.silu.run(&dg, &dact, n as u32, &stream);
+        let dout = gpu.alloc_bytes(n * 2);
+        t.mul.run(&dact, &du, &dout, n as u32, &stream);
+        let dout2 = gpu.alloc_bytes(n * 2);
+        t.silu_mul.run(&dg, &du, &dout2, n as u32, &stream);
+        stream.sync();
+        assert_bits(&format!("silu_mul n={n}"), &dout2.read_to_vec(), &dout.read_to_vec());
+    }
+
+    // ── dn_split_qkv vs 3× embed gather（exec 同款下标表；vd=2·kd 档）──
+    for (tokens, kd, vd) in [(4usize, 256usize, 512usize), (3, 2048, 4096)] {
+        let cd = 2 * kd + vd;
+        let src = vec_bf16(0x6606, tokens * cd, 4.0);
+        let ilq: Vec<u32> = (0..tokens).map(|tt| (tt * 4) as u32).collect();
+        let ilk: Vec<u32> = (0..tokens).map(|tt| (tt * 4 + 1) as u32).collect();
+        let ilv: Vec<u32> = (0..tokens).map(|tt| (tt * 2 + 1) as u32).collect();
+        let dsrc = gpu.alloc_from_slice(&src);
+        let (dilq, dilk, dilv) = (
+            gpu.alloc_from_slice(&ilq),
+            gpu.alloc_from_slice(&ilk),
+            gpu.alloc_from_slice(&ilv),
+        );
+        let (dq, dk, dv) = (
+            gpu.alloc_bytes(tokens * kd * 2),
+            gpu.alloc_bytes(tokens * kd * 2),
+            gpu.alloc_bytes(tokens * vd * 2),
+        );
+        t.embed.run(&dilq, &dsrc, &dq, kd as u32, tokens as u32, &stream);
+        t.embed.run(&dilk, &dsrc, &dk, kd as u32, tokens as u32, &stream);
+        t.embed.run(&dilv, &dsrc, &dv, vd as u32, tokens as u32, &stream);
+        let (dq2, dk2, dv2) = (
+            gpu.alloc_bytes(tokens * kd * 2),
+            gpu.alloc_bytes(tokens * kd * 2),
+            gpu.alloc_bytes(tokens * vd * 2),
+        );
+        t.dn_split_qkv.run(
+            &dsrc, &dq2, &dk2, &dv2, kd as u32, vd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        assert_bits(
+            &format!("dn_split_qkv q t={tokens} kd={kd}"),
+            &dq2.read_to_vec(),
+            &dq.read_to_vec(),
+        );
+        assert_bits(
+            &format!("dn_split_qkv k t={tokens} kd={kd}"),
+            &dk2.read_to_vec(),
+            &dk.read_to_vec(),
+        );
+        assert_bits(
+            &format!("dn_split_qkv v t={tokens} vd={vd}"),
+            &dv2.read_to_vec(),
+            &dv.read_to_vec(),
+        );
+    }
 }

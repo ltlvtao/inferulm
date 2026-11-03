@@ -79,8 +79,11 @@ pub struct OpTable<'a> {
     pub embed: EmbedCuda<'a>,
     pub add: AddCuda<'a>,
     pub mul: MulCuda<'a>,
+    pub silu_mul: SiluMulCuda<'a>,
     // I1 竖切（Qwen3.5 文本骨干）
     pub rms_norm_zc: RmsNormZcCuda<'a>,
+    pub add_norm_zc: AddNormZcCuda<'a>,
+    pub dn_split_qkv: DnSplitQkvCuda<'a>,
     pub rope_pt: RopePtCuda<'a>,
     pub sigmul: SigmulCuda<'a>,
     pub conv1d_dw: Conv1dDwCuda<'a>,
@@ -212,12 +215,19 @@ impl OpTable<'_> {
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
         let mul = MulCuda { gpu, f: m.func("mul") };
+        let silu_mul = SiluMulCuda { gpu, f: m.func("silu_mul") };
         // I1 竖切八入口（同模块；deltanet 自带块几何——注册时零假设）
         let rms_norm_zc = RmsNormZcCuda {
             gpu,
             f: m.func("rms_norm_zc"),
             scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
+        let add_norm_zc = AddNormZcCuda {
+            gpu,
+            f: m.func("add_norm_zc"),
+            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
+        };
+        let dn_split_qkv = DnSplitQkvCuda { gpu, f: m.func("dn_split_qkv") };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
@@ -250,7 +260,8 @@ impl OpTable<'_> {
             }])?,
         )};
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
-            rms_norm_zc, rope_pt, sigmul, conv1d_dw, conv_state_roll, deltanet, deltanet_chunked,
+            silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, rope_pt, sigmul, conv1d_dw, conv_state_roll,
+            deltanet, deltanet_chunked,
             rms_norm_gated, argmax_rows, sample_rows })
     }
 }
@@ -319,6 +330,28 @@ impl MulOp for MulCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "mul/cuda"
+    }
+}
+
+/// silu + mul 融合（SwiGLU 激活）：out = bf16(f32(bf16(silu(g)))·f32(u))——
+/// 与 `silu`→`mul` 两发逐位同（中间 bf16 舍入保留在 kernel 内）
+pub trait SiluMulOp {
+    fn run(&self, g: &DevBuf, u: &DevBuf, out: &DevBuf, n: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct SiluMulCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl SiluMulOp for SiluMulCuda<'_> {
+    fn run(&self, g: &DevBuf, u: &DevBuf, out: &DevBuf, n: u32, stream: &Stream) {
+        let args = crate::kernel_args![*g, *u, *out, n];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "silu_mul/cuda"
     }
 }
 
@@ -423,6 +456,106 @@ impl RmsNormZcOp for RmsNormZcCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "rms_norm_zc/cuda"
+    }
+}
+
+/// add + 零中心 RMSNorm 融合（残差后 ln2 / final norm）：sum_out 与
+/// `add` 逐位同、norm_out 与 `rms_norm_zc` 逐位同（块几何同 block-per-row，
+/// 归约 scratch 同款——两发并一发）
+pub trait AddNormZcOp {
+    /// a/b/sum_out: [rows, hidden] bf16；w: [hidden] bf16
+    fn run(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        w: &DevBuf,
+        sum_out: &DevBuf,
+        norm_out: &DevBuf,
+        rows: u32,
+        hidden: u32,
+        eps: f32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct AddNormZcCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+    /// 块归约 scratch（同 RmsNormZcCuda——resolve 期预分配，capture 期零分配）
+    scratch: DevBuf<'a>,
+}
+
+impl AddNormZcOp for AddNormZcCuda<'_> {
+    fn run(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        w: &DevBuf,
+        sum_out: &DevBuf,
+        norm_out: &DevBuf,
+        rows: u32,
+        hidden: u32,
+        eps: f32,
+        stream: &Stream,
+    ) {
+        let args =
+            crate::kernel_args![*a, *b, *w, *sum_out, *norm_out, hidden, eps, rows, self.scratch];
+        // 块几何与 rms_norm_zc 同构（归约树位级复刻的前提）
+        let b = hidden.min(256).next_power_of_two();
+        assert!(
+            rows as usize * b as usize * 4 <= self.scratch.bytes(),
+            "add_norm_zc rows={rows} 超 scratch 容量 {} 槽",
+            self.scratch.bytes() / 4
+        );
+        self.gpu.launch(&self.f, rows, b, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "add_norm_zc/cuda"
+    }
+}
+
+/// linear 层 conv 输出去交错：src [t, 2·kd+vd]（每 token q|k|v 交错）一发
+/// 拆到 q/k [t,kd]、v [t,vd]——与 3×embed gather 逐位同（纯位搬运）
+pub trait DnSplitQkvOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        src: &DevBuf,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        k_dim: u32,
+        v_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct DnSplitQkvCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl DnSplitQkvOp for DnSplitQkvCuda<'_> {
+    fn run(
+        &self,
+        src: &DevBuf,
+        q: &DevBuf,
+        k: &DevBuf,
+        v: &DevBuf,
+        k_dim: u32,
+        v_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * (2 * k_dim + v_dim);
+        let args = crate::kernel_args![*src, *q, *k, *v, k_dim, v_dim, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "dn_split_qkv/cuda"
     }
 }
 

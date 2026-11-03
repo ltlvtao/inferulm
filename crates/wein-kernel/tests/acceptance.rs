@@ -65,6 +65,9 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry mul("), "mul 入口缺失/被改名");
     // I1 竖切（Qwen3.5 文本骨干）八入口
     assert!(ptx.contains(".entry rms_norm_zc("), "rms_norm_zc 入口缺失/被改名");
+    assert!(ptx.contains(".entry add_norm_zc("), "add_norm_zc 入口缺失/被改名");
+    assert!(ptx.contains(".entry silu_mul("), "silu_mul 入口缺失/被改名");
+    assert!(ptx.contains(".entry dn_split_qkv("), "dn_split_qkv 入口缺失/被改名");
     assert!(ptx.contains(".entry rope_pt("), "rope_pt 入口缺失/被改名");
     assert!(ptx.contains(".entry sigmul("), "sigmul 入口缺失/被改名");
     assert!(ptx.contains(".entry conv1d_dw("), "conv1d_dw 入口缺失/被改名");
@@ -121,8 +124,8 @@ fn k1_ptx_artifact_structure() {
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        58,
-        "导出 kernel 数应为 58（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2 + v3 档 8）"
+        61,
+        "导出 kernel 数应为 61（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2 + v3 档 8 + 融合 3）"
     );
 }
 
