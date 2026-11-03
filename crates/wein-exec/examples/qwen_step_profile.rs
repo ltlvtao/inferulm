@@ -70,7 +70,7 @@ fn main() {
     if std::env::var("WEIN_TUNE_DUMP").is_ok() {
         for r in ex.gemm_tune_report() {
             if r.candidates > 0 {
-                println!("tune m={} n={} k={} wt={} chosen={} argmin={} best={:.4}ms", r.m, r.n, r.k, r.wt, r.chosen, r.argmin, r.best_ms);
+                println!("tune m={} n={} k={} wt={} chosen={} argmin={} best={:.4}ms ws={}", r.m, r.n, r.k, r.wt, r.chosen, r.argmin, r.best_ms, r.ws);
             }
         }
     }

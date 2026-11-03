@@ -70,6 +70,8 @@ pub struct GemmTuneRecord {
     pub best_ms: f64,
     /// heuristic 首选同协议实测（ms）——配对比较基线
     pub first_ms: f64,
+    /// 选中候选的 workspace 字节数（0 = eager 路径免 Lt 内部 memset 对）
+    pub ws: usize,
 }
 
 /// 进程级 algo 钉表：同形状后开实例复用先钉选型（qg2 零漂移要求
@@ -374,6 +376,13 @@ impl BlasLt<'_> {
     /// （毫厘之得让位于跨会话选型一致）。计时写花 c 无害：真 launch 随后
     /// 以 beta=0 覆写。capturing 中不测（防御；build_graphs 的 eager 预热
     /// 保证缓存先于捕获变暖，此路径正常不达）。
+    ///
+    /// **ws0 偏好**（WEIN_LT_WS0=0 关）：workspace_size==0 的候选在时间
+    /// 损失 ≤3% 内优先——Lt 对带工作区的 algo 每次调用内部发一对
+    /// memset（实测 ~1MB+48KB，nsys 满载 c=100 每 gemm 一对、每步 ~330
+    /// 次 ≈ 1.3ms CPU + ~1ms GPU）。图内 memset 是节点零 CPU，eager
+    /// 混合步全裸付——省 API 比毫厘 gemm 时间值钱。偏好是形状纯函数
+    /// （同候选集同规则），qg2 双执行器选型一致性不受影响。
     #[allow(clippy::too_many_arguments)]
     fn pick_algo(
         &self,
@@ -388,8 +397,9 @@ impl BlasLt<'_> {
         valid: &[HeuristicResult],
         stream: &Stream,
     ) -> [u64; 8] {
+        let ws0_pref = std::env::var("WEIN_LT_WS0").map(|v| v != "0").unwrap_or(true);
         if capturing() {
-            let rec = GemmTuneRecord { m, n, k, wt, candidates: 0, argmin: 0, chosen: 0, best_ms: 0.0, first_ms: 0.0 };
+            let rec = GemmTuneRecord { m, n, k, wt, candidates: 0, argmin: 0, chosen: 0, best_ms: 0.0, first_ms: 0.0, ws: valid[0].workspace_size };
             self.report.borrow_mut().push(rec);
             return valid[0].algo;
         }
@@ -411,7 +421,7 @@ impl BlasLt<'_> {
         }
         // 全候选探测失败（理论不达）：退回首选用不测直取
         let Some(&(argmin, best_ms)) = timings.iter().min_by(|x, y| x.1.total_cmp(&y.1)) else {
-            let rec = GemmTuneRecord { m, n, k, wt, candidates: 0, argmin: 0, chosen: 0, best_ms: 0.0, first_ms: 0.0 };
+            let rec = GemmTuneRecord { m, n, k, wt, candidates: 0, argmin: 0, chosen: 0, best_ms: 0.0, first_ms: 0.0, ws: valid[0].workspace_size };
             self.report.borrow_mut().push(rec);
             return valid[0].algo;
         };
@@ -423,8 +433,21 @@ impl BlasLt<'_> {
             .unwrap_or(best_ms);
         // 滞回：近竞（gain < 5% 或 < 1µs）钉回首选取跨会话稳定
         let gain = first_ms - best_ms;
-        let chosen = if best_ms <= first_ms * 0.95 && gain >= 0.001 { argmin } else { 0 };
-        let rec = GemmTuneRecord { m, n, k, wt, candidates: timings.len(), argmin, chosen, best_ms, first_ms };
+        let mut chosen = if best_ms <= first_ms * 0.95 && gain >= 0.001 { argmin } else { 0 };
+        // ws0 偏好：最快候选带工作区时，找 ws==0 里最快的；时间损失 ≤3%
+        // 才换（毫厘之得让位于 eager 步的 API 发射税）
+        if ws0_pref && valid[chosen].workspace_size > 0 {
+            if let Some(&(w0, w0_ms)) = timings
+                .iter()
+                .filter(|&&(vi, _)| valid[vi].workspace_size == 0)
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+            {
+                if w0_ms <= best_ms * 1.03 {
+                    chosen = w0;
+                }
+            }
+        }
+        let rec = GemmTuneRecord { m, n, k, wt, candidates: timings.len(), argmin, chosen, best_ms, first_ms, ws: valid[chosen].workspace_size };
         self.report.borrow_mut().push(rec);
         valid[chosen].algo
     }
