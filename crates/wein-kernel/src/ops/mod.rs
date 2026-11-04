@@ -431,7 +431,6 @@ const DN_CHUNK_ROWS_CAP: usize = 4;
 const DN_CHUNK_VSPLIT_MAX: usize = 8;
 /// fwd_h ① 两相部分和区（f32/块；2 任务 × 16 输出 × 32 lane × 8 warp——须与
 /// kernel 侧 stride 公式一致）
-const DN_H_PART_FLOATS: usize = 8192;
 /// 块数容量余量（行数 ≤ DN_CHUNK_ROWS_CAP 时 Σceil(cnt/BT) ≤ tokens/BT + 行数，取 +8）
 const DN_CHUNK_CHUNK_SLACK: usize = 8;
 
@@ -996,7 +995,7 @@ impl<'a> DeltanetChunkedCuda<'a> {
             inv: gpu.alloc_bytes(t * DELTA_L2_KHEADS_CAP * 2 * 4),
             gcum: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * 4),
             u: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * 4),
-            w: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * 4),
+            w: gpu.alloc_bytes(t * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * 8), // f32 区 + hi/lo 双镜像
             snap: gpu.alloc_bytes(cch * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM * DN_CHUNK_DIM * 2),
             scratch1: gpu.alloc_bytes(
                 cch * DN_CHUNK_VHEADS_CAP * 5 * DN_CHUNK_BT_MAX * 4,
@@ -1004,8 +1003,8 @@ impl<'a> DeltanetChunkedCuda<'a> {
             scratch2: gpu.alloc_bytes(
                 DN_CHUNK_ROWS_CAP
                     * DN_CHUNK_VHEADS_CAP
-                    * (DN_CHUNK_DIM * DN_CHUNK_DIM
-                        + DN_CHUNK_VSPLIT_MAX * (DN_CHUNK_BT_MAX + DN_H_PART_FLOATS))
+                    * (DN_CHUNK_DIM * DN_CHUNK_DIM / 2
+                        + DN_CHUNK_BT_MAX * (1 + DN_CHUNK_DIM))
                     * 4,
             ),
             tokens_cap: t,
@@ -1069,7 +1068,8 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
         let mut sp = vsplit.clamp(1, DN_CHUNK_VSPLIT_MAX as u32);
         loop {
             let vrows = v_dim / sp;
-            let need = n_rows as usize * v_heads as usize * sp as usize * (vrows as usize * k_dim as usize + bt as usize + DN_H_PART_FLOATS);
+            let need = n_rows as usize * v_heads as usize * sp as usize
+                * (vrows as usize * k_dim as usize / 2 + bt as usize + bt as usize * vrows as usize);
             if need <= h_slots || sp == 1 {
                 break;
             }
@@ -1084,17 +1084,22 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
         //    共用——块内逐 v 头 scan/rhs/尾乘/solve）；block = vd+kd = 256 恰满
         assert!(v_heads % k_heads == 0, "v_heads 必须整除 k_heads（Gram 共用）");
         let grid_co = chunks * k_heads; // o ① Gram 按 k 头共用（块内逐 v 头尾乘）
+        // w hi/lo 图像元素基址：hi @ 2·cap、lo @ 3·cap（字节 4N/6N）——恒在
+        // f32 全区之上且互不相交；prep 尾打包写镜像区天然无竞态（半址原位
+        // 曾跨块竞态，见 kernel 注）
+        let wimg = self.tokens_cap as usize * DN_CHUNK_VHEADS_CAP * DN_CHUNK_DIM;
+        let (w_hi_off, w_lo_off) = ((wimg * 2) as u32, (wimg * 3) as u32);
         let prep_args = crate::kernel_args![
             *k, *v, *a, *b, *a_log, *dt_bias, self.inv, self.gcum, self.u, self.w,
             *row_start, *row_count, *snap_off, n_rows, chunks, k_heads, v_heads, k_dim, v_dim,
-            bt, self.snap, self.scratch1,
+            bt, self.snap, self.scratch1, w_hi_off, w_lo_off,
         ];
         self.gpu.launch(&self.f_prep, chunks * k_heads, 256, &prep_args, stream);
         // ③ fwd_h：块间串行状态推进 + 快照 + 末态回池（grid = 行 × v 头 × vsplit）
         let h_args = crate::kernel_args![
             *k, self.inv, self.gcum, self.u, self.w, self.snap, *state,
             *row_start, *row_count, *row_id, *snap_off, n_rows, k_heads, v_heads, k_dim, v_dim,
-            bt, sp, self.scratch2,
+            bt, sp, self.scratch2, w_hi_off, w_lo_off,
         ];
         // sp=8（vrows=16）：VW4 派发下 128 线程（4 warp）恰满行；小块多驻留
         // （256 块 / 128 SM → 多块/SM 共驻，藏 ② tp 链载入延迟）

@@ -103,6 +103,12 @@ impl Gpu {
         Module { drv: &self.drv, handle }
     }
 
+    /// 二进制镜像（CUBIN ELF）直接加载——JIT 判决实验用
+    pub fn drv_module(&self, image: &[u8]) -> Module<'_> {
+        let handle = self.drv.module_load_data(image).expect("cuModuleLoadDataEx(cubin)");
+        Module { drv: &self.drv, handle }
+    }
+
     pub fn alloc_bytes(&self, bytes: usize) -> DevBuf<'_> {
         capture_guard();
         DevBuf {

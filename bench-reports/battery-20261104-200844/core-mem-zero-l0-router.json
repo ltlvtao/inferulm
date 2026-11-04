@@ -1,0 +1,22 @@
+{
+  "config": {
+    "concurrency": 100,
+    "num": 20000
+  },
+  "meta": {
+    "git_rev": "ccc15fb",
+    "profile": "release",
+    "ts_unix": 1793794129
+  },
+  "mode": "flood GET /v1/models",
+  "result": {
+    "error_kinds": {},
+    "errors": 0,
+    "lat_p50_ms": 0.515383,
+    "lat_p99_ms": 1.562619,
+    "qps": 162639.13086429134,
+    "wait_p50_ms": 61.887942,
+    "wait_p99_ms": 117.845575,
+    "wall_s": 0.122971636
+  }
+}

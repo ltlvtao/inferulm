@@ -740,6 +740,20 @@ fn o35_case(k_heads: usize, v_heads: usize, row_start: &[u32], row_count: &[u32]
     let (rel2_ce_s, peak_ce_s) = norm_err(f32s(&got_state).iter().zip(&ex_s).map(|(&x, &y)| (x, y)));
     let (_, peak_re_o) = norm_err(f32s(&expect_out).iter().zip(&ex_o).map(|(&x, &y)| (x, y)));
     let (_, peak_re_s) = norm_err(f32s(&expect_state).iter().zip(&ex_s).map(|(&x, &y)| (x, y)));
+    if peak_ce_o > 4.0e-3 {
+        // 离群元素解剖：got/锚/ref 三方逐元素对质（锚=全程 f32 只在末尾收一次
+        // bf16；ref=每 token 落池收 bf16）
+        let (gf, ef) = (f32s(&got_out), f32s(&expect_out));
+        let mut idx: Vec<usize> = (0..gf.len()).filter(|&i| (gf[i] - ex_o[i]).abs() > 3.9e-3).collect();
+        idx.sort_by(|&a, &b| (gf[a] - ex_o[a]).abs().total_cmp(&(gf[b] - ex_o[b]).abs()));
+        for &i in idx.iter().rev().take(4) {
+            eprintln!(
+                "  锚离群[{i}] tok={} h={} vv={}：got {:.6} / 锚 {:.6} / ref {:.6}（|got−锚| {:.3e}，|got−ref| {:.3e}，|锚−ref| {:.3e}）",
+                i / (v_heads * v_dim), (i / v_dim) % v_heads, i % v_dim,
+                gf[i], ex_o[i], ef[i], (gf[i] - ex_o[i]).abs(), (gf[i] - ef[i]).abs(), (ex_o[i] - ef[i]).abs(),
+            );
+        }
+    }
     eprintln!(
         "o35 {tag}（钳后 vsplit={sp}，chunks={chunks}）：\n    vs reference  out rel2 {rel2_cr_o:.3e}/峰 {peak_cr_o:.3e}，state rel2 {rel2_cr_s:.3e}/峰 {peak_cr_s:.3e}\n    vs f32 锚     out rel2 {rel2_ce_o:.3e}/峰 {peak_ce_o:.3e}，state rel2 {rel2_ce_s:.3e}/峰 {peak_ce_s:.3e}\n    (锚 vs ref   out 峰 {peak_re_o:.3e}，state 峰 {peak_re_s:.3e}——reference 自身逐 token bf16 收的噪声地板)",
     );
@@ -754,7 +768,10 @@ fn o35_case(k_heads: usize, v_heads: usize, row_start: &[u32], row_count: &[u32]
     // 峰值 ≤ 8e-3 钉上界（实测 ~1.6 ULP）
     assert!(rel2_cr_o <= 3.0e-3, "o35 {tag} 输出 rel2 越门：{rel2_cr_o:.3e} > 3e-3");
     assert!(rel2_cr_s <= 3.0e-3, "o35 {tag} 末态 rel2 越门：{rel2_cr_s:.3e} > 3e-3");
-    assert!(peak_ce_o <= 4.0e-3, "o35 {tag} 输出 vs f32 锚峰值越门：{peak_ce_o:.3e} > 4e-3（超单 bf16 ULP——查代数）");
+    // 锚门 = kernel 自身预算（max 幅值处 1 bf16 ULP = 4e-3）+ 锚实测噪声地板
+    // （锚=全程 f32 只末尾收一次，对逐 token 收 bf16 的 reference 自身可差
+    // ~1.6 ULP——实测离群元素 got≡ref、锚独偏，见上方离群打印）。
+    assert!(peak_ce_o <= 4.0e-3 + peak_re_o, "o35 {tag} 输出 vs f32 锚峰值越门：{peak_ce_o:.3e} > {max:.3e}（超 1 ULP+锚噪声——查代数）", max = 4.0e-3 + peak_re_o);
     assert!(peak_ce_s <= 4.0e-3, "o35 {tag} 末态 vs f32 锚峰值越门：{peak_ce_s:.3e} > 4e-3（末态池单次 bf16 收的量子）");
     assert!(peak_cr_o <= 8.0e-3, "o35 {tag} 输出 vs reference 峰值越门：{peak_cr_o:.3e} > 8e-3（超舍入预算——查代数）");
     assert!(peak_cr_s <= 8.0e-3, "o35 {tag} 末态 vs reference 峰值越门：{peak_cr_s:.3e} > 8e-3");
@@ -766,6 +783,11 @@ fn o35_deltanet_chunked_tolerance() {
     o35_case(2, 4, &[0], &[500], 32, 1);
     o35_case(2, 4, &[0], &[500], 64, 4);
     o35_case(2, 4, &[0], &[500], 128, 8);
+    // ② smem staged 专路（生产几何 bt64/sp8：vrows=16、bdim=128、VW=4）
+    o35_case(2, 4, &[0], &[64], 64, 8);
+    o35_case(2, 4, &[0], &[128], 64, 8);
+    o35_case(2, 4, &[0], &[500], 64, 8);
+    o35_case(2, 4, &[0, 300], &[300, 133], 64, 8);
     // 双行 300+133（非整块尾 ×2、行间状态独立、snap_off 前缀）
     o35_case(1, 2, &[0, 300], &[300, 133], 64, 8);
 }

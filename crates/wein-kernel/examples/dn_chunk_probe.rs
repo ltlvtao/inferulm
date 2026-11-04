@@ -120,7 +120,10 @@ fn main() {
     let inv = gpu.alloc_bytes(tokens * kh * 2 * 4);
     let gcum = gpu.alloc_bytes(tokens * vh * 4);
     let du = gpu.alloc_bytes(tokens * vh * vd * 4);
-    let dw = gpu.alloc_bytes(tokens * vh * kd * 4);
+    // w：前半 f32 solve 区 + hi/lo bf16 镜像（8 字节/元素）
+    let dw = gpu.alloc_bytes(tokens * vh * kd * 8);
+    let wimg = (tokens * vh * kd) as u32;
+    let (w_hi_off, w_lo_off) = (wimg * 2, wimg * 3);
     let snap = gpu.alloc_bytes(chunks * vh * vd * kd * 2);
     let sc1 = gpu.alloc_bytes(chunks * vh * 5 * bt * 4);
     let sc2 = gpu.alloc_bytes(1 * vh * 8 * (vd / 8 * kd + 64 + 8192) * 4);
@@ -133,10 +136,10 @@ fn main() {
         let a1 = wein_kernel::kernel_args![dq, dk, inv, tk, tkh, tkd, eps];
         gpu.launch(&l2f, n_l2.div_ceil(128), 128, &a1, st);
         let a2 = wein_kernel::kernel_args![dk, dv, da, db, da_log, ddtb, inv, gcum, du, dw,
-            drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1];
+            drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1, w_hi_off, w_lo_off];
         gpu.launch(&f_prep, nch * tkh, 256, &a2, st);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
         gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, st);
         let a4 = wein_kernel::kernel_args![dq, dk, inv, gcum, du, snap, dout,
@@ -157,11 +160,11 @@ fn main() {
         gpu.launch(&l2f, n_l2.div_ceil(128), 128, &a1, &s);
         evs[1].record_on(&s);
         let a2 = wein_kernel::kernel_args![dk, dv, da, db, da_log, ddtb, inv, gcum, du, dw,
-            drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1];
+            drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1, w_hi_off, w_lo_off];
         gpu.launch(&f_prep, nch * tkh, 256, &a2, &s);
         evs[2].record_on(&s);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
         gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, &s);
         evs[3].record_on(&s);
