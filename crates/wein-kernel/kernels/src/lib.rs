@@ -109,6 +109,68 @@ pub unsafe extern "ptx-kernel" fn shfl_probe(out_i: *mut i32, out_f: *mut f32) {
     unsafe { *out_f.add(t as usize) = y + w as f32 };
 }
 
+// —— 能力探针：wmma（tensor core HMMA）—— attention 下一量级的钥匙。
+// m16n16k16：bf16 输入 f32 累加。LLVM 签名事实（llvm-link 裁决）：
+// 全家族标量/struct 形式——load 返回 {i32×4}（Rust 元组恰好映射 literal
+// struct）、mma 是 16 标量参数 (i32×4 A, i32×4 B, f32×8 C) -> {f32×8}、
+// store 的非 stride 版 ldm 是 ImmArg（Rust 无法传立即数）——**必须用
+// .stride 变体**（ldm 走普通参数）。
+// 元组进/出 extern 签名触发 improper_ctypes——本就是 llvm intrinsic 旁路，放行
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    #[link_name = "llvm.nvvm.wmma.m16n16k16.load.a.row.stride.bf16"]
+    fn wmma_load_a(p: *const u32, ldm: i32) -> (i32, i32, i32, i32);
+    #[link_name = "llvm.nvvm.wmma.m16n16k16.load.b.col.stride.bf16"]
+    fn wmma_load_b(p: *const u32, ldm: i32) -> (i32, i32, i32, i32);
+    #[link_name = "llvm.nvvm.wmma.m16n16k16.mma.row.col.bf16"]
+    fn wmma_mma(
+        a0: i32,
+        a1: i32,
+        a2: i32,
+        a3: i32,
+        b0: i32,
+        b1: i32,
+        b2: i32,
+        b3: i32,
+        c0: f32,
+        c1: f32,
+        c2: f32,
+        c3: f32,
+        c4: f32,
+        c5: f32,
+        c6: f32,
+        c7: f32,
+    ) -> (f32, f32, f32, f32, f32, f32, f32, f32);
+    #[link_name = "llvm.nvvm.wmma.m16n16k16.store.d.row.stride.f32"]
+    fn wmma_store_c(
+        p: *mut f32,
+        c0: f32,
+        c1: f32,
+        c2: f32,
+        c3: f32,
+        c4: f32,
+        c5: f32,
+        c6: f32,
+        c7: f32,
+        ldm: i32,
+    );
+}
+
+/// wmma 探针：1 warp 协作一次 m16n16k16。C[16][16]f32(row) =
+/// A[16][16]bf16(row-major, ldm=16) @ B（以 col-major 视图读，即 host 侧
+/// 传 B_math 的转置摆放：b[n*16+k] = B_math[k][n]）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn wmma_probe(a: *const u16, b: *const u16, c: *mut f32) {
+    unsafe {
+        let (a0, a1, a2, a3) = wmma_load_a(a as *const u32, 16);
+        let (b0, b1, b2, b3) = wmma_load_b(b as *const u32, 16);
+        let d = wmma_mma(
+            a0, a1, a2, a3, b0, b1, b2, b3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        );
+        wmma_store_c(c, d.0, d.1, d.2, d.3, d.4, d.5, d.6, d.7, 16);
+    }
+}
+
 /// 全局线程 id（一维 grid）
 #[inline(always)]
 fn tid() -> u32 {
@@ -3669,6 +3731,252 @@ macro_rules! v3b_export {
 
 v3b_export!(paged_attn_v3_d32k16, 8, 16);
 v3b_export!(paged_attn_v3_d32k8, 8, 8);
+
+// ═══ v4：wmma（tensor core HMMA）FA2 形态——S=Q@K^T 与 P@V 全走 m16n16k16 ═══
+// 几何：block = 1 warp = (q 头, 16 q 行片)；grid = q_heads × ⌈tokens/16⌉。
+// K 从 global 直读（wmma load.b.col：页内 16 token 连续，B(k=hd,c=tok) 的
+// col-major 视图恰好就是 K row-major——零转置零 staging）；V 转置进 smem
+//（P@V 的 B 需要 col-major = V^T[hd][tok]）；P 经 smem 走 bf16 量化。
+// 在线 softmax 与 online_body/v3 同语义（tile max 归一 + 行级 rescale）。
+// fragment 布局（f32 累加器 m16n16k16，PTX ISA）：lane l 持 2 行 × 4 列——
+// 行 g=l/4 与 g+8，列 2·(l%4)+{0,1} 与 +8；d0/d1=(g,2t/2t+1)、d2/d3=(g+8,·)、
+// d4/d5=(g,2t+8/2t+9)、d6/d7=(g+8,·)。行 max/sum = lane 内 4 值 + 2 级
+// bfly（lane 组 {4g..4g+3}）。O = 16 组（hd 256/16）× 8 f32 全驻寄存器。
+// 合同（host 档选择保证）：16 行同序列、行序 = token 序、纯 prefill 批、
+// hd=256、页=16 token、jsplit 忽略恒 1（直写 out，无偏量表）。
+// 数值：mma 内部累加序 ≠ reference ⇒ 容差档（o38 钉 rel2 ≤ 3e-3），
+/// v4 档（wmma tensor core，1 warp/块 = (q 头, 16 行片)）：纯 prefill 长序列用。
+/// KV 池布局 = 生产 [slot=page·bs+tok][kvh][hd]（与 `slot_of` 同构）。
+/// **host 合同：tokens 须 16 对齐且 ≤ 真实行数**（尾部行由 host 切给 v3）；
+/// kernel 内部对 pos 读/写回另有钳位保险带。GQA：kvh = qh/(qh_n/kv_n)。
+// exp 走 fexp（ex2.approx，v3 容差档同款）。
+#[link_section = ".shared"]
+static mut V4_VT: [u32; 256 * 8] = [0; 2048]; // V^T tile [hd][16tok] bf16 对
+#[link_section = ".shared"]
+static mut V4_P: [u32; 16 * 8] = [0; 128]; // P tile [16q][16kv] bf16 对
+
+macro_rules! v4_unroll16 {
+    ($m:ident) => {
+        $m!(0); $m!(1); $m!(2); $m!(3); $m!(4); $m!(5); $m!(6); $m!(7);
+        $m!(8); $m!(9); $m!(10); $m!(11); $m!(12); $m!(13); $m!(14); $m!(15);
+    };
+}
+
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn paged_attn_v4(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    scratch: *mut f32,
+) {
+    let _ = (part_acc, part_ml, ntok, jsplit, chunk, scratch, head_dim, block_size);
+    let lane = unsafe { _thread_idx_x() } as usize;
+    let g = lane >> 2; // fragment 行 g（另一行 g+8）
+    let t2 = (lane & 3) << 1; // fragment 列基 2t（另一列组 +8）
+    let bid = unsafe { _block_idx_x() } as usize;
+    // grid = q_heads(=16) × ⌈tokens/16⌉，头/片分解用位运算——整数除法会
+    // emit panic 路径（k2 禁宿主调用）；几何常量与 wmma ldm ImmArg 同源
+    let qh = bid & 15;
+    let row0 = bid & !15;
+    let kvh = qh >> 2; // GQA 组 = q_heads/kv_heads = 4 内建
+    let last = tokens as usize - 1;
+    let seq = unsafe { *seq_ids.add(row0) } as usize;
+    // 尾片（tokens 非 16 倍数）：越界行索引钳到末行——死行只算不写
+    let pos_g = unsafe { *positions.add((row0 + g).min(last)) } as usize;
+    let pos_g8 = unsafe { *positions.add((row0 + g + 8).min(last)) } as usize;
+    let max_pos = unsafe { *positions.add((row0 + 15).min(last)) } as usize; // 行序 = token 序
+    let n_tile = (max_pos >> 4) + 1;
+
+    let bt = unsafe { block_table.add(seq * bpr as usize) };
+    let qbase = ((row0 * q_heads as usize + qh) * 256) >> 1; // u32 元素单位
+    let qp = q as *const u32;
+    let outp = out as *mut u16;
+    let orow_g = ((row0 + g) * q_heads as usize + qh) * 256;
+    let orow_g8 = ((row0 + g + 8) * q_heads as usize + qh) * 256;
+
+    // V^T smem / P smem 的泛型指针（build.rs 已改写 .shared）
+    let vt = core::ptr::with_exposed_provenance_mut::<u32>(
+        core::ptr::addr_of_mut!(V4_VT) as usize,
+    );
+    let pp = core::ptr::with_exposed_provenance_mut::<u32>(
+        core::ptr::addr_of_mut!(V4_P) as usize,
+    );
+
+    // O 16 组 × 8 f32 全驻寄存器（literal 下标宏展开防 local——SROA 拆）
+    type O8 = (f32, f32, f32, f32, f32, f32, f32, f32);
+    let mut o: [O8; 16] = [(0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32); 16];
+    let mut m_g = f32::NEG_INFINITY;
+    let mut m_g8 = f32::NEG_INFINITY;
+    let mut l_g = 0f32;
+    let mut l_g8 = 0f32;
+    let mut tile = 0usize;
+    while tile < n_tile {
+        // 上一 tile 的 o_mma 读 vt 与本 tile staging 覆写之间必须隔断
+        //（warp 内 smem 写→读跨 lane 可见性）
+        unsafe { bar_warp_sync(0xffff_ffff) };
+        let page = unsafe { *bt.add(tile) } as usize;
+        // 生产布局 [slot=page·16+tok][kvh][hd]（slot_of 同构）：token 行距 he=kv_heads·256
+        let he = kv_heads as usize * 256;
+        let kbase = page * 16 * he + kvh * 256;
+        let kpage = (k_cache as *const u32).add(kbase >> 1);
+        let vpage = (v_cache as *const u16).add(kbase);
+
+        // ── V^T 转置 staging：lane 认领 hd（8 轮 × 32），global 合并读、
+        //    smem 散写（V[tok][hd] → VT[hd][tok 对]）──
+        let mut r = 0usize;
+        while r < 8 {
+            let hd = lane + (r << 5);
+            let mut j = 0usize;
+            while j < 8 {
+                let lo = unsafe { *vpage.add((j << 1) * he + hd) } as u32;
+                let hi = unsafe { *vpage.add(((j << 1) + 1) * he + hd) } as u32;
+                unsafe { *vt.add((hd << 3) + j) = lo | (hi << 16) };
+                j += 1;
+            }
+            r += 1;
+        }
+        // ── S = Q@K^T：16 步 k（hd 256/16），Q/K 全 global 直读 ──
+        let mut s = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+        let mut k = 0usize;
+        while k < 16 {
+            let qa = unsafe { wmma_load_a(qp.add(qbase + (k << 3)), 4096) };
+            let kb = unsafe { wmma_load_b(kpage.add(k << 3), 1024) };
+            s = unsafe {
+                wmma_mma(
+                    qa.0, qa.1, qa.2, qa.3, kb.0, kb.1, kb.2, kb.3, s.0, s.1, s.2, s.3, s.4, s.5,
+                    s.6, s.7,
+                )
+            };
+            k += 1;
+        }
+
+        // ── 掩码（因果）+ 行 max 归约（lane 内 4 值 → 2 级 bfly）──
+        let j0 = tile << 4;
+        let inf = f32::NEG_INFINITY;
+        let s0 = if j0 + t2 <= pos_g { s.0 * q_scale } else { inf };
+        let s1 = if j0 + t2 + 1 <= pos_g { s.1 * q_scale } else { inf };
+        let s4 = if j0 + t2 + 8 <= pos_g { s.4 * q_scale } else { inf };
+        let s5 = if j0 + t2 + 9 <= pos_g { s.5 * q_scale } else { inf };
+        let s2 = if j0 + t2 <= pos_g8 { s.2 * q_scale } else { inf };
+        let s3 = if j0 + t2 + 1 <= pos_g8 { s.3 * q_scale } else { inf };
+        let s6 = if j0 + t2 + 8 <= pos_g8 { s.6 * q_scale } else { inf };
+        let s7 = if j0 + t2 + 9 <= pos_g8 { s.7 * q_scale } else { inf };
+        let mut mg = s0.max(s1).max(s4).max(s5);
+        let mut mg8 = s2.max(s3).max(s6).max(s7);
+        // bfly 只交换不合并：必须 max/加法回叠（v3 点积同款纪律）
+        mg = mg.max(shfl_bfly_f32(mg, 1));
+        mg = mg.max(shfl_bfly_f32(mg, 2));
+        mg8 = mg8.max(shfl_bfly_f32(mg8, 1));
+        mg8 = mg8.max(shfl_bfly_f32(mg8, 2));
+        let mn_g = m_g.max(mg);
+        let mn_g8 = m_g8.max(mg8);
+        let ag = fexp(m_g - mn_g); // 首 tile：exp(−inf)=0 ✓（行至少 1 可见列）
+        let ag8 = fexp(m_g8 - mn_g8);
+
+        // ── p = exp(s − mn)，行 sum 归约，O rescale ──
+        let p0 = fexp(s0 - mn_g);
+        let p1 = fexp(s1 - mn_g);
+        let p4 = fexp(s4 - mn_g);
+        let p5 = fexp(s5 - mn_g);
+        let p2 = fexp(s2 - mn_g8);
+        let p3 = fexp(s3 - mn_g8);
+        let p6 = fexp(s6 - mn_g8);
+        let p7 = fexp(s7 - mn_g8);
+        let mut sg = p0 + p1 + p4 + p5;
+        let mut sg8 = p2 + p3 + p6 + p7;
+        sg = sg + shfl_bfly_f32(sg, 1);
+        sg = sg + shfl_bfly_f32(sg, 2);
+        sg8 = sg8 + shfl_bfly_f32(sg8, 1);
+        sg8 = sg8 + shfl_bfly_f32(sg8, 2);
+        l_g = l_g * ag + sg;
+        l_g8 = l_g8 * ag8 + sg8;
+        macro_rules! o_rescale {
+            ($i:literal) => {
+                o[$i].0 *= ag;
+                o[$i].1 *= ag;
+                o[$i].4 *= ag;
+                o[$i].5 *= ag;
+                o[$i].2 *= ag8;
+                o[$i].3 *= ag8;
+                o[$i].6 *= ag8;
+                o[$i].7 *= ag8;
+            };
+        }
+        v4_unroll16!(o_rescale);
+
+        // ── P 落 smem（bf16 量化，fragment 位置直写）→ warp 屏障 → A 读回 ──
+        let pk = |lo: f32, hi: f32| -> u32 {
+            (f32_to_bf16(lo) as u32) | ((f32_to_bf16(hi) as u32) << 16)
+        };
+        unsafe {
+            *pp.add((g << 3) + (t2 >> 1)) = pk(p0, p1);
+            *pp.add(((g + 8) << 3) + (t2 >> 1)) = pk(p2, p3);
+            *pp.add((g << 3) + ((t2 + 8) >> 1)) = pk(p4, p5);
+            *pp.add(((g + 8) << 3) + ((t2 + 8) >> 1)) = pk(p6, p7);
+        }
+        unsafe { bar_warp_sync(0xffff_ffff) };
+        let (a0, a1, a2, a3) = unsafe { wmma_load_a(pp as *const u32, 16) };
+        // ── O += P@V^T：16 步 n（hd 256/16）──
+        // VT=[hd][16tok]，B 片段 d 维沿 ldm=16 走 hd ⇒ 组 i 的 hd 基 = 16i ⇒ u32 偏移 16i*8=i<<7
+        macro_rules! o_mma {
+            ($i:literal) => {
+                let vb = unsafe { wmma_load_b(vt.add($i << 7), 16) };
+                o[$i] = unsafe {
+                    wmma_mma(
+                        a0, a1, a2, a3, vb.0, vb.1, vb.2, vb.3, o[$i].0, o[$i].1, o[$i].2,
+                        o[$i].3, o[$i].4, o[$i].5, o[$i].6, o[$i].7,
+                    )
+                };
+            };
+        }
+        v4_unroll16!(o_mma);
+
+        m_g = mn_g;
+        m_g8 = mn_g8;
+        tile += 1;
+    }
+
+    // ── 尾写：O/l → bf16 散写 out（行归属：0/1/4/5→g，2/3/6/7→g+8）──
+    let inv_g = 1.0 / l_g;
+    let inv_g8 = 1.0 / l_g8;
+    // 尾片：越界行（row ≥ tokens）不写
+    let (wg, wg8) = (row0 + g < last + 1, row0 + g + 8 < last + 1);
+    macro_rules! o_write {
+        ($i:literal) => {
+            unsafe {
+                if wg {
+                    *outp.add(orow_g + ($i << 4) + t2) = f32_to_bf16(o[$i].0 * inv_g);
+                    *outp.add(orow_g + ($i << 4) + t2 + 1) = f32_to_bf16(o[$i].1 * inv_g);
+                    *outp.add(orow_g + ($i << 4) + t2 + 8) = f32_to_bf16(o[$i].4 * inv_g);
+                    *outp.add(orow_g + ($i << 4) + t2 + 9) = f32_to_bf16(o[$i].5 * inv_g);
+                }
+                if wg8 {
+                    *outp.add(orow_g8 + ($i << 4) + t2) = f32_to_bf16(o[$i].2 * inv_g8);
+                    *outp.add(orow_g8 + ($i << 4) + t2 + 1) = f32_to_bf16(o[$i].3 * inv_g8);
+                    *outp.add(orow_g8 + ($i << 4) + t2 + 8) = f32_to_bf16(o[$i].6 * inv_g8);
+                    *outp.add(orow_g8 + ($i << 4) + t2 + 9) = f32_to_bf16(o[$i].7 * inv_g8);
+                }
+            }
+        };
+    }
+    v4_unroll16!(o_write);
+}
 
 
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。

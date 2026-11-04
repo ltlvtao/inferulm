@@ -105,6 +105,11 @@ fn b2_chunked_mixed_batch_two_lane() {
     std::env::set_var("WEIN_KV_PAGES", "512");
     std::env::set_var("WEIN_T_MAX", "8192");
     std::env::set_var("WEIN_RADIX", "0");
+    // v4 是形状门控快路：混合步（含独立 decode 行）走 online 路、对照的
+    // 单跑追平步（prefill+decode 融合成单 span）走 v4——两侧算术序不同
+    //（v4 的 P 经 bf16 量化），贪心可偶发翻位。b2 合同是"批形不改语义"，
+    // 须固定 kernel 路径验证；v4 纯 span 等价性由 b1（两侧同走 v4）覆盖。
+    std::env::set_var("WEIN_ATTN_V4", "0");
     let Some(dir) = mdir() else { return };
     let Ok(mut ex) = Qwen35Executor::open(&dir) else {
         panic!("大档（t_max 8192）装配失败：显存不足或容量组合非法");

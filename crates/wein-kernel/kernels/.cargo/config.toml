@@ -3,5 +3,17 @@
 # - 组件 llvm-bitcode-linker（nvptx 链接步骤）+ rust-std-nvptx64-nvidia-cuda
 #   （预编译 std——build-std 不再需要，rust-src 仅作后备）
 # 全部经 rsproxy 镜像安装：rustup component add <名> --toolchain nightly
+#
+# sm_89（2026-11-04，wmma 刀）：默认 sm_70 无 wmma.bf16（需 sm_80+，llc ISel
+# 直接失败）。全 PTX 以 sm_89 编译——driver JIT 照常；数值语义不变（LLVM
+# 不因 cpu 换浮点行为），battery 前后对照兜底。
 [build]
 target = "nvptx64-nvidia-cuda"
+
+# 预编译 core 是通用档，target-cpu ABI mismatch 检查本 nightly 无官方出口
+# （-Zunsafe-allow-abi-mismatch 尚未落地）——build-std 重编 core（rust-src
+# 组件），core 与本 crate 同吃 sm_89，mismatch 消失
+rustflags = ["-C", "target-cpu=sm_89"]
+
+[unstable]
+build-std = ["core", "compiler_builtins"]

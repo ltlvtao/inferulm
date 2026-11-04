@@ -211,6 +211,7 @@ impl OpTable<'_> {
             ],
             pacc_v3: gpu.alloc_bytes(V3_PART_ROWS * V3_SPLIT_CAP * ATTN_TILE_HD_CAP * 4),
             pml_v3: gpu.alloc_bytes(V3_PART_ROWS * V3_SPLIT_CAP * 2 * 4),
+            f_v4: m.func("paged_attn_v4"),
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -1551,6 +1552,9 @@ pub struct PagedAttnCuda<'a> {
     f_qblk: [Func; 6],
     /// v3 档变体表（smem K/V tile + shfl 归约）：顺序 = `V3Var::ALL`
     f_v3: [Func; 8],
+    /// v4 档（wmma tensor core）单入口：几何内建（32 线程/块 =
+    /// 1 warp，grid = q_heads × ⌈tokens/16⌉）
+    f_v4: Func,
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
     /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
@@ -2801,6 +2805,60 @@ impl PagedAttnCuda<'_> {
             let args = crate::kernel_args![self.pacc_v3, self.pml_v3, *out, nrows, js_u, hd_u];
             self.gpu.launch(&self.fc, nrows, 256, &args, stream);
         }
+    }
+
+    /// v4 变体编译后属性（regs / local 溢出字节 / smem 字节）——探针口径
+    pub fn v4_meta(&self) -> (i32, i32, i32) {
+        use crate::cuda::driver::{
+            CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_NUM_REGS,
+            CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        };
+        (
+            self.gpu.func_attribute(&self.f_v4, CU_FUNC_ATTRIBUTE_NUM_REGS),
+            self.gpu.func_attribute(&self.f_v4, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            self.gpu.func_attribute(&self.f_v4, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+        )
+    }
+
+    /// v4 档（wmma tensor core，1 warp/块）：纯 prefill 长序列容差档。
+    /// **host 合同：tokens 须 16 对齐**（尾部行由调用方切给下一档）；
+    /// **精确几何 16 q 头 / 4 kv 头 / hd 256**（wmma 的 ldm 是 ImmArg：
+    /// Q 行距 qh·hd=4096、K 列距 kvh·hd=1024 均内建，其他形状走 v3）；
+    /// KV 池布局与全系统一致 [slot=page·bs+tok][kvh][hd]。单遍在线 softmax
+    /// 代数与 v3 同族（tile 级 rescale），无 scratch、无 jsplit。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_v4(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_v4: tokens=0");
+        assert!(tokens % 16 == 0, "paged_attn_v4: tokens 须 16 对齐（尾行切给下一档）");
+        assert!(
+            head_dim == 256 && q_heads == 16 && kv_heads == 4,
+            "paged_attn_v4: 精确几何 16q/4kv/hd256 专用（wmma ldm ImmArg 内建），其他形状走 v3"
+        );
+        let row_tiles = tokens / 16;
+        let (n0, js1, c0) = (0u32, 1u32, 0u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc_v3, self.pml_v3, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, n0, js1, c0, self.scratch
+        ];
+        self.gpu.launch(&self.f_v4, q_heads * row_tiles, 32, &args, stream);
     }
 
     /// v3 变体编译后属性（regs / local 溢出字节 / smem 字节）——探针口径

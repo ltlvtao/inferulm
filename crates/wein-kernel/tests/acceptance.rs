@@ -118,14 +118,18 @@ fn k1_ptx_artifact_structure() {
         "paged_attn_v3_d32k8",
         "paged_attn_v3_n32k16",
         "paged_attn_v3_n32k8",
+        // v4 档（wmma tensor core）：长 prefill（WEIN_ATTN_V4 接线）
+        "paged_attn_v4",
+        // wmma 能力探针（v4 前置：fragment 映射/累加验证）
+        "wmma_probe",
     ] {
         let head = format!(".entry {k}(");
         assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
     }
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        61,
-        "导出 kernel 数应为 61（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem 能力探针 2 + v3 档 8 + 融合 3）"
+        63,
+        "导出 kernel 数应为 63（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem/wmma 能力探针 3 + v3 档 8 + v4 档 1 + 融合 3）"
     );
 }
 
