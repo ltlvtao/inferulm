@@ -126,10 +126,12 @@ fn k1_ptx_artifact_structure() {
         let head = format!(".entry {k}(");
         assert!(ptx.contains(&head), "{k} 入口缺失/被改名");
     }
+    // attention v5 档（4 warp × 64 行 CTA 共享 K/V smem）
+    assert!(ptx.contains(".entry paged_attn_v5("), "paged_attn_v5 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        63,
-        "导出 kernel 数应为 63（24 + attention A/B 档 15 + deltanet chunked 3 + qblk 6 + shfl/smem/wmma 能力探针 3 + v3 档 8 + v4 档 1 + 融合 3）"
+        64,
+        "导出 kernel 数应为 64（63 + v5 档 1）"
     );
 }
 

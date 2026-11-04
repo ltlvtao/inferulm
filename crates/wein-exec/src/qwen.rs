@@ -870,6 +870,12 @@ pub struct Qwen35Executor {
     /// 块独立重读，KV 工作集（ctx×2KB/层）超 L2 后 4× HBM 放大反慢）
     attn_v4_min_t: u32,
     attn_v4_max_ctx: u32,
+    /// v5 档（4 warp × 64 行 CTA 共享 K/V smem）接管门限：t 下限
+    /// （`WEIN_ATTN_V5_T`，默认 2048）与 ctx 上限（`WEIN_ATTN_V5_CTX`，默认
+    /// 1<<20——v5 每 kvh 流只被 4 个 q 头读（GQA 固有），无 v4 的 4× HBM
+    /// 放大，32K+ 长上下文本档就是为此开的）
+    attn_v5_min_t: u32,
+    attn_v5_max_ctx: u32,
     /// 本步批内最大行位置（forward 入口记账，attn 门控用——设备侧 pos 缓冲
     /// 不回读）
     step_max_pos: u32,
@@ -1014,6 +1020,78 @@ impl Qwen35Executor {
     ) {
         // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        // v5 档（4 warp × 64 行 CTA 共享 K/V smem）：v4 全部合同 + KV 流量
+        // ÷4（每字节供 64 行消费）。tokens 64 对齐主段走 v5，余段（<64 行）
+        // 的 16 对齐部分走 v4、尾行（<16 行）narrow 切给 online——行独立，
+        // 算术序不变，**v5 ≡ v4 逐位**（o39）。开关每次调用现读（进程内 A/B）；
+        // 含 decode 行的混合批禁 v5（同 v4）。
+        if self.attn_online
+            && !has_decode_row
+            && single_span
+            && t >= self.attn_v5_min_t
+            && self.step_max_pos < self.attn_v5_max_ctx
+            && self.attn_cfg.kv == wein_kernel::ops::KvDtype::Bf16
+            && hd == 256
+            && qh_n == 16
+            && kvh == 4
+            && std::env::var("WEIN_ATTN_V5").map(|v| v != "0").unwrap_or(true)
+        {
+            let t64 = t & !63;
+            if t64 > 0 {
+                a.run_tile_v5(
+                    q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t64,
+                    stream,
+                );
+            }
+            let rem = t - t64;
+            if rem > 0 {
+                let row = (qh_n * hd) as usize * 2;
+                let s = t64 as usize;
+                let t4 = rem & !15;
+                if t4 > 0 {
+                    a.run_tile_v4(
+                        &q.narrow(s * row, t4 as usize * row),
+                        k,
+                        v,
+                        bt,
+                        &seqs.narrow(s * 4, t4 as usize * 4),
+                        &pos.narrow(s * 4, t4 as usize * 4),
+                        &out.narrow(s * row, t4 as usize * row),
+                        q_scale,
+                        bpr,
+                        block_size,
+                        qh_n,
+                        kvh,
+                        hd,
+                        t4,
+                        stream,
+                    );
+                }
+                let tail = rem - t4;
+                if tail > 0 {
+                    let s2 = s + t4 as usize;
+                    a.run_tile_online_cfg(
+                        cfg,
+                        &q.narrow(s2 * row, tail as usize * row),
+                        k,
+                        v,
+                        bt,
+                        &seqs.narrow(s2 * 4, tail as usize * 4),
+                        &pos.narrow(s2 * 4, tail as usize * 4),
+                        &out.narrow(s2 * row, tail as usize * row),
+                        q_scale,
+                        bpr,
+                        block_size,
+                        qh_n,
+                        kvh,
+                        hd,
+                        tail,
+                        stream,
+                    );
+                }
+            }
+            return;
+        }
         // v4 档（wmma tensor core）：单遍档 + **纯 prefill 批** + t≥下限 +
         // ctx<上限 + bf16 池 + 精确几何 16q/4kv/hd256（wmma ldm ImmArg 内建）
         // 时接管长 prefill。tokens 16 对齐主段走 v4，尾行（<16 行）narrow 切给
@@ -1440,6 +1518,14 @@ impl Qwen35Executor {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8192),
+            attn_v5_min_t: std::env::var("WEIN_ATTN_V5_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048),
+            attn_v5_max_ctx: std::env::var("WEIN_ATTN_V5_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 20),
             step_max_pos: 0,
             dn_chunk: std::env::var("WEIN_DN_CHUNK").map(|v| v != "0").unwrap_or(true),
             fused: std::env::var("WEIN_FUSED").map(|v| v != "0").unwrap_or(true),

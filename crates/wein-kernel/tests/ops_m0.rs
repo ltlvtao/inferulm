@@ -1203,6 +1203,88 @@ fn o38_paged_attn_v4_tolerance() {
     }
 }
 
+/// o39 · **v5 档**（`paged_attn_v5`：4 warp × 64 行 CTA 共享 K/V smem）
+/// **位级合同：v5 ≡ v4 逐位**——同 fragment 算术，只换 K/V 来源（smem
+/// staging）与行分属（warp 拥 16 行）。这是本档的最强验收：o38 的容差
+/// 判据经 v4 传递成立。host 合同：tokens 64 对齐、单 span、16q/4kv/hd256。
+/// 位置档含：全行同 pos（掩码均匀）、升序 pos（warp 间掩码梯度——早 warp
+/// 多吃的全掩 tile 走 −inf 路径）、重掩码、单组最小档、奇数组数。
+#[test]
+fn o39_paged_attn_v5_bitwise_v4() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let stream = gpu.stream();
+    let bs = 16usize;
+    // (tokens, pos_mode)：pos_mode = Some(p) 全行同 pos；None = 升序 0..t-1
+    let cases: [(usize, Option<u32>); 6] = [
+        (512, Some(511)),   // 8 组，主形
+        (512, Some(2047)),  // 长 ctx 2048
+        (128, Some(6008)),  // 6009 ctx 档，2 组
+        (192, Some(100)),   // 重掩码：尾部行只见 101 列
+        (64, Some(63)),     // 单组最小档（n_tile=1×4 warp）
+        (4160, None),       // 65 组（奇数）+ 升序 pos（warp 掩码梯度）
+    ];
+    for &(tokens, pm) in cases.iter() {
+        let (qh, kvh, hd) = (16usize, 4usize, 256usize);
+        let nseq = 1usize;
+        let positions: Vec<u32> = match pm {
+            Some(p) => vec![p; tokens],
+            None => (0..tokens as u32).collect(),
+        };
+        let maxpos = *positions.last().unwrap() as usize;
+        let bpr = (maxpos + 1).div_ceil(bs);
+        let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+        let seq_ids = vec![0u32; tokens];
+        let he = kvh * hd;
+        let slots = nseq * bpr * bs;
+        let k_cache = vec_bf16(0x51ab, slots * he, 1.0);
+        let v_cache = vec_bf16(0x62cd, slots * he, 1.0);
+        let qn = tokens * qh * hd;
+        let q = vec_bf16(0x73ef, qn, 2.0);
+        let q_scale = 1.0 / (hd as f32).sqrt();
+        let dq = gpu.alloc_from_slice(&q);
+        let dkc = gpu.alloc_from_slice(&k_cache);
+        let dvc = gpu.alloc_from_slice(&v_cache);
+        let dbt = gpu.alloc_from_slice(&block_table);
+        let dsi = gpu.alloc_from_slice(&seq_ids);
+        let dpo = gpu.alloc_from_slice(&positions);
+        let dout = gpu.alloc_bytes(qn * 2);
+        let poison = vec![0x7f7fu16; qn];
+        // v4 档先行
+        dout.upload_on(&poison, &stream);
+        t.paged_attn.run_tile_v4(
+            &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, bs as u32,
+            qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let v4: Vec<u16> = dout.read_to_vec();
+        // v5 档（污化先行：漏写 / warp 互踩必现形）
+        dout.upload_on(&poison, &stream);
+        t.paged_attn.run_tile_v5(
+            &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, bs as u32,
+            qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let v5: Vec<u16> = dout.read_to_vec();
+        // 双跑 diff 查竞态（CTA 屏障编排错 = 非确定）
+        t.paged_attn.run_tile_v5(
+            &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32, bs as u32,
+            qh as u32, kvh as u32, hd as u32, tokens as u32, &stream,
+        );
+        stream.sync();
+        let v5b: Vec<u16> = dout.read_to_vec();
+        let tag = format!("t={tokens} pos={}", pm.map(|p| p.to_string()).unwrap_or_else(|| "asc".into()));
+        let diff = v4.iter().zip(v5.iter()).filter(|(a, b)| a != b).count();
+        let race = v5.iter().zip(v5b.iter()).filter(|(a, b)| a != b).count();
+        eprintln!("o39 {tag}：v5 vs v4 位差 {diff}/{}｜双跑 diff {race}", v4.len());
+        assert_eq!(diff, 0, "o39 v5 ≢ v4（{tag}）：位级合同破裂");
+        assert_eq!(race, 0, "o39 v5 双跑 diff≠0（{tag}）：竞态");
+        assert!(v5.iter().any(|&x| x != 0 && x != 0x7f7f), "o39 输出全零/残留污化（{tag}）");
+        drop((dq, dkc, dvc, dbt, dsi, dpo, dout));
+    }
+}
+
 /// o32 · 分块档长序列单发耗时金丝雀（decode 形，1 token，Qwen3.5-4B full
 /// 层形 16 q / 4 kv / hd 256）：KV 读量从 t×q_heads×L 降到 (t/ntok)×kv_heads×L
 /// ——本档按 j 分片换并行度，单块读量 = (L/jsplit)×hd×4B。
