@@ -94,6 +94,12 @@ fn main() {
     // ③ 引用该符号的函数体内 ld/st 去 .global（泛型空间——cvta 后指针在
     // generic 空间）。符号名单由源文件扫描而来（新增 smem 数组自动进表）。
     patch_smem_symbols(&ptx[0], &dst, &kernels.join("src/lib.rs"));
+    // PTX 文本级 patch 之二：cp.async 占位函数体替换。Rust 表达不了
+    // addrspace(3)/(1) 指针（intrinsic 签名 mismatch），nvptx 后端又无 asm!，
+    // 故 lib.rs 用 `#[no_mangle]` 占位函数（volatile 直拷体，保证不被 IPO
+    // 删调用），本补丁把函数体文本替换为真 cp.async 指令序列。占位体若
+    // 未被替换就上线会写坏 smem——任何一步失败都 panic，绝不静默。
+    patch_cp_async(&dst);
     println!("cargo:rustc-env=WEIN_PTX={}", dst.display());
 }
 
@@ -170,6 +176,113 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     }
     std::fs::write(dst, out).expect("写改写后 PTX");
     println!("cargo:warning=smem 改写：{:?}（{patched_count} 处）", names);
+}
+
+/// cp.async 占位函数体替换。签名形态（LLVM NVPTX 稳定产出）：
+/// `.visible .func NAME(\n\t.param .b64 NAME_param_0[,...]\n) // @NAME` + `{体}`。
+/// 体替换为 ld.param 取参 → cvta 空间转换 → 真 cp.async 指令。同时把
+/// V5_KS 声明 `.align 4` 提升 `.align 16`（cp-size 16 要求 dst 16B 对齐，
+/// global 侧 kbase=32768·page+512·kvh 恒 16B 对齐）。
+fn patch_cp_async(dst: &PathBuf) {
+    let ptx = std::fs::read_to_string(dst).expect("读 smem 改写后 PTX");
+    let mut out = replace_cp_placeholder(&ptx, "cp_async_cg16", 2, |p| format!(
+        "\t.reg .b64 \t%rd<2>;\n\n\
+         \tld.param.b64 \t%rd0, [{p0}];\n\
+         \tld.param.b64 \t%rd1, [{p1}];\n\
+         \tcvta.to.shared.u64 \t%rd0, %rd0;\n\
+         \tcvta.to.global.u64 \t%rd1, %rd1;\n\
+         \tcp.async.cg.shared.global \t[%rd0], [%rd1], 16;\n\
+         \tret;\n",
+        p0 = p[0], p1 = p[1],
+    ));
+    out = replace_cp_placeholder(&out, "cp_async_commit", 1, |_| {
+        "\tcp.async.commit_group;\n\tret;\n".to_string()
+    });
+    out = replace_cp_placeholder(&out, "cp_async_wait_all", 1, |_| {
+        "\tcp.async.wait_all;\n\tret;\n".to_string()
+    });
+    // V5_KS 对齐提升（smem 补丁已把声明改写为 .shared）
+    let mut bumped = 0usize;
+    let lines: Vec<String> = out
+        .lines()
+        .map(|l| {
+            if l.contains("V5_KS") && l.contains(".align 4 .b8 ") {
+                bumped += 1;
+                l.replace(".align 4 .b8 ", ".align 16 .b8 ")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(bumped, 1, "V5_KS 对齐提升应恰一处，实得 {bumped}");
+    out = lines.join("\n");
+    for needle in [
+        "cp.async.cg.shared.global",
+        "cp.async.commit_group",
+        "cp.async.wait_all",
+    ] {
+        assert!(out.contains(needle), "cp.async 指令 {needle} 未出现在产物 PTX");
+    }
+    assert!(
+        !out.contains("st.volatile.b64") && !out.contains("st.volatile.b32"),
+        "占位 volatile 体残留——绝不允许上线"
+    );
+    std::fs::write(dst, out).expect("写 cp.async 改写后 PTX");
+    println!("cargo:warning=cp.async 改写：三函数体 + V5_KS .align 16");
+}
+
+/// 定位 `name` 函数定义，花括号匹配替换体。`body(params) -> 指令文本`。
+fn replace_cp_placeholder(
+    ptx: &str,
+    name: &str,
+    n_params: usize,
+    body: impl FnOnce(&[String]) -> String,
+) -> String {
+    let sig = format!(".visible .func {name}(");
+    let start = ptx
+        .find(&sig)
+        .unwrap_or_else(|| panic!("cp.async 占位函数 {name} 不在 PTX 中"));
+    let after = &ptx[start..];
+    let close = after
+        .find("\n)")
+        .unwrap_or_else(|| panic!("{name} 签名缺收尾 ) 行"));
+    let params: Vec<String> = after[..close]
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            t.starts_with(".param ")
+                .then(|| t.rsplit(' ').next().unwrap_or("").trim_end_matches(',').to_string())
+        })
+        .collect();
+    assert_eq!(params.len(), n_params, "{name} 参数个数 {params:?}");
+    let rest = &after[close..];
+    let open = rest
+        .find('{')
+        .unwrap_or_else(|| panic!("{name} 缺函数体 {{"));
+    let mut depth = 0usize;
+    let mut end = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(end > 0, "{name} 函数体花括号不匹配");
+    // open/end 相对 rest，换算回 ptx 绝对偏移再拼接
+    let (abs_open, abs_end) = (start + close + open, start + close + end);
+    format!(
+        "{}{{\n{}\n}}{}",
+        &ptx[..abs_open],
+        body(&params),
+        &ptx[abs_end + 1..]
+    )
 }
 
 /// 定位能跑到 nightly 的 cargo：

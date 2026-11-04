@@ -3978,9 +3978,38 @@ pub unsafe extern "ptx-kernel" fn paged_attn_v4(
     v4_unroll16!(o_write);
 }
 
+// ═══ cp.async 占位函数（build.rs `patch_cp_async` 整体替换函数体）═══
+// NVVM 有 `llvm.nvvm.cp.async.*` intrinsic，但指针参数要求 addrspace(3)/(1)
+// ——Rust 类型系统表达不了（实测报 intrinsic signature mismatch）；nvptx
+// 后端又无 asm!（无寄存器类）。路子与 `patch_smem_symbols` 同族：占位体
+// 用 volatile 直拷（保证 rustc 不 IPO 删调用），build.rs 把函数体文本替换
+// 为真指令。dst 传 smem 泛型指针（补丁内先 cvta.to.shared）。
+// **合同：补丁失败即 build panic——占位体（volatile 写）绝不允许上线**。
+#[inline(never)]
+#[no_mangle]
+pub unsafe fn cp_async_cg16(dst: *mut u8, src: *const u8) {
+    unsafe {
+        core::ptr::write_volatile(
+            dst as *mut u64,
+            core::ptr::read_volatile(src as *const u64),
+        )
+    }
+}
+
+#[inline(never)]
+#[no_mangle]
+pub fn cp_async_commit(_dummy: *mut u32) {
+    unsafe { core::ptr::write_volatile(_dummy, 0) }
+}
+
+#[inline(never)]
+#[no_mangle]
+pub fn cp_async_wait_all(_dummy: *mut u32) {
+    unsafe { core::ptr::write_volatile(_dummy, 0) }
+}
+
 // ═══ v5：4 warp × 64 行 CTA 共享 K/V smem（KV 流量 ÷4——每字节供 64 行 ═══
-// ═══ 消费而非 16 行）。几何：block = 128 线程（4 warp）= (q 头, 64 行组)，
-// 每 warp 拥 16 行（寄存器足迹与 v4 相同：O 16 组 × 8 f32 + S/P 片）；
+// ═══ 消费而非 16 行）。几何：block = 128 线程（4 warp）= (q 头, 64 行组），
 // grid = q_heads × ⌈tokens/64⌉。K 平铺进 smem（wmma load.b 的 col-major
 // 视图 = row-major K，零转置仅换源）；V^T 转置 staging 同 v4 由 128 线程
 // 分摊；P 每 warp 私有 128 u32 槽。在线 softmax 按行分 warp，无跨 warp
@@ -4067,21 +4096,28 @@ pub unsafe extern "ptx-kernel" fn paged_attn_v5(
     let mut l_g = 0f32;
     let mut l_g8 = 0f32;
 
-    // ── staging（global→smem，128 线程分摊）：K 平铺 u64 整载（8 轮，
-    //    每轮 128×8B = 1KB 合并读），V^T 转置（tid 认领 2 个 hd）──
+    // ── staging（global→smem，128 线程分摊）：K 走 cp.async.cg 16B ×4 块/
+    //    线程（占位函数经 build.rs 补丁装载——绕过寄存器直达 smem，无
+    //    ld→st 依赖链）。寻址与旧 u64 版逐槽等价：块号 c → token=c>>5、
+    //    源跨步 he<<1 字节/token（global [16tok][kv_heads][256d] 交错，
+    //    dst 是 [16tok][256d] 平铺）；dst/src 均 16B 对齐（KS 声明 .align 16
+    //    由补丁提升，global 侧 kbase = 32768·page + 512·kvh）。V^T 转置仍
+    //    ld+st（含 lo|hi<<16 计算——cp.async 做不了转置）──
     let he = kv_heads as usize * 256;
     let stage = |tile: usize, buf: usize, k_cache: *const u8, v_cache: *const u8, bt: *const u32| {
         let page = unsafe { *bt.add(tile) } as usize;
-        let kbase = page * 16 * he + kvh * 256;
-        let kpage = (k_cache as *const u64).add(kbase >> 2); // u64 单位
-        let ks64 = ks as *mut u64;
+        let kbase = (page * 16 * he + kvh * 256) << 1; // 字节偏移
+        let ksrc = k_cache.add(kbase);
+        let kdst = (ks as *mut u8).add(buf << 13); // 每缓冲 8KB
         let mut r = 0usize;
-        while r < 8 {
-            let i = tid + (r << 7); // u64 槽：token = i>>6，组内 = i&63
-            unsafe { *ks64.add((buf << 10) + i) = *kpage.add(((i >> 6) << 8) + (i & 63)) };
+        while r < 4 {
+            let c = tid + (r << 7); // 16B 块号 0..511
+            let soff = ((c >> 5) * he << 1) + ((c & 31) << 4);
+            unsafe { cp_async_cg16(kdst.add(c << 4), ksrc.add(soff)) };
             r += 1;
         }
-        let vpage = (v_cache as *const u16).add(kbase);
+        unsafe { cp_async_commit(ppw as *mut u32) };
+        let vpage = (v_cache as *const u16).add(kbase >> 1);
         let vt2 = vt.add(buf << 11);
         let mut r = 0usize;
         while r < 2 {
@@ -4098,12 +4134,13 @@ pub unsafe extern "ptx-kernel" fn paged_attn_v5(
     };
 
     // ── 双缓冲流水：tile t 计算读 buf t%2，tile t+1 的 staging 写 buf
-    //    (t+1)%2——缓冲不相交，staging 载入与计算重叠；唯一 CTA 屏障在
-    //    迭代头（保证 buf (t+1)%2 上轮计算已读完 + 本轮 staging 已到齐）。
-    //    位级合同不变：staging 值与来源逐字同，只多了一个缓冲位 ──
+    //    (t+1)%2——缓冲不相交，staging 与计算重叠；迭代头 = cp.async
+    //    wait_all（本线程在途拷贝到齐）+ CTA 屏障（全部线程可见 + 上轮
+    //    计算已读完）。位级合同不变：staging 值与来源逐字同 ──
     stage(0, 0, k_cache, v_cache, bt);
     let mut tile = 0usize;
     while tile < n_tile {
+        unsafe { cp_async_wait_all(ppw as *mut u32) };
         unsafe { _syncthreads() };
         let buf = tile & 1;
         let nxt = tile + 1;

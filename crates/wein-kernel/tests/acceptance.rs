@@ -179,12 +179,32 @@ fn k2_intrinsics_lowered_to_ptx() {
     }
     let host_calls: Vec<&str> = ptx
         .lines()
-        .filter(|l| l.trim_start().starts_with("call"))
+        .filter(|l| {
+            let t = l.trim_start();
+            // 白名单：cp.async 占位函数的设备内调用（build.rs patch_cp_async
+            // 替换体，ptxas 内联）——不是宿主调用
+            t.starts_with("call") && !t.starts_with("call.uni cp_async_")
+        })
         .collect();
     assert!(
         host_calls.is_empty(),
         "PTX 出现宿主调用：{host_calls:?}（no_std kernel 不应有 call）"
     );
+    // cp.async 能力门：占位函数体替换旁路（patch_cp_async）经 attn_v5_probe
+    // 验收后钉死——① 三条真指令落模块 ② v5 K staging 调用点在位
+    // ③ 占位 volatile 体不得残留（未替换就上线会写坏 smem）。
+    for needle in [
+        "cp.async.cg.shared.global",
+        "cp.async.commit_group",
+        "cp.async.wait_all",
+    ] {
+        assert!(ptx.contains(needle), "{needle} 未落 PTX（patch_cp_async 回归）");
+    }
+    assert!(
+        ptx.matches("call.uni cp_async_cg16").count() >= 8,
+        "v5 K staging 调用点缺失（期望 ≥8：双 stage 调用点 ×4 展开轮）"
+    );
+    assert!(!ptx.contains("st.volatile"), "cp.async 占位 volatile 体残留");
     // shfl/smem 能力门：旁路（link_llvm_intrinsics + build.rs 段改写）经
     // shfl_probe 验收后钉死——① shfl.sync 出现 ② SMEM_PROBE 以 .shared 声明
     // ③ 产物内不得再留 ld.global/st.global（改写全函数体扫过一遍）。
