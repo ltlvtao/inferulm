@@ -196,7 +196,9 @@ impl RadixCache {
     /// evict 的块列表版：快照槽挂块的联动钩子——块离开缓存时挂其上的
     /// 槽必须同步回收，否则块 id 复用后映射残留 = 错误命中。
     pub fn evict_blocks(&mut self, pool: &mut BlockPool, need: usize) -> Vec<BlockId> {
-        let mut freed = Vec::with_capacity(need);
+        // with_capacity 只是提示：usize::MAX（clear-all 语义）会容量溢出 panic，
+        // 钳到 256——真实驱逐数由 find_lru_leaf 的 None 出口决定
+        let mut freed = Vec::with_capacity(need.min(256));
         while freed.len() < need {
             let (_, block, path) = match Self::find_lru_leaf(&self.root, &mut Vec::new()) {
                 Some(b) => b,

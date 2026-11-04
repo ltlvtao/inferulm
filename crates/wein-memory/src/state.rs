@@ -79,12 +79,27 @@ impl MemState {
     /// 悲观准入判定（不变更状态——真正的驱逐发生在 admit 里）
     pub fn can_admit(&self, ctx_len: usize) -> bool {
         let need = self.blocks_needed(ctx_len);
-        self.pool.free_now() + self.radix.evictable_blocks() >= need + self.pool.watermark()
+        // 水位是防振荡余量，不是容量税：整池单请求（如 32K 会话 × 2048 页）
+        // 时钳到池余量——否则 need+watermark > total 永远不准入，只能走
+        // 批空强制准入 → preempt → abort 的兜底链
+        let wm = self
+            .pool
+            .watermark()
+            .min((self.pool.total() as usize).saturating_sub(need));
+        self.pool.free_now() + self.radix.evictable_blocks() >= need + wm
     }
 
     /// 压力判定（free_soon = free + 在途 deferred ≤ 低水位）
     pub fn over_pressure(&self) -> bool {
         self.pool.free_soon() <= self.pool.watermark()
+    }
+
+    /// 前缀缓存全清（`/reset_prefix_cache` 的记账侧）：驱逐全部可逐块
+    /// （在飞 pin 块天然保留）并立即回收。返回清出的块数。
+    pub fn clear_prefix_cache(&mut self) -> usize {
+        let n = self.radix.evict(&mut self.pool, usize::MAX);
+        self.pool.recycle();
+        n
     }
 
     /// 准入（重准入含抢占保留的完整上下文）。false = 放不下（无副作用残留）

@@ -150,6 +150,9 @@ pub trait CapacityModel: Send {
     fn on_removed(&mut self, req: ReqId, how: Removal);
     fn over_pressure(&mut self) -> bool;
     fn step_end(&mut self) {}
+    /// 前缀缓存清空钩子（`/reset_prefix_cache`）：有记账级缓存的实现
+    /// （PoolCapacity）在此驱逐全部可逐条目。默认无操作。
+    fn clear_prefix_cache(&mut self) {}
     /// 引擎下行转换钩子：识别具体容量实现（强制抢占等扩展信号）
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         None

@@ -40,6 +40,7 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/reset_prefix_cache", post(reset_prefix_cache))
         .fallback(not_found)
         // 最外层：handler panic → 500 JSON（手写 CatchPanic，依赖里没有 tower-http）
         .layer(axum::middleware::from_fn(mw::catch_panic))
@@ -347,6 +348,20 @@ async fn health(State(st): State<Arc<ServeState>>) -> Response {
 async fn metrics(State(st): State<Arc<ServeState>>) -> Response {
     let text = st.metrics.render(st.engine.stats().map(|a| a.as_ref()));
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], text).into_response()
+}
+
+/// 前缀缓存清空（对齐 vLLM 的 dev 端点，长上下文探针的冷跑依赖它）。
+/// 命令经引擎通道按序处理——先于其后到达的 Submit 生效，无需等待回执
+async fn reset_prefix_cache(State(st): State<Arc<ServeState>>) -> Response {
+    if !st.engine.is_alive() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"success": false, "error": "engine task exited"})),
+        )
+            .into_response();
+    }
+    st.engine.clear_prefix_cache();
+    Json(json!({"success": true})).into_response()
 }
 
 // ---------- handlers ----------

@@ -212,10 +212,10 @@ fn attn_v3_from_env(var: &str) -> wein_kernel::ops::V3Cfg {
 }
 
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
-/// 从约束于 KV 页池——512 页 ÷ 每前缀 ~3 页 ≈ 百级条目，64 槽同量级）。
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
-/// 都要有槽才可能被命中——单活跃槽只保末边界时祖先无槽、命中恒 0）
-const SNAP_SLOTS: usize = 64;
+/// 都要有槽才可能被命中——单活跃槽只保末边界时祖先无槽、命中恒 0）。
+/// 槽数随 `ctx::snap_slots()`（WEIN_SNAP_SLOTS / --snap-slots）——长上下文
+/// /多会话下槽压升高，池大时该抬（0 = 关快照池）
 /// linear 侧 q/k l2norm eps（FLA 对齐，modeling l2norm）
 const L2_EPS: f32 = 1e-6;
 
@@ -1316,7 +1316,7 @@ impl Qwen35Executor {
         let spec_policy = std::env::var("WEIN_SPEC_ADAPTIVE").map_or(true, |v| v != "0");
         // 前缀缓存快照池（WEIN_RADIX=0 关：不分配、三钩子全跳过）。
         // 池深跟状态池实际层数（lin_state=24 linear 层，非 n_layers=32）
-        let radix_on = std::env::var("WEIN_RADIX").map_or(true, |v| v != "0");
+        let radix_on = std::env::var("WEIN_RADIX").map_or(true, |v| v != "0") && ctx::snap_slots() > 0;
         let radix_dbg = std::env::var("WEIN_RADIX_DEBUG").is_ok();
         // decode 栅格默认 64（4 块）——快照 25MB/行/份 ≈ 0.23ms，栅格 16 时
         // 满负荷每步 +1.4ms（实测）；decode 侧命中场景远少于 prompt 侧
@@ -1326,14 +1326,15 @@ impl Qwen35Executor {
             .unwrap_or((4 * ctx::block() as usize).max(ctx::snap_stride()));
         let snap_grid_dec = dgrid.div_ceil(ctx::block() as usize) * ctx::block() as usize;
         let (snap_lin, snap_conv, snap_free) = if radix_on {
+            let slots = ctx::snap_slots();
             let mut sl = Vec::with_capacity(lin_state.len());
             let mut sc = Vec::with_capacity(conv_state.len());
             for _ in 0..lin_state.len() {
-                let l: DevBuf<'static> = pin!(gpu.alloc_bytes(lin_row * SNAP_SLOTS));
+                let l: DevBuf<'static> = pin!(gpu.alloc_bytes(lin_row * slots));
                 sl.push(l);
             }
             for _ in 0..conv_state.len() {
-                let c: DevBuf<'static> = pin!(gpu.alloc_bytes(conv_row * SNAP_SLOTS));
+                let c: DevBuf<'static> = pin!(gpu.alloc_bytes(conv_row * slots));
                 sc.push(c);
             }
             for s in &sl {
@@ -1342,7 +1343,7 @@ impl Qwen35Executor {
             for s in &sc {
                 s.zero_on(session.stream());
             }
-            (sl, sc, (0..SNAP_SLOTS as u32).rev().collect())
+            (sl, sc, (0..slots as u32).rev().collect())
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
@@ -4017,6 +4018,20 @@ fn conv_row_bytes(cfg: &Qwen35Config) -> usize {
 impl Executor for Qwen35Executor {
     fn row_capacity(&self) -> usize {
         self.row_capacity as usize
+    }
+
+    /// 前缀缓存全清（`/reset_prefix_cache`）：驱逐整棵 radix——只逐未 pin
+    /// 的（在飞请求的命中块天然保留，BlockPool rc 保页到请求离场），快照槽
+    /// 随块联动回收，页立即回池。返回清出的 KV 块数
+    fn clear_prefix_cache(&mut self) -> usize {
+        let freed = self.radix.evict_blocks(&mut self.pool, usize::MAX);
+        for b in &freed {
+            if let Some(s) = self.snap_of_block.remove(b) {
+                self.snap_free.push(s);
+            }
+        }
+        self.pool.recycle();
+        freed.len()
     }
 
     /// 采样参数下发（见 `Qwen35Executor::set_sampling`）：Err = 设备侧不可

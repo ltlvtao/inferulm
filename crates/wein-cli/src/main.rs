@@ -119,6 +119,7 @@ fn main() {
             take("--ctx-len", &mut c.max_pos, "max_pos");
             take("--kv-pages", &mut c.kv_pages, "kv_pages");
             take("--snap-stride", &mut c.snap_stride, "snap_stride");
+            take("--snap-slots", &mut c.snap_slots, "snap_slots");
             // --t-max N：批前向行上限显式覆盖（未给 = 按 --ctx-len 自动档：
             // ≥512、封顶 8192）。大块 prefill（chunk > 512）必须抬它——
             // exec 的激活/输入表全按 t_max 定尺

@@ -97,6 +97,10 @@ impl CapacityModel for PoolCapacity {
         self.mem.over_pressure()
     }
 
+    fn clear_prefix_cache(&mut self) {
+        self.mem.clear_prefix_cache();
+    }
+
     fn step_end(&mut self) {
         self.mem.step_end();
     }
@@ -251,6 +255,11 @@ pub trait Executor: Send {
     /// 对应请求，同批其他请求照常推进。
     fn take_failures(&mut self) -> Vec<(ReqId, StepError)> {
         Vec::new()
+    }
+    /// 前缀缓存清空（`/reset_prefix_cache`）：返回清出的 KV 块数（0 = 无
+    /// 缓存概念）。默认无操作（脚本件/替身）
+    fn clear_prefix_cache(&mut self) -> usize {
+        0
     }
 }
 
@@ -525,6 +534,14 @@ impl EngineCore {
                 prompts.insert(id, prompt_token_ids);
             }
             EngineCommand::Cancel(id) => Self::abort(sched, senders, stops, prompts, stats, id),
+            EngineCommand::ClearPrefixCache => {
+                // 双侧同清：exec 的真 KV 页/快照槽 + 容量模型的记账缓存
+                // （--memory 时 PoolCapacity 有独立 radix）。命令经通道按序
+                // 处理——先于其后到达的 Submit 生效，无需回执
+                let blocks = exec.clear_prefix_cache();
+                sched.capacity_mut().clear_prefix_cache();
+                tracing::info!(blocks, "prefix cache cleared");
+            }
         }
     }
 

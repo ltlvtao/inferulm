@@ -109,6 +109,8 @@ impl MockEngine {
                     }
                     state.cancelled.lock().unwrap().insert(id);
                 }
+                // 替身引擎无前缀缓存——语义上清了 0 块
+                EngineCommand::ClearPrefixCache => {}
             }
         }
         // 引擎关闭：终止全部在飞请求

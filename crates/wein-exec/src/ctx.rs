@@ -27,8 +27,11 @@ pub struct CtxConfig {
     /// 页大小（token/页）：块表宽度 `bpr = max_pos / block`
     pub block: usize,
     /// 快照边界步长（token，须为 block 的整数倍）：默认 = block（逐块快照，
-    /// 位级同旧形态）；长上下文抬高它换取"槽够用"（槽数 SNAP_SLOTS 固定）
+    /// 位级同旧形态）；长上下文抬高它换取"槽够用"
     pub snap_stride: usize,
+    /// 前缀快照槽数（每槽 ≈25.2MB 线性层 + conv 状态，与 ctx 无关——
+    /// 槽压随 kv_pages/会话数增长）。默认 64 = 旧常量；0 = 关快照池
+    pub snap_slots: usize,
     /// 批前向行（token）上限——exec 激活/输入表的定尺（旧编译期 T_MAX=512）。
     /// 0 = 未显式指定（`resolve` 时按 max_pos 自动取档，见 [`Self::resolve`]）
     pub t_max: usize,
@@ -54,6 +57,7 @@ impl Default for CtxConfig {
             kv_pages: 512,
             block: 16,
             snap_stride: 16,
+            snap_slots: 64,
             // 0 = 未指定（`resolve` 填自动档；默认路径 = 512 原值）
             t_max: 0,
         }
@@ -73,6 +77,7 @@ impl CtxConfig {
             kv_pages: num("WEIN_KV_PAGES", d.kv_pages),
             block: num("WEIN_CTX_BLOCK", d.block),
             snap_stride: num("WEIN_SNAP_STRIDE", d.snap_stride),
+            snap_slots: num("WEIN_SNAP_SLOTS", d.snap_slots),
             t_max: num("WEIN_T_MAX", d.t_max),
         }
     }
@@ -182,6 +187,10 @@ pub fn block() -> u32 {
 
 pub fn snap_stride() -> usize {
     get().snap_stride
+}
+
+pub fn snap_slots() -> usize {
+    get().snap_slots
 }
 
 /// 单行页表宽度（块数）——块表/图档 `in_bt`/host `bt_host` 的列宽

@@ -398,6 +398,41 @@ mod m10_state {
         assert!(mem.free_blocks() > free, "回收后在途块回到可用");
     }
 
+    /// m10 · 整池单请求：水位是防振荡余量不是容量税——need ≤ total 时钳到
+    ///      池余量。否则 32K 会话（2048 页 × 2048 页池）need+watermark > total
+    ///      永远不准入，只能走批空强制准入 → preempt → abort 的兜底链
+    #[test]
+    fn can_admit_whole_pool_single_request() {
+        let mem = MemState::new(MemConfig {
+            block_size: 16,
+            num_blocks: 100,
+            low_watermark: 0.1, // 水位 10：未钳制时 100+10 > 100 恒拒
+        });
+        assert!(mem.can_admit(100 * 16), "整池单请求须可准入（水位钳到余量）");
+        assert!(!mem.can_admit(101 * 16), "超池仍拒绝");
+
+        // 部分占用时水位余量照常起作用：50 块被缓存（可逐）、free 50
+        let mut m2 = MemState::new(MemConfig {
+            block_size: 16,
+            num_blocks: 100,
+            low_watermark: 0.1,
+        });
+        assert!(m2.admit(1, &[7u32; 50 * 16], 0));
+        m2.finish(1);
+        // need 96：wm=min(10, 4)=4，free+evictable=100 ≥ 100 ✓ 靠驱逐凑满
+        assert!(m2.can_admit(96 * 16));
+
+        // 占用者是在飞请求（块不进缓存、不可逐）：水位守卫照常生效
+        let mut m3 = MemState::new(MemConfig {
+            block_size: 16,
+            num_blocks: 100,
+            low_watermark: 0.1, // 水位 10
+        });
+        assert!(m3.admit(2, &[7u32; 50 * 16], 0)); // free 50、evictable 0
+        assert!(m3.can_admit(40 * 16), "40+10 ≤ 50 放行");
+        assert!(!m3.can_admit(41 * 16), "41+10 > 50 拒（留水位余量）");
+    }
+
     /// m10b · over_pressure 用 free_soon（含 deferred）：在途释放可立即缓解压力
     ///        （抢占循环在同一 step 内多次判定，被抢占者的块虽在 deferred 也要算数）
     #[test]

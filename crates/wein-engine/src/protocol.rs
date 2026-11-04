@@ -112,8 +112,11 @@ pub enum EngineEvent {
     Finished(FinishReason),
 }
 
-/// serve → engine 的全部命令（仅提交与取消两个入口）。
+/// serve → engine 的全部命令（提交/取消 + 前缀缓存清空）。
 pub enum EngineCommand {
     Submit(EngineRequest),
     Cancel(RequestId),
+    /// `/reset_prefix_cache`：驱逐全部可逐前缀（在飞请求的 pin 块保留）。
+    /// 经命令通道按序处理，先于其后到达的 Submit 生效
+    ClearPrefixCache,
 }

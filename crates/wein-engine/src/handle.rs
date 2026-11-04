@@ -103,4 +103,10 @@ impl EngineHandle {
     pub fn cancel(&self, id: RequestId) {
         let _ = self.cmd_tx.send(EngineCommand::Cancel(id));
     }
+
+    /// 前缀缓存清空（`/reset_prefix_cache`）：best-effort 同 cancel——命令经
+    /// 通道按序处理，先于其后到达的 submit 生效
+    pub fn clear_prefix_cache(&self) {
+        let _ = self.cmd_tx.send(EngineCommand::ClearPrefixCache);
+    }
 }
