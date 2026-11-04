@@ -747,6 +747,32 @@ impl StepProf {
     /// 事件记录本身在 GPU 时间轴上有成本（WSL 实测 ~85µs/次，m=4 步
     /// 440 边界 +37ms）——步尾同点校准突发量出单价，报告按段内边界数扣除
     fn finalize(&mut self, wall: f64) {
+        // WEIN_STEP_PROFILE=per：逐步一行（长上下文多步 prefill 的步间形态——
+        // 轮均值会把尾步慢段摊平，看不出单步结构）
+        if std::env::var("WEIN_STEP_PROFILE").as_deref() == Ok("per") {
+            let mut prev = 0usize;
+            let mut segs: Vec<(&str, f64)> = Vec::new();
+            for &(sect, e) in &self.ends {
+                let ms = self.ev[e].elapsed_ms(&self.ev[prev]) as f64;
+                if let Some(last) = segs.last_mut() {
+                    if last.0 == sect {
+                        last.1 += ms;
+                    } else {
+                        segs.push((sect, ms));
+                    }
+                } else {
+                    segs.push((sect, ms));
+                }
+                prev = e;
+            }
+            segs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top: Vec<String> = segs
+                .iter()
+                .take(6)
+                .map(|(s, ms)| format!("{s}={ms:.1}"))
+                .collect();
+            eprintln!("step {} wall={wall:.1} | {}", self.steps + 1, top.join(" "));
+        }
         let mut prev = 0usize;
         for &(sect, e) in &self.ends {
             *self.totals.entry(sect).or_insert(0.0) +=
@@ -871,7 +897,7 @@ pub struct Qwen35Executor {
     attn_v4_min_t: u32,
     attn_v4_max_ctx: u32,
     /// v5 档（4 warp × 64 行 CTA 共享 K/V smem）接管门限：t 下限
-    /// （`WEIN_ATTN_V5_T`，默认 2048）与 ctx 上限（`WEIN_ATTN_V5_CTX`，默认
+    /// （`WEIN_ATTN_V5_T`，默认 512——尾 chunk ragged 段也接管）与 ctx 上限（`WEIN_ATTN_V5_CTX`，默认
     /// 1<<20——v5 每 kvh 流只被 4 个 q 头读（GQA 固有），无 v4 的 4× HBM
     /// 放大，32K+ 长上下文本档就是为此开的）
     attn_v5_min_t: u32,
@@ -1521,7 +1547,10 @@ impl Qwen35Executor {
             attn_v5_min_t: std::env::var("WEIN_ATTN_V5_T")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+                // 512：尾 chunk（t<2048 的 ragged 段）也走 v5——6009 实测
+                // 尾步 attn 81.9→66（v4/慢路 → v5 主体）；2048 旧档把整个
+                // 尾步拒在门外
+                .unwrap_or(512),
             attn_v5_max_ctx: std::env::var("WEIN_ATTN_V5_CTX")
                 .ok()
                 .and_then(|v| v.parse().ok())

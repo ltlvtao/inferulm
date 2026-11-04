@@ -33,7 +33,10 @@ fn main() {
         eprintln!("SKIP（模型目录不在场）");
         return;
     };
-    std::env::set_var("WEIN_STEP_PROFILE", "1"); // 须先于 open
+    // 须先于 open；已设（如 =per 逐步档）则尊重外部值
+    if std::env::var("WEIN_STEP_PROFILE").is_err() {
+        std::env::set_var("WEIN_STEP_PROFILE", "1");
+    }
     let args: Vec<usize> = std::env::args().skip(1).filter_map(|t| t.parse().ok()).collect();
     let n = args.first().copied().unwrap_or(3000);
     let gen = args.get(1).copied().unwrap_or(32);

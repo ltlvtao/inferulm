@@ -129,6 +129,7 @@ fn main() {
                 std::process::exit(1)
             });
         }
+        let mut warmup_len = 0usize;
         let (engine, tok): (EngineHandle, Arc<dyn Tokenizer>) = if use_qwen {
             let dir = PathBuf::from(&model);
             let ex = if use_graph {
@@ -156,6 +157,7 @@ fn main() {
                     None
                 }
             };
+            let mut warmup_len_inner = warmup_len;
             let engine = EngineCore::spawn_with(
                 {
                     // --mix-cap N：混合步封顶覆盖（battery 调参用；默认走
@@ -197,11 +199,14 @@ fn main() {
                             low_watermark: 0.1,
                         });
                     }
+                    // 启动预热的步长（= 调度器实际会用的满 chunk，见下）
+                    warmup_len_inner = cfg.sched.chunk_size.min(cfg.sched.token_budget);
                     cfg
                 },
                 Box::new(ex),
             )
             .0;
+            warmup_len = warmup_len_inner;
             (engine, Arc::new(HfServing { tok: hf, tpl }))
         } else {
             let engine: EngineHandle = match engine_kind.as_str() {
@@ -242,6 +247,33 @@ fn main() {
             (engine, Arc::new(mock_tok))
         };
         let ctx_limit = engine.ctx_limit();
+        // 启动预热（qwen；--no-warmup 可关，对照测量用）：进程首步 prefill
+        // 的一次性成本 ~137ms（cuBLASLt workspace/algo 初始化、lm_head 首
+        // 调、模块惰性页入——6009 冷跑首轮实测 676 vs 540）。暖一发满
+        // chunk 即覆盖全部 m 族（1913-after-2048 实测零税——初始化成本
+        // 按 (n,k) 摊，不按 m 重付），带 4 个 decode 步顺带暖采样路径；
+        // 快照/KV 随后整池清空。vLLM 同款 startup warmup。
+        if use_qwen && warmup_len > 0 && !args.iter().any(|a| a == "--no-warmup") {
+            let t0 = std::time::Instant::now();
+            let ids: Vec<u32> =
+                (0..warmup_len as u32).map(|i| 1000 + (i * 37) % 2000).collect();
+            match engine.submit(ids, 4, Default::default()) {
+                Ok((_, mut stream)) => {
+                    while let Some(ev) = stream.recv().await {
+                        if matches!(ev, wein_engine::EngineEvent::Finished(_)) {
+                            break;
+                        }
+                    }
+                    engine.clear_prefix_cache();
+                    println!(
+                        "warmup: {}ms（{} token prefill + 4 decode；前缀缓存已清）",
+                        t0.elapsed().as_millis(),
+                        warmup_len
+                    );
+                }
+                Err(_) => eprintln!("warmup 提交失败（引擎已关闭）——跳过"),
+            }
+        }
         let state = ServeState::new(model.clone(), tok, engine);
         let server = spawn_server_guarded(state, format!("0.0.0.0:{port}").parse().unwrap())
             .await
