@@ -69,10 +69,12 @@ fn main() {
 
     let (r4, l4, s4) = t.paged_attn.v4_meta();
     let (r5, l5, s5) = t.paged_attn.v5_meta();
-    println!("## 编译属性：v4 {r4} regs/{l4}B local/{s4}B smem｜v5 {r5} regs/{l5}B local/{s5}B smem");
+    println!(
+        "## 编译属性：v4 {r4} regs/{l4}B local/{s4}B smem｜v5 {r5}/{l5}/{s5}"
+    );
 
-    // ── ① 正确性 spot：v5 ≡ v4 逐位（t=512 八组、t=1088 十七组=奇数组数）
-    for tokens in [512usize, 1088] {
+    // ── ① 正确性 spot：v5 ≡ v4 逐位 + 双跑查竞态
+    for tokens in [512usize, 1152] {
         if let Some(want) = only_t {
             if tokens != want {
                 continue;
@@ -90,38 +92,35 @@ fn main() {
             dummy: gpu.alloc_bytes(4),
         };
         let poison = vec![0x7f7fu16; tokens * q_heads * hd];
-        let run = |v5: bool| {
+        let run = |which: u8| {
             d.out.upload_on(&poison, &stream);
-            if v5 {
-                t.paged_attn.run_tile_v5(
-                    &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32,
-                    bs as u32, q_heads as u32, kv_heads as u32, hd as u32, tokens as u32,
-                    &stream,
-                );
-            } else {
-                t.paged_attn.run_tile_v4(
-                    &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32,
-                    bs as u32, q_heads as u32, kv_heads as u32, hd as u32, tokens as u32,
-                    &stream,
-                );
+            let a = (
+                &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32, bs as u32,
+                q_heads as u32, kv_heads as u32, hd as u32, tokens as u32,
+            );
+            match which {
+                4 => t.paged_attn.run_tile_v4(a.0, a.1, a.2, a.3, a.4, a.5, a.6, a.7, a.8, a.9, a.10, a.11, a.12, a.13, &stream),
+                _ => t.paged_attn.run_tile_v5(a.0, a.1, a.2, a.3, a.4, a.5, a.6, a.7, a.8, a.9, a.10, a.11, a.12, a.13, &stream),
             }
             stream.sync();
             d.out.read_to_vec::<u16>()
         };
-        let v4 = run(false);
-        let v5 = run(true);
-        let v5b = run(true);
-        let diff = v4.iter().zip(v5.iter()).filter(|(a, b)| a != b).count();
+        let v4 = run(4);
+        let v5 = run(5);
+        let v5b = run(5);
+        let d45 = v4.iter().zip(v5.iter()).filter(|(a, b)| a != b).count();
         let race = v5.iter().zip(v5b.iter()).filter(|(a, b)| a != b).count();
-        let flag = if diff == 0 && race == 0 { "✅" } else { "❌" };
-        println!("## t={tokens}：v5≡v4 位差 {diff}/{}、双跑 diff {race} {flag}", v4.len());
+        let flag = if d45 == 0 && race == 0 { "✅" } else { "❌" };
+        println!(
+            "## t={tokens}：v5≡v4 {d45}、双跑 {race} {flag}"
+        );
         drop(d);
     }
 
-    // ── ② 计时 @3009/6009/8009：v5 vs v4（各取 64/16 对齐主段）
+    // ── ② 计时 @3009/6009/8009/32000：v4 vs v5（各取对齐主段）
     println!("\n## 单发计时（10 发均摊，ms/单层）");
-    println!("| T | v4 | v5 | v4/v5 | v5 8 层 | KV 流量(GB/层) v4→v5 |");
-    println!("|---|---|---|---|---|---|");
+    println!("| T | v4 | v5 | v4/v5 | v5 8 层 |");
+    println!("|---|---|---|---|---|");
     for tt in [3009usize, 6009usize, 8009usize, 32000] {
         if let Some(want) = only_t {
             if tt != want {
@@ -155,25 +154,18 @@ fn main() {
         };
         let t4 = (tt & !15) as u32;
         let t64 = (tt & !63) as u32;
+        let args = (
+            &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32, bs as u32,
+            q_heads as u32, kv_heads as u32, hd as u32,
+        );
         let v4_ms = timeit(&|| {
-            t.paged_attn.run_tile_v4(
-                &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32, bs as u32,
-                q_heads as u32, kv_heads as u32, hd as u32, t4, &stream,
-            )
+            t.paged_attn.run_tile_v4(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, t4, &stream)
         });
         let v5_ms = timeit(&|| {
-            t.paged_attn.run_tile_v5(
-                &d.q, &d.k, &d.v, &d.bt, &d.si, &d.pos, &d.out, q_scale, c.bpr as u32, bs as u32,
-                q_heads as u32, kv_heads as u32, hd as u32, t64, &stream,
-            )
+            t.paged_attn.run_tile_v5(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, t64, &stream)
         });
-        // 每 kvh 流被消费次数：v4 每 16 行组×每 q 头一次（÷16 粒度重读 4 头），
-        // v5 每 64 行组一次——近似 KV→SM 流量 = 组数×4q头×平均前缀×1KB
-        let avg = |t: usize| t as f64 / 2.0;
-        let g4 = (t4 as f64 / 16.0) * 4.0 * avg(t4 as usize) / 1.0e9;
-        let g5 = (t64 as f64 / 64.0) * 4.0 * avg(t64 as usize) / 1.0e9;
         println!(
-            "| {tt} | {v4_ms:.3} | {v5_ms:.3} | {:.2}x | {:.1} | {g4:.2}→{g5:.2} |",
+            "| {tt} | {v4_ms:.3} | {v5_ms:.3} | {:.2}x | {:.1} |",
             v4_ms / v5_ms,
             v5_ms * 8.0
         );

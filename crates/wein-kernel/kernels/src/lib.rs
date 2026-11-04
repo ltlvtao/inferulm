@@ -4276,6 +4276,10 @@ pub unsafe extern "ptx-kernel" fn paged_attn_v5(
 }
 
 
+
+
+
+
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
 /// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的
 /// 上界 = ROWS_CAP/group）。四项的定尺依据：

@@ -2917,6 +2917,7 @@ impl PagedAttnCuda<'_> {
         self.gpu.launch(&self.f_v5, q_heads * row_tiles, 128, &args, stream);
     }
 
+
     /// v3 变体编译后属性（regs / local 溢出字节 / smem 字节）——探针口径
     pub fn v3_meta(&self, v: V3Var) -> (i32, i32, i32) {
         use crate::cuda::driver::{

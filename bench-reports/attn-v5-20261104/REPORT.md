@@ -64,3 +64,55 @@
   配 `WEIN_CHUNK=2048 WEIN_CTX_LEN=32768 WEIN_KV_PAGES=2048 WEIN_SNAP_STRIDE=256`。
 - 留刀顺位：Bc=64 大瓦片（容差档 o40 式）> delta h 换形态 > BT 自适应 >
   W8A8（对手 +24%）> tools > 昇腾。
+
+## 追记：大瓦片刀证伪（2026-11-04，未 commit 即删）
+
+四步收官后开"追平 vLLM 最后一段"刀。四个变体全部落在 v5 ±5% 带内，
+**结构性假说全灭**；根因定位后关刀，死代码（v6/v7/v8/v7_ablate）当场删净。
+
+### 变体与读数（6009 ms/单层，v5=7.0-7.4）
+
+| 变体 | 假说 | 读数 | 判决 |
+|---|---|---|---|
+| v6 Bc=32 单缓冲 | 屏障频率/mma 链长是墙 | 7.1-7.3 | 打平（意外保位级 ≡v5） |
+| v7 Br=128（8 warp/CTA） | CTA 粒度/Q 流量 18GB/层 是墙 | 6.9-7.1 | 打平（Q 重读被 L2 吸收；位级 ≡v5） |
+| v8 S 四路 k-劈链 | 单依赖链停顿（独立测 −45%） | 7.1 | 全量打平——softmax/O 在场收益蒸发 |
+| v7_ablate 消融相位 0-10 | 定位 | 见下 | S 段独占 60% |
+
+### S 相位判决性分解（@6009，消融 kernel 实测）
+
+| 项 | ms | 占 S 段 4.32 |
+|---|---|---|
+| 纯载入（qa+kb 全迭代，无 mma） | **2.07** | **48%** |
+| 纯 mma（frag 预载一次，无逐迭代载入） | **1.17** | 27% |
+| S(A@smem 假源)（延迟隔离） | 4.03 | −7% ⇒ 载入**延迟**无关 |
+| S 四链独立（ILP 隔离） | 2.56 | −45% ⇒ 载入**指令/依赖**有关 |
+
+### 根因（nvcc 实测定案）
+
+PTX 全 401 条 `wmma.load.*.bf16` 在 SASS 落成 **4×LD.E 32 位标量 generic 载入**
+（每 fragment 4 条，LD.E 可走 generic window 触 shared），**零 LDSM**。用
+nvcc -ptx/-arch=sm_89 生成 canonical shared wmma（`__align__(16)`）对照：
+SASS 同样零 LDSM——**ptxas 对 wmma.load 永不生成 ldmatrix**，vLLM/FA2 的
+LDSM 全部来自手写 `ldmatrix.sync` 内联 PTX。我们的 Rust→NVVM 管线没有
+ldmatrix intrinsic，asm! 在 nvptx 无寄存器类——换 LDSM 只剩 build.rs
+raw-PTX 注入引擎（per-lane 地址改写 + 4-reg 返回旁路）+ Q staging 32KB
+smem（>48KB 静态上限需动态 smem + cuFuncSetAttribute FFI）。
+
+### 关刀判据
+
+纯 mma 地板 1.17 + staging 1.44 + softmax 0.29 + O 1.09 ≈ **即使 LDSM
+全套落地也只到 ~5.3ms/层（仍 2.2× vLLM 2.41）**；投入（PTX 注入引擎+
+动态 smem+FFI）与回报（6009 −25ms/543、32K −~70ms/4587）不成比例。
+**attention 微架构深挖到此为止**：v5（59.5ms@6009/8 层）为该管线终态，
+redirect 到 6009 账本更大的项——空洞 ~104ms、delta h 换形态 ~80ms、
+lm_head/logits ~20ms、W8A8。
+
+### 收尾
+
+- 删净：paged_attn_v6/v7/v8/v7_ablate 四 kernel + V6_KS/VT/P、V7_KS/VT/P
+  smem 符号 + f_v6/f_v7/f_v8/f_v7a + run_tile_v6/v7/v8/v7_ablate +
+  v6/v7/v8_meta + 探针五列/消融段。lib.rs 8076→6894 行。
+- 验证：wein-kernel 全测 76 过（k1 入口 64 不变——v6/v7/v8 是未提交增量）、
+  qwen 23/23、探针 v5≡v4 位级 0 差、6009 7.26/32000 210.4 与基线一致。
+  battery 免（生产路径 v5 一字未动）。
