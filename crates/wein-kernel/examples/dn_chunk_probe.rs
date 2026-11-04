@@ -131,6 +131,7 @@ fn main() {
     let dsn = gpu.alloc_from_slice(&snap_off);
     let (tk, tkh, tvh, tkd, tvd) = (tokens as u32, kh as u32, vh as u32, kd as u32, vd as u32);
     let (nr, nch, btu, eps) = (n_rows as u32, chunks as u32, bt as u32, 1e-6f32);
+    let tparu = std::env::var("WEIN_DN_TPAR").map(|v| v != "0").unwrap_or(true) as u32;
     let launch = |st: &Stream, sp: u32| {
         let n_l2 = tk * tkh;
         let a1 = wein_kernel::kernel_args![dq, dk, inv, tk, tkh, tkd, eps];
@@ -139,7 +140,7 @@ fn main() {
             drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1, w_hi_off, w_lo_off];
         gpu.launch(&f_prep, nch * tkh, 256, &a2, st);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off, tparu];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
         gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, st);
         let a4 = wein_kernel::kernel_args![dq, dk, inv, gcum, du, snap, dout,
@@ -164,7 +165,7 @@ fn main() {
         gpu.launch(&f_prep, nch * tkh, 256, &a2, &s);
         evs[2].record_on(&s);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off, tparu];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
         gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, &s);
         evs[3].record_on(&s);

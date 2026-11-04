@@ -108,7 +108,7 @@ fn main() {
 /// 不许静默产出跑不动的 PTX。
 fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     let src = std::fs::read_to_string(lib_rs).expect("读 kernels src");
-    // 符号名：#[link_section = ".shared"] 紧随的 static mut NAME
+    // 符号名：#[link_section = ".shared"] 后（允许隔注释行）的 static mut NAME
     let mut names: Vec<String> = Vec::new();
     let mut mark = false;
     for line in src.lines() {
@@ -118,6 +118,9 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
             continue;
         }
         if mark {
+            if t.starts_with("//") {
+                continue;
+            }
             if let Some(rest) = t.strip_prefix("static mut ") {
                 let name: String =
                     rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();

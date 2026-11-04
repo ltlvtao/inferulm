@@ -971,6 +971,11 @@ pub struct DeltanetChunkedCuda<'a> {
     /// fwd_h 的块私有 scratch（[rows×vh×vsplit 块] × (vrows·kd+BT) f32，
     /// 按 ROWS×VH×(DIM²+VSPLIT·BT) 定尺——vsplit 越大块越多每块越小）
     scratch2: DevBuf<'a>,
+    /// ② t-并行 wmma 档（WEIN_DN_TPAR=1 开，默认关）：S+=k̂ᵀ@(g·δ″) 整 chunk 折
+    /// GEMM，破 legacy 位级、走 o35 容差档；仅 staged 生产几何生效。bank 冲突
+    /// 修平后与 serial 平价（1511 vs 1461µs/层 中位，A 镜像 hi/lo 打包的
+    /// staging 税 ≈ mma 省下的 fma）——留作形态备胎与 A/B 档。
+    dn_tpar: bool,
     tokens_cap: usize,
     chunks_cap: usize,
 }
@@ -1007,6 +1012,7 @@ impl<'a> DeltanetChunkedCuda<'a> {
                         + DN_CHUNK_BT_MAX * (1 + DN_CHUNK_DIM))
                     * 4,
             ),
+            dn_tpar: std::env::var("WEIN_DN_TPAR").map(|v| v == "1").unwrap_or(false),
             tokens_cap: t,
             chunks_cap: cch,
         }
@@ -1100,6 +1106,7 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
             *k, self.inv, self.gcum, self.u, self.w, self.snap, *state,
             *row_start, *row_count, *row_id, *snap_off, n_rows, k_heads, v_heads, k_dim, v_dim,
             bt, sp, self.scratch2, w_hi_off, w_lo_off,
+            (self.dn_tpar && sp == 8 && bt <= 64) as u32,
         ];
         // sp=8（vrows=16）：VW4 派发下 128 线程（4 warp）恰满行；小块多驻留
         // （256 块 / 128 SM → 多块/SM 共驻，藏 ② tp 链载入延迟）
@@ -2761,7 +2768,6 @@ impl PagedAttnCuda<'_> {
             Err(_) => V3Var::pick(hd, cfg.kt),
         };
         let ntile = (tokens as usize).div_ceil(cfg.br);
-        let base = kv_heads as usize * ntile;
         let part_ok = tokens as usize * q_heads as usize <= V3_PART_ROWS;
         // jsplit 固定 1：js=2 时偏结果写路径在混合批下致相邻序列分叉（b2
         // 实测 small 5/8），combine 有已知脆弱——禁掉（js=1 性能差 ~3% 内，
