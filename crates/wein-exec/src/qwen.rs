@@ -4239,10 +4239,13 @@ impl Executor for Qwen35Executor {
     }
 
     /// 块边界（= 快照检查点/前缀共享粒度）。radix 关时上报 1：调度账与
-    /// 旧版逐位一致（A/B 基线）
+    /// 旧版逐位一致（A/B 基线）。开时上报 `snap_stride`——快照栅格按
+    /// stride 取格点（`(p+1) % stride == 0`），调度 chunk 尾只对齐到
+    /// block 会让长上下文档（stride 256）的步尾全部落在格点之外，
+    /// 前缀缓存全程空转
     fn prefix_align(&self) -> usize {
         if self.radix_on {
-            ctx::block() as usize
+            self.snap_stride
         } else {
             1
         }

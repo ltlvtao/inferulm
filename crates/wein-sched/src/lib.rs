@@ -503,6 +503,13 @@ impl Scheduler {
                 if a > 0 {
                     chunk = a;
                 }
+                // 精确契合（本步吃满 backlog 且落在格点）时，唯一检查点会
+                // 落在 prompt 末位——快照恢复的"末 token 重算"规则排除末块，
+                // 精确重复的 prompt 将全程 miss。让出一格粒度收尾：多付一小
+                // 步（≤ snap_align token），换末位前一个可命中的检查点。
+                if chunk == backlog && chunk > self.cfg.snap_align {
+                    chunk -= self.cfg.snap_align;
+                }
             }
             r.forwarded += chunk;
             budget -= chunk;
@@ -955,6 +962,20 @@ mod tests {
         };
         assert_eq!(run(1), (vec![10], 2), "不对齐：prompt 一步追平");
         assert_eq!(run(4), (vec![8, 2], 2), "对齐 4：首块 8（块边界）+ 末块 2");
+        // 精确契合（prompt 8 = 2×4 落格点）让出一格：末位前留可命中检查点
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 16,
+            max_running: 8,
+            chunk_size: 16,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            snap_align: 4,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 8], max_tokens: 2 });
+        let (plans, _) = run_to_idle(&mut s, 50);
+        let chunks: Vec<usize> =
+            plans.iter().filter(|p| !p.prefill.is_empty()).map(|p| p.prefill[0].1).collect();
+        assert_eq!(chunks, vec![4, 4], "精确契合让一格：[4, 4] 而非单步 [8]");
         // 多块预算切片：仍逐段对齐，末块不圆
         let mut s = Scheduler::new(SchedConfig {
             token_budget: 16,

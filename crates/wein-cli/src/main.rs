@@ -199,8 +199,19 @@ fn main() {
                             low_watermark: 0.1,
                         });
                     }
-                    // 启动预热的步长（= 调度器实际会用的满 chunk，见下）
-                    warmup_len_inner = cfg.sched.chunk_size.min(cfg.sched.token_budget);
+                    // 启动预热的步长（= 调度器实际会用的满 chunk，见下）。
+                    // 钳到 ctx/KV 池余量内：chunk ≥ ctx 时预热请求会被容量
+                    // 校验当场打回（warmup 静默 0ms，冷跑全款付 Lt 首调——
+                    // chunk8192/ctx8192 档实测）
+                    let ctx_cap = wein_exec::ctx::max_pos() as usize;
+                    let kv_cap =
+                        wein_exec::kv_pages() as usize * wein_exec::kv_block() as usize;
+                    warmup_len_inner = cfg
+                        .sched
+                        .chunk_size
+                        .min(cfg.sched.token_budget)
+                        .min(ctx_cap.saturating_sub(64))
+                        .min(kv_cap.saturating_sub(64));
                     cfg
                 },
                 Box::new(ex),
