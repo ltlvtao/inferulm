@@ -114,14 +114,21 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     let src = std::fs::read_to_string(lib_rs).expect("读 kernels src");
     // 符号名：#[link_section = ".shared"] 后（允许隔注释行）的 static mut NAME
     let mut names: Vec<String> = Vec::new();
-    let mut mark = false;
+    // 动态段符号：#[link_section = ".shared-dyn"]——声明改写为 extern
+    // 动态 smem（宿主 launch_smem 供字节），其余三处改写同静态段
+    let mut dyn_names: Vec<String> = Vec::new();
+    let mut mark = 0u8; // 0 无 / 1 静态 / 2 动态
     for line in src.lines() {
         let t = line.trim();
         if t.contains("#[link_section = \".shared\"]") {
-            mark = true;
+            mark = 1;
             continue;
         }
-        if mark {
+        if t.contains("#[link_section = \".shared-dyn\"]") {
+            mark = 2;
+            continue;
+        }
+        if mark > 0 {
             if t.starts_with("//") {
                 continue;
             }
@@ -129,13 +136,17 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
                 let name: String =
                     rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
                 if !name.is_empty() {
-                    names.push(name);
+                    if mark == 1 {
+                        names.push(name);
+                    } else {
+                        dyn_names.push(name);
+                    }
                 }
             }
-            mark = false;
+            mark = 0;
         }
     }
-    if names.is_empty() {
+    if names.is_empty() && dyn_names.is_empty() {
         // 无 smem 数组：原样拷贝
         std::fs::copy(ptx_src, dst).expect("拷贝 PTX 产物");
         return;
@@ -145,18 +156,32 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     let mut patched_count = 0usize;
     // v3 entry 插 .maxntid 512（.version 7.0 无 .maxnreg）：逼 ptxas 把 regs
     // 压到 65536/512=128 → bdim≤512 均可发射且 bdim256 得 2 块/SM 占用。
-    let mut v3_pending = false;
+    // （dn_chunk_o 曾试 .maxnreg 128 注入：瓦片 acc 组溢出净亏 60%，已废）
+    let mut pending_dir: Option<&str> = None;
     let mut lines_out: Vec<String> = Vec::with_capacity(ptx.len() / 24);
     for l in ptx.lines() {
         if l.starts_with(".visible .entry ") {
             in_fn = true;
             if l.starts_with(".visible .entry paged_attn_v3_") {
-                v3_pending = true;
+                pending_dir = Some(".maxntid 512, 1, 1");
             }
         }
         let mut line = l.to_string();
-        let has_sym = names.iter().any(|n| l.contains(n.as_str()));
-        if has_sym && l.contains(".global") {
+        let has_dyn = dyn_names.iter().any(|n| l.contains(n.as_str()));
+        let has_sym = has_dyn || names.iter().any(|n| l.contains(n.as_str()));
+        if has_dyn && l.starts_with(".global ") {
+            // 动态段声明整行改 extern 动态 smem（名字取 mangled 前缀不变）：
+            // 声明形如 `.global .align 8 .b8 SYM[32];`
+            let sym: String = l
+                .split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .chars()
+                .take_while(|c| *c != '[' && *c != ';')
+                .collect();
+            line = format!(".extern .shared .align 16 .b8 {sym}[];");
+            patched_count += 1;
+        } else if has_sym && l.contains(".global") {
             line = l.replace(".global", ".shared");
             patched_count += 1;
         } else if has_sym && l.contains("mov.b64") {
@@ -165,11 +190,14 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
         } else if in_fn && (l.contains("st.global") || l.contains("ld.global")) {
             line = l.replace("st.global", "st").replace("ld.global", "ld");
         }
-        lines_out.push(line);
-        if v3_pending && l.trim_start().starts_with(')') {
-            lines_out.push(".maxntid 512, 1, 1".to_string());
-            v3_pending = false;
+        // 待插指令在 '{' 行**前**落（入体内 ptxas 解析报错）
+        if let Some(d) = pending_dir {
+            if l.trim_start().starts_with('{') {
+                lines_out.push(d.to_string());
+                pending_dir = None;
+            }
         }
+        lines_out.push(line);
         if in_fn && l == "}" {
             in_fn = false;
         }
@@ -177,12 +205,21 @@ fn patch_smem_symbols(ptx_src: &PathBuf, dst: &PathBuf, lib_rs: &PathBuf) {
     let out = lines_out.join("\n");
     for n in &names {
         assert!(
-            out.contains(&format!(".shared") ) || patched_count > 0,
+            out.contains(&format!(".shared .b8 ")) || patched_count > 0,
             "smem 符号 {n} 未在 PTX 中改写"
         );
     }
+    for n in &dyn_names {
+        assert!(
+            out.contains(".extern .shared .align 16 .b8 ") && out.contains(&format!("{n}[]")),
+            "动态 smem 符号 {n} 未在 PTX 中改写"
+        );
+    }
     std::fs::write(dst, out).expect("写改写后 PTX");
-    println!("cargo:warning=smem 改写：{:?}（{patched_count} 处）", names);
+    println!(
+        "cargo:warning=smem 改写：{:?}（dyn {:?}，{patched_count} 处）",
+        names, dyn_names
+    );
 }
 
 /// cp.async 占位函数体替换。签名形态（LLVM NVPTX 稳定产出）：
@@ -208,6 +245,19 @@ fn patch_cp_async(dst: &PathBuf) {
     out = replace_cp_placeholder(&out, "cp_async_wait_all", 1, |_| {
         "\tcp.async.wait_all;\n\tret;\n".to_string()
     });
+    out = replace_cp_placeholder(&out, "cp_async_wait1", 1, |_| {
+        "\tcp.async.wait_group 1;\n\tret;\n".to_string()
+    });
+    // prefetch.global.L2：ld.param 取参 → cvta.global → 真 prefetch（纯
+    // 提示指令，无落点）
+    out = replace_cp_placeholder(&out, "dn_l2pf", 1, |p| format!(
+        "\t.reg .b64 \t%rd<1>;\n\n\
+         \tld.param.b64 \t%rd0, [{p0}];\n\
+         \tcvta.to.global.u64 \t%rd0, %rd0;\n\
+         \tprefetch.global.L2 \t[%rd0];\n\
+         \tret;\n",
+        p0 = p[0],
+    ));
     // V5_KS 对齐提升（smem 补丁已把声明改写为 .shared）
     let mut bumped = 0usize;
     let lines: Vec<String> = out
@@ -227,6 +277,8 @@ fn patch_cp_async(dst: &PathBuf) {
         "cp.async.cg.shared.global",
         "cp.async.commit_group",
         "cp.async.wait_all",
+        "cp.async.wait_group",
+        "prefetch.global.L2",
     ] {
         assert!(out.contains(needle), "cp.async 指令 {needle} 未出现在产物 PTX");
     }
@@ -235,7 +287,7 @@ fn patch_cp_async(dst: &PathBuf) {
         "占位 volatile 体残留——绝不允许上线"
     );
     std::fs::write(dst, out).expect("写 cp.async 改写后 PTX");
-    println!("cargo:warning=cp.async 改写：三函数体 + V5_KS .align 16");
+    println!("cargo:warning=cp.async 改写：四函数体 + V5_KS .align 16");
 }
 
 /// 定位 `name` 函数定义，花括号匹配替换体。`body(params) -> 指令文本`。

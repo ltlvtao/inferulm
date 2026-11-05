@@ -977,11 +977,6 @@ pub struct DeltanetChunkedCuda<'a> {
     /// fwd_h 的块私有 scratch（[rows×vh×vsplit 块] × (vrows·kd+BT) f32，
     /// 按 ROWS×VH×(DIM²+VSPLIT·BT) 定尺——vsplit 越大块越多每块越小）
     scratch2: DevBuf<'a>,
-    /// ② t-并行 wmma 档（WEIN_DN_TPAR=1 开，默认关）：S+=k̂ᵀ@(g·δ″) 整 chunk 折
-    /// GEMM，破 legacy 位级、走 o35 容差档；仅 staged 生产几何生效。bank 冲突
-    /// 修平后与 serial 平价（1511 vs 1461µs/层 中位，A 镜像 hi/lo 打包的
-    /// staging 税 ≈ mma 省下的 fma）——留作形态备胎与 A/B 档。
-    dn_tpar: bool,
     tokens_cap: usize,
     chunks_cap: usize,
 }
@@ -997,7 +992,7 @@ impl<'a> DeltanetChunkedCuda<'a> {
             caps.delta_chunk_tokens
         };
         let cch = t / 64 + DN_CHUNK_CHUNK_SLACK;
-        Self {
+        let this = Self {
             gpu,
             f_prep: m.func("dn_chunk_prep"),
             f_h: m.func("dn_chunk_h"),
@@ -1018,10 +1013,25 @@ impl<'a> DeltanetChunkedCuda<'a> {
                         + DN_CHUNK_BT_MAX * (1 + DN_CHUNK_DIM))
                     * 4,
             ),
-            dn_tpar: std::env::var("WEIN_DN_TPAR").map(|v| v == "1").unwrap_or(false),
             tokens_cap: t,
             chunks_cap: cch,
-        }
+        };
+        // o 快路动态 smem（S₀ 34816B + δ 32768B）opt-in：静态 33792B +
+        // 67584B = 101376B 恰为 sm_89 每块 opt-in 上限
+        use crate::cuda::driver::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        gpu.func_set_attribute(
+            &this.f_o,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            67584,
+        );
+        // h ① w hi/lo 双缓冲动态 smem（2 槽 × [64][34] u64 × hi/lo = 69632B）：
+        // 静态 22784 + 69632 = 92416 ≤ 101376B sm_89 每块上限
+        gpu.func_set_attribute(
+            &this.f_h,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            69632,
+        );
+        this
     }
 }
 
@@ -1112,12 +1122,16 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
             *k, self.inv, self.gcum, self.u, self.w, self.snap, *state,
             *row_start, *row_count, *row_id, *snap_off, n_rows, k_heads, v_heads, k_dim, v_dim,
             bt, sp, self.scratch2, w_hi_off, w_lo_off,
-            (self.dn_tpar && sp == 8 && bt <= 64) as u32,
         ];
         // sp=8（vrows=16）：VW4 派发下 128 线程（4 warp）恰满行；小块多驻留
         // （256 块 / 128 SM → 多块/SM 共驻，藏 ② tp 链载入延迟）
         let h_bdim = if sp == 8 { 128u32 } else { 256u32 };
-        self.gpu.launch(&self.f_h, n_rows * v_heads * sp, h_bdim, &h_args, stream);
+        // ① w-staging 专路（bts≤64 × kd=128）：bdim=256（sp≤4，regs 本就
+        // 1 块/SM）双槽 69632B；sp=8（bdim=128）不 staging（h_smem=0——
+        // 保 2 块/SM，kernel 走 L2 预热档）。
+        // kernel 侧 dblb/wst 同门——不匹配则永不触动态段
+        let h_smem: u32 = if bt <= 64 && k_dim == 128 && sp != 8 { 69632 } else { 0 };
+        self.gpu.launch_smem(&self.f_h, n_rows * v_heads * sp, h_bdim, h_smem, &h_args, stream);
         // ④ 输出组装（grid 同 prep；u 此时是 δ）。Mᵀ 走 w 别名（o 不读 w，
         //    h 之后 w 已死，下一层 prep 覆写——同 stream 保序）；scratch1
         //    传给 o 读 prep 的 eneg/epos 端点缩放（同 grid 几何同槽位）
@@ -1126,7 +1140,10 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
             *row_start, *row_count, *snap_off, n_rows, chunks, k_heads, v_heads, k_dim, v_dim,
             bt, self.w, self.scratch1,
         ];
-        self.gpu.launch(&self.f_o, grid_co, 256, &o_args, stream);
+        // 快路（bt=64、vd=128、vph≤2）launch 携带动态 smem 67584B（S₀
+        // 全行 34816B + δ 32768B）；其余几何 0 字节（免无谓占 smem 压并发）
+        let o_smem = if bt == 64 && v_dim == 128 && v_heads / k_heads <= 2 { 67584 } else { 0 };
+        self.gpu.launch_smem(&self.f_o, grid_co, 256, o_smem, &o_args, stream);
         sp
     }
 

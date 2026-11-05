@@ -42,6 +42,18 @@ fn main() {
         m.func("dn_chunk_o"),
         m.func("dn_qk_l2norm"),
     );
+    // o 快路动态 smem（S₀+δ，同 ops/mod.rs）opt-in
+    gpu.func_set_attribute(
+        &f_o,
+        wein_kernel::cuda::driver::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        67584,
+    );
+    // h ① w hi/lo 双缓冲动态 smem（同 ops/mod.rs）
+    gpu.func_set_attribute(
+        &f_h,
+        wein_kernel::cuda::driver::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        69632,
+    );
     let s = gpu.stream();
 
     let (kh, vh, kd, vd) = (16usize, 32usize, 128usize, 128usize);
@@ -131,7 +143,6 @@ fn main() {
     let dsn = gpu.alloc_from_slice(&snap_off);
     let (tk, tkh, tvh, tkd, tvd) = (tokens as u32, kh as u32, vh as u32, kd as u32, vd as u32);
     let (nr, nch, btu, eps) = (n_rows as u32, chunks as u32, bt as u32, 1e-6f32);
-    let tparu = std::env::var("WEIN_DN_TPAR").map(|v| v != "0").unwrap_or(true) as u32;
     let launch = |st: &Stream, sp: u32| {
         let n_l2 = tk * tkh;
         let a1 = wein_kernel::kernel_args![dq, dk, inv, tk, tkh, tkd, eps];
@@ -140,12 +151,15 @@ fn main() {
             drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, snap, sc1, w_hi_off, w_lo_off];
         gpu.launch(&f_prep, nch * tkh, 256, &a2, st);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off, tparu];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
-        gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, st);
+        // bt=64 × kd=128 → ① w-staging 专路（同 ops/mod.rs 门）：sp=8 不
+        // staging（0B 保 2 块/SM），其余双槽 69632B
+        let hsm = if sp == 8 { 0 } else { 69632u32 };
+        gpu.launch_smem(&f_h, nr * tvh * sp, hbd, hsm, &a3, st);
         let a4 = wein_kernel::kernel_args![dq, dk, inv, gcum, du, snap, dout,
             drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, dw, sc1];
-        gpu.launch(&f_o, nch * tkh, 256, &a4, st);
+        gpu.launch_smem(&f_o, nch * tkh, 256, 67584, &a4, st);
     };
     eprintln!("\n  BT=64 分 kernel 分解（vsplit=8；µs/层）");
     for &sp in &[1u32, 2, 4, 8] {
@@ -165,13 +179,13 @@ fn main() {
         gpu.launch(&f_prep, nch * tkh, 256, &a2, &s);
         evs[2].record_on(&s);
         let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
-            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off, tparu];
+            drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
         let hbd = if sp == 8 { 128u32 } else { 256u32 };
-        gpu.launch(&f_h, nr * tvh * sp, hbd, &a3, &s);
+        gpu.launch_smem(&f_h, nr * tvh * sp, hbd, if sp == 8 { 0 } else { 69632 }, &a3, &s);
         evs[3].record_on(&s);
         let a4 = wein_kernel::kernel_args![dq, dk, inv, gcum, du, snap, dout,
             drs, drc, dsn, nr, nch, tkh, tvh, tkd, tvd, btu, dw, sc1];
-        gpu.launch(&f_o, nch * tkh, 256, &a4, &s);
+        gpu.launch_smem(&f_o, nch * tkh, 256, 67584, &a4, &s);
         evs[4].record_on(&s);
         s.sync();
         let seg = |i: usize| evs[i].elapsed_ms(&evs[i - 1]) as f64 * 1000.0;

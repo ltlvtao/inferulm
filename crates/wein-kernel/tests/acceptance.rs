@@ -183,9 +183,11 @@ fn k2_intrinsics_lowered_to_ptx() {
         .lines()
         .filter(|l| {
             let t = l.trim_start();
-            // 白名单：cp.async 占位函数的设备内调用（build.rs patch_cp_async
-            // 替换体，ptxas 内联）——不是宿主调用
-            t.starts_with("call") && !t.starts_with("call.uni cp_async_")
+            // 白名单：cp.async / prefetch 占位函数的设备内调用（build.rs
+            // patch_cp_async 替换体，ptxas 内联）——不是宿主调用
+            t.starts_with("call")
+                && !t.starts_with("call.uni cp_async_")
+                && !t.starts_with("call.uni dn_l2pf")
         })
         .collect();
     assert!(

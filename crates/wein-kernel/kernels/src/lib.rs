@@ -4018,6 +4018,23 @@ pub fn cp_async_wait_all(_dummy: *mut u32) {
     unsafe { core::ptr::write_volatile(_dummy, 0) }
 }
 
+/// cp.async.wait_group 1（N 为立即数——等最老未决组完成、留新组在飞；
+/// 体由 build.rs 同族替换）
+#[inline(never)]
+#[no_mangle]
+pub fn cp_async_wait1(_dummy: *mut u32) {
+    unsafe { core::ptr::write_volatile(_dummy, 0) }
+}
+
+/// prefetch.global.L2 [p]（纯提示——无寄存器/ smem 落点，不参与任何
+/// 完成跟踪；体由 build.rs 同族替换）。dn_chunk_h 单槽档用它跨 chunk
+/// 预热 w hi/lo 行集（无 smem 写 ⇒ 无 WAR——cp.async 预载转 L2 命中）
+#[inline(never)]
+#[no_mangle]
+pub fn dn_l2pf(_p: *const u8) {
+    unsafe { core::ptr::read_volatile(_p); }
+}
+
 // ═══ v5：4 warp × 64 行 CTA 共享 K/V smem（KV 流量 ÷4——每字节供 64 行 ═══
 // ═══ 消费而非 16 行）。几何：block = 128 线程（4 warp）= (q 头, 64 行组），
 // grid = q_heads × ⌈tokens/64⌉。K 平铺进 smem（wmma load.b 的 col-major
@@ -5431,7 +5448,89 @@ pub unsafe extern "ptx-kernel" fn deltanet(
 /// A 矩阵走独立的 `ascratch`（[块, BT·BT] f32——host 以 snap 缓冲别名传入：
 /// prep 先于 h 运行且不读 snap，生命周期零交叠）
 
-// 诊断档：0=全跑（生产）；>0 为临时分相排除法（见 git 历史/探针注释）
+/// 前代解的单列内核（左看：X[t][c] = R[t][c] − Σ_{p<t} A[t][p]·X[p][c]，p
+/// 升序 fma）。**8 行一组**：组内 8 个独立累加器并行吸收 p<8g 的贡献（共享
+/// X[p] 载入），再按 j 升序做组内前代——每元素的 fma 序与逐行串行版逐字同
+/// ⇒ 输出位级不变；依赖链由 n²/2 串行 fma（n=64 → 2016 条 × 4 周期）拆成
+/// 8 条并行链，8 warp/SM（regs 254 的占用上限）下才喂得饱发射。
+/// `base` 是 rhs 源兼解出值的落点（列距 `stride` 由调用者给）。
+#[inline(always)]
+unsafe fn dn_prep_solve_col(
+    base: *mut f32,
+    stride: usize,
+    abase: *const f32,
+    bts: usize,
+    n: usize,
+) {
+    let mut i0 = 0usize;
+    let mut arows = [0usize; 8];
+    while i0 + 8 <= n {
+        for i in 0..8 {
+            arows[i] = abase.add((i0 + i) * bts) as usize;
+        }
+        let mut acc = [0f32; 8];
+        for i in 0..8 {
+            acc[i] = *base.add((i0 + i) * stride);
+        }
+        let mut p = 0usize;
+        while p + 1 < i0 {
+            let xp = *base.add(p * stride);
+            let xq = *base.add((p + 1) * stride);
+            for i in 0..8 {
+                let a = *((arows[i] as *const f32).add(p) as *const u64);
+                acc[i] = fma(0.0 - f32::from_bits(a as u32), xp, acc[i]);
+                acc[i] = fma(0.0 - f32::from_bits((a >> 32) as u32), xq, acc[i]);
+            }
+            p += 2;
+        }
+        if p < i0 {
+            let xp = *base.add(p * stride);
+            for i in 0..8 {
+                acc[i] = fma(0.0 - *((arows[i] as *const f32).add(p)), xp, acc[i]);
+            }
+        }
+        // 组内前代（j 升序；acc[j] 已是解值，与从 base 重读同值）
+        for i in 0..8 {
+            let mut x = acc[i];
+            let arow = arows[i] as *const f32;
+            for j in 0..i {
+                x = fma(0.0 - *arow.add(i0 + j), acc[j], x);
+            }
+            acc[i] = x;
+            *base.add((i0 + i) * stride) = x;
+        }
+        i0 += 8;
+    }
+    // 尾组（n%8 行）：逐行版原样（同序）
+    while i0 < n {
+        let mut x = *base.add(i0 * stride);
+        let arow = abase.add(i0 * bts);
+        let mut p = 0usize;
+        let p4 = i0 & !3usize;
+        while p < p4 {
+            let (a01, a23) = (
+                *(arow.add(p) as *const u64),
+                *(arow.add(p + 2) as *const u64),
+            );
+            let x0 = *base.add(p * stride);
+            let x1 = *base.add((p + 1) * stride);
+            let x2 = *base.add((p + 2) * stride);
+            let x3 = *base.add((p + 3) * stride);
+            x = fma(0.0 - f32::from_bits(a01 as u32), x0, x);
+            x = fma(0.0 - f32::from_bits((a01 >> 32) as u32), x1, x);
+            x = fma(0.0 - f32::from_bits(a23 as u32), x2, x);
+            x = fma(0.0 - f32::from_bits((a23 >> 32) as u32), x3, x);
+            p += 4;
+        }
+        while p < i0 {
+            let a = *arow.add(p);
+            x = fma(0.0 - a, *base.add(p * stride), x);
+            p += 1;
+        }
+        *base.add(i0 * stride) = x;
+        i0 += 1;
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
@@ -5486,7 +5585,8 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
     let kh = kk;
     let krow = |g: usize, j: usize| (g * kh_n + kh) * kd + j; // q/k 的 (token, k 头) 行内偏移
     let t = _thread_idx_x() as usize;
-    // ── 逐 v 头：门控 scan + gcum/neg/pos + rhs 直落 u/w ──
+    // ── ① 逐 v 头：门控 scan + gcum/neg/pos（rhs 移到 A 之后——与旧序的值
+    //    逐位同，只是把三趟 u/w 读写排得更靠）──
     let mut hv = 0usize;
     while hv < vph {
         let h = kk * vph + hv;
@@ -5534,40 +5634,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
             *pos.add(t) = expf(*src.add(t) - clast);
         }
         _syncthreads();
-        // rhs 直落 u/w：任务 = (行 tp, 4 列 run)（64 run/行——vd=kd=128 钉死）。
-        // 4 列 1×u64 载、2×u64 存；scale（β / β·eneg·invk）每 run 一次
-        {
-            let mut e = t;
-            while e < n * 64 {
-                let tp = udiv(e, 64);
-                let run = urem(e, 64);
-                let cc = run * 4;
-                let (w4, s_, p) = if run < 32 {
-                    (
-                        *(v.add((t0 + tp) * vh * vd + h * vd + cc) as *const u64),
-                        *bet.add(tp),
-                        u.add((t0 + tp) * vh * vd + h * vd + cc) as *mut u64,
-                    )
-                } else {
-                    // f32 写（solve 段按同 pitch 读写；bf16 打包在 solve 后单独做）
-                    (
-                        *(k.add(krow(t0 + tp, cc - 128)) as *const u64),
-                        *bet.add(tp)
-                            * *neg.add(tp)
-                            * *inv.add((t0 + tp) * kh_n * 2 + kh * 2 + 1),
-                        w.add((t0 + tp) * vh * kd + h * kd + (cc - 128)) as *mut u64,
-                    )
-                };
-                let (lo, hi) = (w4 as u32, (w4 >> 32) as u32);
-                let f0 = f32::from_bits(lo << 16) * s_;
-                let f1 = f32::from_bits(lo & 0xffff_0000) * s_;
-                let f2 = f32::from_bits(hi << 16) * s_;
-                let f3 = f32::from_bits(hi & 0xffff_0000) * s_;
-                *p = (f0.to_bits() as u64) | ((f1.to_bits() as u64) << 32);
-                *(p.add(1)) = (f2.to_bits() as u64) | ((f3.to_bits() as u64) << 32);
-                e += 256;
-            }
-        }
         hv += 1;
     }
     // ── A 下三角物化：任务 = (t 八元 × s 八元) 8×8 寄存器瓦片（绿版结构；
@@ -5696,16 +5762,50 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
             e += 256;
         }
     }
-    _syncthreads(); // A 物化完成（跨线程）后才进 solve
-    // ── 左看前代：256 线程列并行（t<128 → u 列 t；t≥128 → w 列 t−128；
-    //    vd=kd=128 钉死）。每线程独占一列串行走完 n 行：X[t][c] = R[t][c] −
-    //    Σ_{p<t} A[t][p]·X[p][c]（p 升序 fma——与旧 8 宽瓦片版逐元素同序）。
-    //    列独占 ⇒ 零跨线程依赖零屏障；warp 内列连续 → 每行 1 条 128B 合并
-    //    载；逐 v 头串行各解一份（A/u/w/ascratch 均按 (块,v 头) 槽位）
-    if true {
-        let mut hv = 0usize;
-        while hv < vph {
-            let h = kk * vph + hv;
+    _syncthreads(); // A 物化完成（跨线程）后才进 rhs/solve
+    {
+        // ── ③ rhs 直落 u/w f32 → 左看前代（原地）→ w 打包 ──
+        let mut hv2 = 0usize;
+        while hv2 < vph {
+            let h = kk * vph + hv2;
+            let vb = gc * vh + h;
+            let sc = scratch.add(vb * (5 * bts));
+            let (bet, neg) = (sc.add(2 * bts), sc.add(3 * bts));
+            let mut e = t;
+            while e < n * 64 {
+                let tp = udiv(e, 64);
+                let run = urem(e, 64);
+                let cc = run * 4;
+                let (w4, s_, p) = if run < 32 {
+                    (
+                        *(v.add((t0 + tp) * vh * vd + h * vd + cc) as *const u64),
+                        *bet.add(tp),
+                        u.add((t0 + tp) * vh * vd + h * vd + cc) as *mut u64,
+                    )
+                } else {
+                    (
+                        *(k.add(krow(t0 + tp, cc - 128)) as *const u64),
+                        *bet.add(tp)
+                            * *neg.add(tp)
+                            * *inv.add((t0 + tp) * kh_n * 2 + kh * 2 + 1),
+                        w.add((t0 + tp) * vh * kd + h * kd + (cc - 128)) as *mut u64,
+                    )
+                };
+                let (lo, hi) = (w4 as u32, (w4 >> 32) as u32);
+                let f0 = f32::from_bits(lo << 16) * s_;
+                let f1 = f32::from_bits(lo & 0xffff_0000) * s_;
+                let f2 = f32::from_bits(hi << 16) * s_;
+                let f3 = f32::from_bits(hi & 0xffff_0000) * s_;
+                *p = (f0.to_bits() as u64) | ((f1.to_bits() as u64) << 32);
+                *(p.add(1)) = (f2.to_bits() as u64) | ((f3.to_bits() as u64) << 32);
+                e += 256;
+            }
+            hv2 += 1;
+        }
+        _syncthreads();
+        let mut hv2 = 0usize;
+        while hv2 < vph {
+            let h = kk * vph + hv2;
             let abase = ascratch.add((gc * vh + h) * bts * bts);
             let isu = t < 128;
             let c = if isu { t } else { t - 128 };
@@ -5714,85 +5814,38 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
             } else {
                 (w.add(t0 * vh * kd + h * kd + c), vh * kd)
             };
-            let mut ti = 0usize;
-            while ti < n {
-                let mut x = *base.add(ti * pitch);
-                let arow = abase.add(ti * bts);
-                // p 链 4× 展开：X 行 4 载 + A 行 2×u64（warp 同址广播）先行批量
-                // 发出再跑 4 fma，藏 L1 延迟（4 路部分和树实测更慢——批量载齐
-                // 才放 fma，反而失去 load/fma 交错；且序变无精度收益）
-                let mut p = 0usize;
-                let p4 = ti & !3usize;
-                while p < p4 {
-                    let (a01, a23) = (
-                        *(arow.add(p) as *const u64),
-                        *(arow.add(p + 2) as *const u64),
-                    );
-                    let x0 = *base.add(p * pitch);
-                    let x1 = *base.add((p + 1) * pitch);
-                    let x2 = *base.add((p + 2) * pitch);
-                    let x3 = *base.add((p + 3) * pitch);
-                    x = fma(0.0 - f32::from_bits(a01 as u32), x0, x);
-                    x = fma(0.0 - f32::from_bits((a01 >> 32) as u32), x1, x);
-                    x = fma(0.0 - f32::from_bits(a23 as u32), x2, x);
-                    x = fma(0.0 - f32::from_bits((a23 >> 32) as u32), x3, x);
-                    p += 4;
-                }
-                while p < ti {
-                    let a = *arow.add(p);
-                    x = fma(0.0 - a, *base.add(p * pitch), x);
-                    p += 1;
-                }
-                *base.add(ti * pitch) = x;
-                ti += 1;
-            }
-            hv += 1;
+            dn_prep_solve_col(base, pitch, abase, bts, n);
+            hv2 += 1;
         }
-    }
-    _syncthreads(); // w f32 solve 全就绪（跨线程列写）后才可打包
-    // ── w f32→bf16 原地前向打包（h 的 ① wmma 需要 bf16 片段源；o kernel 的
-    //    M 走 w 别名在 h 之后覆写——生命周期零交叠，不读原值）。solve 只写
-    //    行 <n，尾行 [n, bt) 是陈旧值：① 的 mma 会读到这些行（tile 整载）——
-    //    写 0 使其无害（elementwise 端 tr<n 守卫本就丢结果，0 只是杜绝读越
-    //    界与垃圾）。前向安全：pair j 读 2×f32 后写 1×u32 到同址，后续 pair
-    //    未动（f32→bf16 是截尾取高 16 位，pair 打包恰好落前半 u32）
-    // w 打包：f32 → hi/lo 双 bf16 图像，**全部写镜像新区**（f32 全区之上）。
-    // 曾用"半址原位"（hi 写 byte 2·idx）——被证伪：该写恰落 f32 元素 idx/2，
-    // 是另一任务（e≈e/2，常在**另一个 prep 块**、另一 token/k 头）的未读源
-    // ——跨块/块内并发竞态，o35 误差随时序在 4e-3 ~ 1.3e-1 摆动（memcheck
-    // 串行化最重）。镜像区与任何 f32 源不相交 ⇒ 天然无竞态。
-    // hi+lo 二次量化 ε²≈7.6e-6 ≈ f32 等效（旧标量路 w 即 f32——精度点不
-    // 回退；单 bf16 ε=3.9e-3，o35 out rel2 4.07e-3 越门——且那读数本身
-    // 是竞态侥幸样本）。tr≥n 尾行写 0（图像跨层复用，杜绝陈旧值）。
-    {
-        let vph = vh / kh_n;
-        let pairs = vph * kd / 2; // kd 恒偶 → bf16 对齐 u32
-        let w_hi = (w as *mut u16).add(w_hi_off as usize);
-        let w_lo = (w as *mut u16).add(w_lo_off as usize);
-        let mut e = t;
-        while e < bts * pairs {
-            let tr = udiv(e, pairs);
-            let c2 = e - tr * pairs;
-            let idx = (t0 + tr) * vh * kd + kk * vph * kd + c2 * 2; // u16 元素位
-            let src = w.add(idx); // f32 源（byte 4·idx）
-            let (hi_p, lo_p) = if tr < n {
-                let p64 = *(src as *const u64);
-                let e0 = f32::from_bits(p64 as u32);
-                let e1 = f32::from_bits((p64 >> 32) as u32);
-                let (h0, h1) = (f32_to_bf16(e0), f32_to_bf16(e1));
-                // 残差 = 原值 − hi 展开值（bf16→f32 是纯位拼：低 16 位补零）
-                let r0 = e0 - f32::from_bits((h0 as u32) << 16);
-                let r1 = e1 - f32::from_bits((h1 as u32) << 16);
-                (
-                    (h0 as u32) | ((h1 as u32) << 16),
-                    (f32_to_bf16(r0) as u32) | ((f32_to_bf16(r1) as u32) << 16),
-                )
-            } else {
-                (0u32, 0u32)
-            };
-            *(w_hi.add(idx) as *mut u32) = hi_p;
-            *(w_lo.add(idx) as *mut u32) = lo_p;
-            e += 256;
+        _syncthreads(); // w f32 solve 全就绪（跨线程列写）后才可打包
+        {
+            let pairs = vph * kd / 2;
+            let w_hi = (w as *mut u16).add(w_hi_off as usize);
+            let w_lo = (w as *mut u16).add(w_lo_off as usize);
+            let mut e = t;
+            while e < bts * pairs {
+                let tr = udiv(e, pairs);
+                let c2 = e - tr * pairs;
+                let idx = (t0 + tr) * vh * kd + kk * vph * kd + c2 * 2; // u16 元素位
+                let src = w.add(idx); // f32 源（byte 4·idx）
+                let (hi_p, lo_p) = if tr < n {
+                    let p64 = *(src as *const u64);
+                    let e0 = f32::from_bits(p64 as u32);
+                    let e1 = f32::from_bits((p64 >> 32) as u32);
+                    let (h0, h1) = (f32_to_bf16(e0), f32_to_bf16(e1));
+                    let r0 = e0 - f32::from_bits((h0 as u32) << 16);
+                    let r1 = e1 - f32::from_bits((h1 as u32) << 16);
+                    (
+                        (h0 as u32) | ((h1 as u32) << 16),
+                        (f32_to_bf16(r0) as u32) | ((f32_to_bf16(r1) as u32) << 16),
+                    )
+                } else {
+                    (0u32, 0u32)
+                };
+                *(w_hi.add(idx) as *mut u32) = hi_p;
+                *(w_lo.add(idx) as *mut u32) = lo_p;
+                e += 256;
+            }
         }
     }
 }
@@ -5823,11 +5876,6 @@ struct DnH {
     cnt: usize,
     nch: usize,
     t: usize,
-    /// ② t-并行 wmma 档（host 侧 WEIN_DN_TPAR 门 + staged 生产几何）：
-    /// S += k̂ᵀ@(g·δ″) 整 chunk 折成 m16n16k16 GEMM，C 片段跨 chunk 驻
-    /// 寄存器。破与 legacy 的位级等价（求和树换形 + B 侧 bf16 hi/lo），数值
-    /// 走 o35 容差档。
-    tpar: bool,
 }
 
 /// u64 → 4×f32（bf16 高位展开——纯移位/掩码，无查表）
@@ -5874,25 +5922,23 @@ static mut DN_H2_K: [u64; 64 * 36] = [0; 64 * 36];
 static mut DN_H2_D: [F4; 64 * 4] = [F4([0.0; 4]); 64 * 4];
 #[link_section = ".shared"]
 static mut DN_H2_G: [f32; 64] = [0.0; 64];
-// ② t-并行（wmma）专用：A=δ″g 的 hi/lo 双 bf16 转置镜像 [v][t]（行距 bts；
-// elementwise 写、② mma 读）、C 片段落地 scratch [v][j] f32（store_c 只会
-// f32——pack 到 s16/snap/pool 由全块协作完成）、恒等 B（col 视图 b[n*16+k]=δ，
-// 供 S₀→C 片段初值 mma 精确恢复）。DnA16：wmma 片段载入基址须 ≥16B，
-// [u16]/[f32] 自然对齐不够（V5_KS 走的是 PTX 级 .align 提升，这里用类型级）
-#[repr(align(16))]
-struct DnA16<T>(T);
-#[link_section = ".shared"]
-// 行距 80 u16（160B ≡ +8 bank/行，同上防片段读 8-way）——与 bts 解耦定长；
-// pad 列 [bts,80) 片段读永远不触（k 步 ≤ ceil(bts/16)·16），零填免管。
-static mut DN_H2_BH: DnA16<[u16; 16 * 80]> = DnA16([0; 16 * 80]);
-#[link_section = ".shared"]
-static mut DN_H2_BL: DnA16<[u16; 16 * 80]> = DnA16([0; 16 * 80]);
-#[link_section = ".shared"]
-// 行距 136 f32（544B ≡ +8 bank/行）：store_c 的 2×f32/lane 写在 512B 行距
-// （≡bank0）下全撞。pack 读按 (v,j) 直读行内连续 16B 无冲突。
-static mut DN_H2_C: DnA16<[f32; 16 * 136]> = DnA16([0.0; 16 * 136]);
-#[link_section = ".shared"]
-static mut DN_H2_I: DnA16<[u16; 16 * 16]> = DnA16([0; 16 * 16]);
+/// dn_chunk_h 的动态 smem 池（extern 动态段——build.rs 改写声明，宿主
+/// launch_smem 供 69632/8704B + MAX_DYNAMIC 属性）。互斥分支分账：
+///   · ① w hi/lo 跨 chunk 双缓冲（dblb = wst ∧ bdim≥256，即 sp≤4 生产档
+///     ——255 regs 本就 1 块/SM）：2 槽 × [64 行][34 u64] × hi/lo。行距
+///     34 u64=272B（≡+4 bank/行——wmma load_a 的 16B/lane 片段读 8 行相位
+///     恰铺满 32 bank 无冲突；272≡16 mod 128 行首恒 16B 对齐供 cp.async）。
+///     ① 的 A 片段原从 global 直载（行距 8KB 散射、全暴露 HBM 延迟）——
+///     staging 是位拷贝，mma 输入位样逐位同。bdim=128（sp=8）不 staging：
+///     sm_89 每块 smem ≥63232B（单槽）即破 100KB/SM 的 2 块/SM 门槛（实测
+///     双槽 2383/单槽 2300 vs 基线 1483，两波串行反慢）——① 保持 global
+///     直载 + 循环顶 prefetch.global.L2 预热 chunk i+1（零 smem）。
+/// 满配静态 22784+动态 69632=92416 ≤ 99KB sm_89 每块上限。
+/// （2026-11：t-并行 wmma 备胎 tpar 已删——实测与串行路平价，且它的 C 片段
+/// 槽落本段头时，ptxas 13.4 会把该写提升到 tpar=0 路径执行 ⇒ sp=8 档（本段
+/// 供给 0B）700 illegal memory access。见 o35 事故记录。）
+#[link_section = ".shared-dyn"]
+static mut DN_H2_W: [u64; 4] = [0; 4];
 
 #[inline(always)]
 unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
@@ -5907,6 +5953,55 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
     let vrows = d.vrows;
     let nvq = vrows >> 2; // v 四元组数（vrows ≥ 16 ⇒ ≥ 4）
     let bdim = _block_dim_x() as usize;
+    // ── 档门（纯算术，提前算）：staged = 生产专路；wst = ① 的 w hi/lo
+    //    smem 双缓冲档（bts≤64 × kd=128——kd 定行宽 16×16B 块、bts 定槽深
+    //    64 行）──
+    let staged = VW == 4 && bts <= 64 && vrows == 16 && bdim == 128;
+    let wst = kd == 128 && bts <= 64;
+    // w 双槽档：仅 bdim≥256（8 warp、255 regs 本就 1 块/SM——98048B 不掉
+    // 占用）。bdim=128（sp=8 生产几何）基线靠 2 块/SM 藏串行链延迟：sm_89
+    // 每块 smem ≥63232B（单槽）即破 100KB/SM 的 2 块门槛（双槽 69632B 实测
+    // 2383、单槽 2300，均两波串行反慢 55%）→ 该档不 staging，① 保持
+    // global 直载 + 循环顶 L2 预热 chunk i+1（纯提示零 smem，2 块/SM 不动）
+    let dblb = wst && bdim >= 256;
+    // ① w 预载宏：chunk $c 的 hi/lo 全块 cp.async → 槽 $s（纯位拷贝——
+    // mma 输入位样与 global 直载逐位同；读集 = 旧 ① 的 t-tile 覆盖行集，
+    // 越尾行（t≥n）内容无害：elementwise t<n 掩掉。bt 恒 16 倍数，
+    // r16=bts 时读集与旧路逐字节同）。hi/lo 两段顺序发射、源基合一
+    // （lo = hi + 镜像间距——压寄存器驻留）；块序 q 连续 → 16 线程铺一
+    // 行 256B，相位内 bank 无冲突。
+    macro_rules! dn_hwstage {
+        ($c:expr, $s:expr) => {{
+            let wk2 = vh * kd * 2; // 源字节行距
+            let src = d.w.add((t0row + ($c) * bts) * (wk2 >> 1) + h * kd) as *const u8;
+            // lo 镜像源 = hi 源 + 两 u16 指针址差（即字节差——d.w16_lo 与
+            // d.w 同为 *const u16，w_lo_off/w_hi_off 元素差已 ×2 进址差）
+            let lo_off = (d.w16_lo as usize).wrapping_sub(d.w as usize);
+            let bph = ((bts + 15) & !15usize) * 16; // 每 half 的 16B 块数
+            let dst = DN_H2_W.as_mut_ptr().add(($s) * 4352) as *mut u8;
+            let mut q = t;
+            while q < bph {
+                cp_async_cg16(
+                    dst.add((q >> 4) * 272 + (q & 15) * 16),
+                    src.add((q >> 4) * wk2 + (q & 15) * 16),
+                );
+                q += bdim;
+            }
+            let mut q = t;
+            while q < bph {
+                cp_async_cg16(
+                    dst.add(17408 + (q >> 4) * 272 + (q & 15) * 16),
+                    src.add(lo_off + (q >> 4) * wk2 + (q & 15) * 16),
+                );
+                q += bdim;
+            }
+        }};
+    }
+    if dblb {
+        // chunk 0 先行入槽 0（下方 S₀ 载入段放飞；屏障前 wait 收口）
+        dn_hwstage!(0, 0);
+        cp_async_commit(core::ptr::null_mut());
+    }
     // ── S₀ → 寄存器 + s_mat(bf16) + chunk0 快照（一趟；vrows<VW·8 时尾部 warp 空转）──
     let mut acc = [[0f32; 4]; VW];
     if vb0 < vrows {
@@ -5918,36 +6013,14 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             *(d.snap0.add(e) as *mut u64) = dn_pack4(v);
         }
     }
-    // ── tpar 门（= staged 生产几何 + host 门）与 C 片段初值 ──
-    let staged = VW == 4 && bts <= 64 && vrows == 16 && bdim == 128;
-    let tpar = d.tpar && staged && kd == 128;
-    if tpar {
-        // 恒等 B（col 视图 b[n*16+k]=δ；i=17n ⇔ k=n）——须在下方屏障前
-        // 就绪（跨线程读）
-        let ip = DN_H2_I.0.as_mut_ptr();
-        let mut ii = t;
-        while ii < 256 {
-            *ip.add(ii) = if ii % 17 == 0 { 0x3F80 } else { 0 };
-            ii += bdim;
-        }
+    if dblb {
+        // chunk 0 的 w 预载收口（发于 S₀ 载入前，飞行窗口 = S₀ 全程）；
+        // wait_group 0 清本线程组 + 下方屏障对全块担保 smem 可见
+        cp_async_wait_all(core::ptr::null_mut());
     }
-    _syncthreads(); // s_mat 全片就绪（① 任务跨 warp 读）
+    _syncthreads(); // s_mat 全片就绪（① 任务跨 warp 读）+ w 槽 0 可见（dblb）
     let mut c0 = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
     let mut c1 = c0;
-    if tpar {
-        // C 初值 = S₀：恒等 B 的 mma（1.0·x 与 +0 均精确——bf16 源无损，
-        // 与 serial 路 decode(pool0) 逐位同源）。每 warp 拥 2 个 j-tile。
-        let (i0, i1, i2, i3) = wmma_load_b(DN_H2_I.0.as_ptr() as *const u32, 16);
-        let j0 = warp * 32;
-        let af = wmma_load_a(d.s16.add(j0) as *const u32, kd as i32);
-        c0 = wmma_mma(
-            af.0, af.1, af.2, af.3, i0, i1, i2, i3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        );
-        let af = wmma_load_a(d.s16.add(j0 + 16) as *const u32, kd as i32);
-        c1 = wmma_mma(
-            af.0, af.1, af.2, af.3, i0, i1, i2, i3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        );
-    }
     let mut ci = 0usize;
     while ci < d.nch {
         let t0 = t0row + ci * bts;
@@ -5965,15 +6038,12 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             gt += bdim;
         }
         // staged ②：k̂ 协作预载 smem（先发射载入，与下方 ① mma 并发飞行；
-        // 可见性由 ① 后的既有屏障担保）。tpar 档整块预载并清 t≥n——ragged
         // 尾片 B 片段读到的越界行恒 0（0×NaN=NaN 的状态毒化与越读值双双
-        // 关死；① 的越读行被 elementwise t<n 掩掉、无此需求）。g 预载仅
-        // serial 路用（tpar 在 elementwise 里乘 gsc 折入 A 镜像）。
         if staged {
             let kg = d.k.add(t0 * kh_n * kd + kh * kd) as *const u64;
             let krow8 = (kh_n * kd) / 4; // u64 行距（u16 元素行 ×2B ÷8B）
             let ks = DN_H2_K.as_mut_ptr();
-            let lim = if tpar { bts * 32 } else { n * 32 };
+            let lim = n * 32;
             let mut i = t;
             while i < lim {
                 let tr = i >> 5;
@@ -5981,25 +6051,31 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                 *ks.add(tr * 36 + (i & 31)) = src;
                 i += bdim;
             }
-            if !tpar && t < n {
+            if t < n {
                 *DN_H2_G.as_mut_ptr().add(t) = *d.gsc.add(t);
             }
         }
-        if tpar {
-            // A 镜像清 t≥n（elementwise 只写 t<n，上一 chunk 残留会当真值
-            // 乘进状态）。零区在 ① 屏障前写、elementwise（屏障后）只碰
-            // t<n——无竞。
-            let bs = DN_H2_BH.0.as_mut_ptr();
-            let bl = DN_H2_BL.0.as_mut_ptr();
-            let mut e = t;
-            while e < 16 * bts {
-                let tr = e % bts;
-                if tr >= n {
-                    let vv = e / bts;
-                    *bs.add(vv * 80 + tr) = 0;
-                    *bl.add(vv * 80 + tr) = 0;
-                }
-                e += bdim;
+        if dblb && ci + 1 < d.nch {
+            // chunk i+1 的 w hi/lo 预载入对槽（发于 ① 前——①+elementwise+③
+            // 全程飞行；槽 (i+1)&1=(i-1)&1 自 ①(i-1) 后已死，无竞）。环尾
+            // wait+屏障收口，供 ①(i+1) 直读
+            dn_hwstage!(ci + 1, (ci + 1) & 1);
+            cp_async_commit(core::ptr::null_mut());
+        } else if wst && ci + 1 < d.nch {
+            // 单槽不 staging 档（bdim=128/sp=8——见 dblb 注）：chunk i+1 的
+            // w hi/lo 发 L2 预热（纯提示零 smem，① 全程飞行）——① 的 global
+            // 散射载转 L2 命中，2 块/SM 占用不动。线分派：每行 4 线
+            // （hi/lo × 128B），t&2 选 half、t&1 选线内 128B
+            let wk2 = vh * kd * 2;
+            let src = d.w.add((t0row + (ci + 1) * bts) * (wk2 >> 1) + h * kd) as *const u8;
+            let lo_off = (d.w16_lo as usize).wrapping_sub(d.w as usize);
+            // base 已折 t&2（half）与 t&1（线内 128B）——循环仅 r*wk2 步进
+            let base = if (t & 2) != 0 { src.add(lo_off) } else { src };
+            let (off, step) = ((t & 1) * 128, bdim >> 2);
+            let mut r = t >> 2;
+            while r < bts {
+                dn_l2pf(base.add(r * wk2 + off));
+                r += step;
             }
         }
         // ── ① δ″ = invk·(ū − w·S₀ᵀ)：wmma bf16（tensor core，与 attention v5
@@ -6013,16 +6089,66 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
         let ttiles = bts >> 4;
         let ntiles = vrows >> 4;
         let warps = bdim >> 5;
-        {
+        // wst：dblb 档 A 片段源换双缓冲槽（hi @ 槽首 / lo @ +64·34 u64；
+        // 行距 34 u64=136 元素）。staging 是位拷贝 ⇒ mma 输入位样逐位同。
+        // 两路各自整形（免跨路寄存器合流抬峰值）；块统一门，走哪路全块
+        // 一致；dblb=0（sp=8）① 保持 global 直载（2 块/SM 优先）
+        if dblb {
+            // 槽 u16 视图：hi @ 槽首、lo @ +64·34 u64（=8704 u16 元素）
+            let sb = DN_H2_W.as_ptr().add((ci & 1) * 4352) as *const u16;
+            let sbl = sb.add(64 * 34 * 4);
+            let mut ti = warp;
+            while ti < ttiles * ntiles {
+                let tq = udiv(ti, ntiles);
+                let nq = ti - tq * ntiles;
+                let mut c = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+                let wbase = sb.add(tq * 16 * 136);
+                let wlbase = sbl.add(tq * 16 * 136);
+                let sbase = d.s16.add(nq * 16 * kd);
+                let mut k4 = 0usize;
+                while k4 < kd {
+                    let bf = wmma_load_b(sbase.add(k4) as *const u32, kd as i32);
+                    // hi → mma → lo → mma：af 顺序复用（寄存器峰值不抬），
+                    // b 片段只载一次
+                    let af = wmma_load_a(wbase.add(k4) as *const u32, 136);
+                    c = wmma_mma(
+                        af.0, af.1, af.2, af.3, bf.0, bf.1, bf.2, bf.3, c.0, c.1, c.2, c.3, c.4,
+                        c.5, c.6, c.7,
+                    );
+                    let af = wmma_load_a(wlbase.add(k4) as *const u32, 136);
+                    c = wmma_mma(
+                        af.0, af.1, af.2, af.3, bf.0, bf.1, bf.2, bf.3, c.0, c.1, c.2, c.3, c.4,
+                        c.5, c.6, c.7,
+                    );
+                    k4 += 16;
+                }
+                wmma_store_c(
+                    d.xsc.add(tq * 16 * vrows + nq * 16),
+                    c.0,
+                    c.1,
+                    c.2,
+                    c.3,
+                    c.4,
+                    c.5,
+                    c.6,
+                    c.7,
+                    vrows as i32,
+                );
+                ti += warps;
+            }
+        } else {
             let w16 = d.w as *const u16;
             let wk = vh * kd; // bf16 元素行距
+            // lo 基 = hi 基 + 镜像元素距（w16_lo−w 的 u16 元素差——省一路
+            // IMAD.WIDE 整形，压寄存器）
+            let lo_e = ((d.w16_lo as usize).wrapping_sub(d.w as usize)) >> 1;
             let mut ti = warp;
             while ti < ttiles * ntiles {
                 let tq = udiv(ti, ntiles);
                 let nq = ti - tq * ntiles;
                 let mut c = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
                 let wbase = w16.add((t0 + tq * 16) * wk + h * kd);
-                let wlbase = d.w16_lo.add((t0 + tq * 16) * wk + h * kd);
+                let wlbase = wbase.add(lo_e);
                 let sbase = d.s16.add(nq * 16 * kd);
                 let mut k4 = 0usize;
                 while k4 < kd {
@@ -6068,15 +6194,7 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                     let m = *d.inv.add((t0 + tr) * kh_n * 2 + kh * 2 + 1);
                     let val = m * (*p - *d.xsc.add(e));
                     *p = val;
-                    if tpar {
-                        // A 镜像 [v][t] hi/lo：g 折此（serial 路在 ② 里乘）。
-                        // lo 残差 ε²≈7.6e-6——o35 容差预算内
-                        let bg = val * *d.gsc.add(tr);
-                        let hi = f32_to_bf16(bg);
-                        *DN_H2_BH.0.as_mut_ptr().add(vv * 80 + tr) = hi;
-                        let lo = f32_to_bf16(bg - f32::from_bits((hi as u32) << 16));
-                        *DN_H2_BL.0.as_mut_ptr().add(vv * 80 + tr) = lo;
-                    } else if staged {
+                    if staged {
                         *dsp.add(tr * 16 + vv) = val; // ② smem 顺路落（行组=vv>>2=warp）
                     }
                 }
@@ -6084,75 +6202,9 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             }
         }
         _syncthreads();
-        // ── ② 衰减 + 秩 n 更新 + 快照：warp-per-row（tpar = 整 chunk GEMM）──
+        // ── ② 衰减 + 秩 n 更新 + 快照：warp-per-row ──
         let dlast = expf(0.0 - clast);
-        if tpar {
-            // S ← dlast·S + k̂ᵀ@(g·δ″)：m=v, n=j, k=t 的 m16n16k16。C 片段
-            // 驻寄存器跨 chunk；dlast 全片段统一标量（布局不透明亦可精确乘）。
-            // k-step 满片 ceil(n/16)——尾片靠 A 镜像 t≥n 清零 + K staging 同
-            // 清（B 侧零行）双双归零，ragged 恒安全。
-            c0 = (
-                c0.0 * dlast, c0.1 * dlast, c0.2 * dlast, c0.3 * dlast, c0.4 * dlast, c0.5 * dlast,
-                c0.6 * dlast, c0.7 * dlast,
-            );
-            c1 = (
-                c1.0 * dlast, c1.1 * dlast, c1.2 * dlast, c1.3 * dlast, c1.4 * dlast, c1.5 * dlast,
-                c1.6 * dlast, c1.7 * dlast,
-            );
-            let ksu = DN_H2_K.as_ptr() as *const u16; // [bts][144] u16 视图
-            let j0 = warp * 32;
-            let ksn = (n + 15) >> 4;
-            let mut ks = 0usize;
-            while ks < ksn {
-                let ah = wmma_load_a(DN_H2_BH.0.as_ptr().add(ks * 16) as *const u32, 80);
-                let al = wmma_load_a(DN_H2_BL.0.as_ptr().add(ks * 16) as *const u32, 80);
-                let b0 = wmma_load_b_row(ksu.add(ks * 16 * 144 + j0) as *const u32, 144);
-                c0 = wmma_mma(
-                    ah.0, ah.1, ah.2, ah.3, b0.0, b0.1, b0.2, b0.3, c0.0, c0.1, c0.2, c0.3, c0.4,
-                    c0.5, c0.6, c0.7,
-                );
-                c0 = wmma_mma(
-                    al.0, al.1, al.2, al.3, b0.0, b0.1, b0.2, b0.3, c0.0, c0.1, c0.2, c0.3, c0.4,
-                    c0.5, c0.6, c0.7,
-                );
-                let b1 = wmma_load_b_row(ksu.add(ks * 16 * 144 + j0 + 16) as *const u32, 144);
-                c1 = wmma_mma(
-                    ah.0, ah.1, ah.2, ah.3, b1.0, b1.1, b1.2, b1.3, c1.0, c1.1, c1.2, c1.3, c1.4,
-                    c1.5, c1.6, c1.7,
-                );
-                c1 = wmma_mma(
-                    al.0, al.1, al.2, al.3, b1.0, b1.1, b1.2, b1.3, c1.0, c1.1, c1.2, c1.3, c1.4,
-                    c1.5, c1.6, c1.7,
-                );
-                ks += 1;
-            }
-            // 落地：store_c（只出 f32）→ 屏障 → 全块 pack bf16 到 s16 +
-            // snap（ci+1<nch）/ pool0（末 chunk——与 serial 语义同：末态=末 s16）
-            wmma_store_c(
-                DN_H2_C.0.as_mut_ptr().add(j0),
-                c0.0, c0.1, c0.2, c0.3, c0.4, c0.5, c0.6, c0.7, 136,
-            );
-            wmma_store_c(
-                DN_H2_C.0.as_mut_ptr().add(j0 + 16),
-                c1.0, c1.1, c1.2, c1.3, c1.4, c1.5, c1.6, c1.7, 136,
-            );
-            _syncthreads();
-            let csp = DN_H2_C.0.as_ptr();
-            let last = ci + 1 == d.nch;
-            let mut e4 = t;
-            while e4 < vrows * kd / 4 {
-                // kd=128 ⇒ 每行 32 个 u64 槽：v=e4>>5、行内 f32 偏 (e4&31)*4
-                let q = csp.add((e4 >> 5) * 136 + (e4 & 31) * 4);
-                let pk = dn_pack4([*q, *q.add(1), *q.add(2), *q.add(3)]);
-                *(d.s16.add(e4 * 4) as *mut u64) = pk;
-                if last {
-                    *(d.pool0.add(e4 * 4) as *mut u64) = pk;
-                } else {
-                    *(d.snap0.add((ci + 1) * vh * vd * kd + e4 * 4) as *mut u64) = pk;
-                }
-                e4 += bdim;
-            }
-        } else if staged {
+        if staged {
             // 生产专路：acc 4×4（warp 拥行 4w..4w+4 = δ″ 行组 w），k̂/δ″/g 全
             // smem，2 深轮转（smem ~30cy < 2×每拍发射 ~48cy——盖住）。数值与
             // 旧路逐位同：k̂ u64 位样搬运、δ″/g f32 原值、fma 序不变。
@@ -6316,11 +6368,16 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                 }
             }
         }
+        if dblb {
+            // ① 头发射的 chunk i+1 w 预载于此收口（本线程组清空——飞行窗口
+            // = ①+elementwise+③），随后屏障对全块担保 smem 可见，①(i+1) 直读
+            cp_async_wait_all(core::ptr::null_mut());
+        }
         _syncthreads();
         ci += 1;
     }
-    // 末态回池（bf16；tpar 已在末 chunk pack 里写）
-    if !tpar && vb0 < vrows {
+    // 末态回池（bf16）
+    if vb0 < vrows {
         for r in 0..VW {
             let e = (vb0 + r) * kd + j4;
             *(d.pool0.add(e) as *mut u64) = dn_pack4(acc[r]);
@@ -6356,7 +6413,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_h(
     // s_mat bf16（前半槽的字节）+ g[bt] + x[bt,vrows]
     w_hi_off: u32, // w hi 图像元素基址（prep 尾打包产物；① 第一条 mma 源）
     w_lo_off: u32, // w lo 残差镜像元素基址（① 第二条 mma 源）
-    tpar: u32,     // ② t-并行 wmma 档（非 0 且 staged 生产几何才生效）
 ) {
     let (kd, vd) = (k_dim as usize, v_dim as usize);
     let (kh_n, vh) = (k_heads as usize, v_heads as usize);
@@ -6408,7 +6464,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_h(
         cnt,
         nch,
         t,
-        tpar: tpar != 0,
     };
     // VW 派发按 warp 数覆盖行数（bdim=64：2 warp × VW8=16 行恰满 vs=8 片；
     // 128/256 时与旧阈值等价）。VW ≥4 保 ② 的 F4 v 列 16B 对齐
@@ -6424,6 +6479,22 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_h(
         dn_h_run3::<32>(&d);
     }
 }
+
+/// dn_chunk_o ①→③ Mᵀ smem 直递（免 32KB 全局写+读往返/CTA）：
+/// [vph≤2][bt≤64] 行距 33 u64=264B≡+2 word/行（s 相邻行错 2 bank，
+/// 33 为奇 ⇒ ① 写 tr0>>1 u64 对内偏移仍 8B 对齐）。f32 位样原样（与全局
+/// mscratch 路逐位同）；bt>64 / vph>2 走旧全局路。
+#[link_section = ".shared"]
+static mut DN_O_M: [u64; 2 * 64 * 33] = [0; 2 * 64 * 33];
+
+/// dn_chunk_o ② 的 S₀ 动态 smem staging（extern 动态段——build.rs 把
+/// 声明改写为 `.extern .shared .align 16 .b8 DN_O_DYN[]`，宿主以
+/// launch_smem(67584B) + MAX_DYNAMIC_SHARED 属性供给；S₀ 全行
+/// [128][34] u64=34816B（行距 34 u64=272B，行首 16B 对齐供 cp.async，
+/// 272≡16 mod 128 免整周期；16B 块序 ^(row>>3&7) 搅动——warp 16 行散读
+/// ≤2-way 冲突），δ [64][64] u64=32768B 紧随（+4352 u64）
+#[link_section = ".shared-dyn"]
+static mut DN_O_DYN: [u64; 4] = [0; 4];
 
 /// 输出组装（chunk_fwd_o 同构）：一块 = (全局块, v 头)，全并行——
 /// ① Mᵀ 转置物化（mscratch = w 缓冲别名；列主线程：8 车道 t 共享 k_s 行；
@@ -6463,6 +6534,7 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
     let gc = udiv(bid, kh_n);
     let kk = urem(bid, kh_n); // 本块 k 头：① 的 q·k Gram 按 k 头算一份共用
     let vph = udiv(vh, kh_n); // 每份 Gram 服务的 v 头数（host 断言整除）
+    let mfast = bts <= 64 && vph <= 2; // Mᵀ 落 smem DN_O_M（否则全局 mscratch）
     let mut r = 0usize;
     while r + 1 < n_rows as usize && gc >= *snap_off.add(r + 1) as usize {
         r += 1;
@@ -6476,11 +6548,201 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
     let t = _thread_idx_x() as usize;
     let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32);
     let qrow = |g: usize, j: usize| (g * kh_n + kh) * kd + j;
-    // ── ① Mᵀ：任务 = (t 八元 × s 八元) 8×8 寄存器瓦片（同 A 形）——每 j4 步
-    //    k_s 行 8×u64 + q 行 8×u64 → 256 fma/16 载；存转置 Mᵀ[s][t]（行连续），
-    //    s ≤ t 含对角（对角 e^0 由析出式自然给出），M[t][s] =
+    let ofast = mfast && bts == 64 && vd == 128;
+    // S₀ 全行 stage 宏（2048×16B/256 线程=8 块）：128 行 × 16 块，行距
+    // 34 u64=272B（行首 16B 对齐供 cp.async，272≡16 mod 128 免整周期），
+    // 16B 块序 ^(row>>3&7) 搅动——warp 16 行散读 ≤2-way 冲突
+    macro_rules! dn_ostage {
+        ($vb:expr, $buf:expr) => {{
+            let s0 = snap.add(($vb) * vd * kd);
+            let mut g = t;
+            while g < 2048 {
+                let row = g >> 4;
+                let kb = g & 15;
+                let kw = kb ^ ((row >> 3) & 7);
+                cp_async_cg16(
+                    $buf.add(row * 34 + kw * 2) as *mut u8,
+                    s0.add(row * kd + kb * 8) as *const u8,
+                );
+                g += 256;
+            }
+        }};
+    }
+    // δ stage 宏（2048×16B/256 线程=8 块）：64 行（s<n 守卫——尾块行不触
+    // 越界 token）× 32 块，f32 行距 64 u64=512B
+    macro_rules! dn_dstage {
+        ($h:expr, $buf:expr) => {{
+            let d0 = dn.add(($h) * vd);
+            let mut g = t;
+            while g < 2048 {
+                let row = g >> 5;
+                if row < n {
+                    let blk = g & 31;
+                    cp_async_cg16(
+                        $buf.add(row * 64 + blk * 2) as *mut u8,
+                        d0.add((t0 + row) * vh * vd + blk * 4) as *const u8,
+                    );
+                }
+                g += 256;
+            }
+        }};
+    }
+    let dsp = DN_O_DYN.as_mut_ptr();
+    if ofast {
+        // S₀(hv0)+δ(hv0) 预取于 ① 前——传输藏于 Gram 计算（管线见快路注释）
+        dn_ostage!(gc * vh + kk * vph, dsp);
+        dn_dstage!(kk * vph, dsp.add(4352));
+        cp_async_commit(core::ptr::null_mut());
+    }
+    if mfast {
+        // Mᵀ smem 清零：③ 读块内 s>t 对与 t≥n 尾列——4×4 瓦片不全覆盖
+        // 这些格（旧 8×8 全 8 列含零落盘故无此依赖），smem 跨 CTA 残留
+        // 须自清（17 u64/线程；屏障防清零与 ① 落盘竞态）
+        let mz = DN_O_M.as_mut_ptr();
+        let mut zi = t;
+        while zi < 4224 {
+            *mz.add(zi) = 0u64;
+            zi += 256;
+        }
+        _syncthreads();
+    }
+    // ── ① Mᵀ：任务 = (t × s) 方形寄存器瓦片——每 j4 步 k_s 行 + q 行
+    //    u64 载 → 256 fma/载；存转置 Mᵀ[s][t]（行连续），s ≤ t 含对角
+    //    （对角 e^0 由析出式自然给出），M[t][s] =
     //    (invq_t·eneg_t)·(invk_s·epos_s·E)·(q_t·k_s)；兜底档逐对 expf ──
-    if true {
+    if mfast {
+        // 快路 4×4：ntg4=⌈n/4⌉，bt=64 全块恰 256 任务=线程数（活跃
+        // ~136/256；旧 8×8 仅 64 任务/36 活跃——Gram 饥饿主因）。每
+        // (t,s) 对仍单线程 j4 升序 fma 链——与旧路逐位同，无归约序
+        // 变化。Mᵀ[sr][tr0..+4] 2×u64/行（tr0=4·i 偶 ⇒ u64 对齐 ✓）。
+        let ntg = udiv(n + 3, 4);
+        let ntasks = ntg * ntg;
+        let mut e = t;
+        while e < ntasks {
+            let tr0 = udiv(e, ntg) * 4;
+            let sr0 = urem(e, ntg) * 4;
+            if tr0 + 3 >= sr0 {
+                let (mut a0, mut a1) = ([0f32; 4], [0f32; 4]);
+                let (mut a2, mut a3) = ([0f32; 4], [0f32; 4]);
+                let mut qt = [0u64; 4];
+                let mut ks = [0u64; 4];
+                let mut qt2 = [0u64; 4];
+                let mut ks2 = [0u64; 4];
+                // t 行宏：qt[r] 解 4 bf16 × ks[c]（4 元小循环可展开）4 fma
+                macro_rules! dn_mrow4 {
+                    ($acc:ident, $r:expr) => {{
+                        let (qlo, qhi) = (qt[$r] as u32, (qt[$r] >> 32) as u32);
+                        let qa = f32::from_bits(qlo << 16);
+                        let qb = f32::from_bits(qlo & 0xffff_0000);
+                        let qc = f32::from_bits(qhi << 16);
+                        let qd = f32::from_bits(qhi & 0xffff_0000);
+                        for c in 0..4 {
+                            let (slo, shi) = (ks[c] as u32, (ks[c] >> 32) as u32);
+                            $acc[c] = fma(qa, f32::from_bits(slo << 16), $acc[c]);
+                            $acc[c] = fma(qb, f32::from_bits(slo & 0xffff_0000), $acc[c]);
+                            $acc[c] = fma(qc, f32::from_bits(shi << 16), $acc[c]);
+                            $acc[c] = fma(qd, f32::from_bits(shi & 0xffff_0000), $acc[c]);
+                        }
+                    }};
+                }
+                // 双缓冲：j4+1 行载入提前发射，藏 L1 延迟于本步 64 fma
+                //（fma 序不变——载入时点而已）
+                for r in 0..4 {
+                    if tr0 + r < n {
+                        qt[r] = *(q.add(qrow(t0 + tr0 + r, 0)) as *const u64);
+                    }
+                }
+                for c in 0..4 {
+                    if sr0 + c < n {
+                        ks[c] = *(k.add(qrow(t0 + sr0 + c, 0)) as *const u64);
+                    }
+                }
+                let mut j4 = 0usize;
+                while j4 < 32 {
+                    if j4 + 1 < 32 {
+                        let jn = (j4 + 1) * 4;
+                        for r in 0..4 {
+                            if tr0 + r < n {
+                                qt2[r] = *(q.add(qrow(t0 + tr0 + r, jn)) as *const u64);
+                            }
+                        }
+                        for c in 0..4 {
+                            if sr0 + c < n {
+                                ks2[c] = *(k.add(qrow(t0 + sr0 + c, jn)) as *const u64);
+                            }
+                        }
+                    }
+                    dn_mrow4!(a0, 0);
+                    dn_mrow4!(a1, 1);
+                    dn_mrow4!(a2, 2);
+                    dn_mrow4!(a3, 3);
+                    qt = qt2;
+                    ks = ks2;
+                    j4 += 1;
+                }
+                // 列落位：缩放两式与慢路同文（fastf/兜底）；
+                // M[t][s] = invq_t·(q_t·k_s)·e^{C_s−C_t}（h 落 δ″=invk_s·δ_s
+                // 配对）：指数 ≤ 0 恒安全——**不可**拆 e^{C_last−C_t}·e^{C_s−C_last}
+                // （大 X 头两侧同时欠流 → 0·0，o35 head1-3 全零根因）；fastf 档
+                // (C_last≤60) neg_t·pos_s·E 与 prep 的 A 同式，兜底逐对 expf
+                // （宏体自由标识符按定义点解析 ⇒ 定义须在 hv 循环内）
+                let mut hv = 0usize;
+                while hv < vph {
+                    let h = kk * vph + hv;
+                    let vb = gc * vh + h;
+                    let sc = scratch.add(vb * (5 * bts));
+                    let neg = sc.add(3 * bts);
+                    let pos = sc.add(4 * bts);
+                    let clast = *gcum.add((t0 + n - 1) * vh + h);
+                    let fastf = clast <= 60.0f32;
+                    let bige = if fastf { expf(clast) } else { 1.0f32 };
+                    macro_rules! dn_mstc4 {
+                        ($c:expr) => {{
+                            let sr = sr0 + $c;
+                            if sr < n {
+                                macro_rules! mv2 {
+                                    ($ar:ident, $tr:expr) => {
+                                        if $tr < n && $tr >= sr {
+                                            if fastf {
+                                                *inv.add((t0 + $tr) * kh_n * 2 + kh * 2)
+                                                    * *neg.add($tr)
+                                                    * *pos.add(sr)
+                                                    * bige
+                                                    * $ar[$c]
+                                            } else {
+                                                *inv.add((t0 + $tr) * kh_n * 2 + kh * 2)
+                                                    * $ar[$c]
+                                                    * expf(
+                                                        *gcum.add((t0 + sr) * vh + h)
+                                                            - *gcum.add((t0 + $tr) * vh + h),
+                                                    )
+                                            }
+                                        } else {
+                                            0.0f32
+                                        }
+                                    };
+                                }
+                                let p0 = DN_O_M
+                                    .as_mut_ptr()
+                                    .add(hv * 2112 + sr * 33 + (tr0 >> 1));
+                                *p0 = (mv2!(a0, tr0).to_bits() as u64)
+                                    | ((mv2!(a1, tr0 + 1).to_bits() as u64) << 32);
+                                *(p0.add(1)) = (mv2!(a2, tr0 + 2).to_bits() as u64)
+                                    | ((mv2!(a3, tr0 + 3).to_bits() as u64) << 32);
+                            }
+                        }};
+                    }
+                    dn_mstc4!(0);
+                    dn_mstc4!(1);
+                    dn_mstc4!(2);
+                    dn_mstc4!(3);
+                    hv += 1;
+                }
+            }
+            e += 256;
+        }
+    } else {
+        // 慢路（bt>64 / vph>2）8×8 旧几何，Mᵀ 落全局 mscratch 不变
         let ntg = udiv(n + 7, 8);
         let ntasks = ntg * ntg;
         let mut e = t;
@@ -6547,7 +6809,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                     let sc = scratch.add(vb * (5 * bts));
                     let neg = sc.add(3 * bts);
                     let pos = sc.add(4 * bts);
-                    let mbase = mscratch.add(vb * bts * bts);
                     let clast = *gcum.add((t0 + n - 1) * vh + h);
                     let fastf = clast <= 60.0f32;
                     let bige = if fastf { expf(clast) } else { 1.0f32 };
@@ -6577,7 +6838,10 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                                         }
                                     };
                                 }
-                                let p0 = mbase.add(sr * bts + tr0) as *mut u64;
+                                // Mᵀ[sr][tr0..+8]：全局 w 别名（行距 bts/2
+                                // u64——tr0 偶 ⇒ 同址 f32 对齐）
+                                let p0 =
+                                    (mscratch.add(vb * bts * bts + sr * bts + tr0)) as *mut u64;
                                 *p0 = (mv2!(a0, tr0).to_bits() as u64)
                                     | ((mv2!(a1, tr0 + 1).to_bits() as u64) << 32);
                                 *(p0.add(1)) = (mv2!(a2, tr0 + 2).to_bits() as u64)
@@ -6604,15 +6868,234 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
         }
     }
     _syncthreads();
-    // ── ②+③ 任务 = (t 八元 tg × v 八元 vg) 寄存器瓦片（跨步 256 领）：
-    //    ② base = Σ_j S₀[v][j]·q̂_t[j]（S₀ bf16 8 行 + q bf16 8 行，
-    //    16×u64/256 fma）；③ o += Σ_{s≤t} M[t][s]·δ[s][v]（Mᵀ 8-t 2×u64 +
-    //    δ 8-v 4×u64 → 4 载/64 fma）；行缩放 rs = e^{−C_t}·invq_t 尾乘，
-    //    /√kd 收 bf16 ──
-    if true {
-        // t 八元 × v 四元：bt=64 下任务 = 8·32 = 256 = 线程数（8×8 只有 128，
-        // 半线程空转——③ 的 s 链载入延迟无 warp 可藏）。v 轴切（而非 t 轴）：
-        // δ/M 每 s 步载入字节数不变，总流量不涨
+    // ── ②+③ 任务 = (t 八元 tg × v 瓦 vg) 寄存器瓦片（跨步 256 领）：
+    //    ② base = Σ_j S₀[v][j]·q̂_t[j]；③ o += Σ_{s≤t} M[t][s]·δ[s][v]；
+    //    行缩放 rs = e^{−C_t}·invq_t 尾乘，/√kd 收 bf16。S₀ 片解码提出
+    //    行宏（旧路每 (r,c) 对重解——解码 ALU 与 fma 同量级）──
+    if ofast {
+        // 快路（生产几何）：Mᵀ ③ 读 smem；② 的 S₀ 全行与 ③ 的 δ 经
+        // cp.async 进动态 smem（S₀ [128][34] u64、δ [64][64] u64——③ 的
+        // δ 每 (CTA,hv) 被各 t-group 重读 ~8×，全局路 L1 被 99KB smem 挤掉
+        // 后全数落 L2 延迟是 ③ 主墙）。管线零暴露：(hv0 两相) 于 ① 前
+        // 发射藏于 Gram；hv≥1 环头 wait_group 1 等 S₀(hv) 开 ②、δ(hv)
+        // 留飞藏于 ②；② 排空后 S₀(hv+1) 入槽藏于 ③，③ 前 wait_group 1
+        // 等 δ、S₀(hv+1) 留飞藏于 ③+落盘。任务 = (4t × 8v) 恰 256 =
+        // 线程数：每线程 1 任务，任务态提环外、acc 寄存器跨相存活。
+        // 乘加序与慢路逐元素相同（j/s 升序链——仅 S₀/δ 载入来源变 smem）
+        cp_async_wait_all(core::ptr::null_mut());
+        _syncthreads();
+        let ntg = udiv(n + 3, 4);
+        let nvt = vd >> 3;
+        let ntasks = ntg * nvt;
+        let e = t;
+        let (tr0, v0) = if e < ntasks {
+            (udiv(e, nvt) * 4, urem(e, nvt) * 8)
+        } else {
+            (0, 0)
+        };
+        let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+        let mut qt = [0u64; 4];
+        let mut dv = [0f32; 8];
+        let mut mv = [0f32; 4];
+        let (sbuf, dbuf) = (dsp, dsp.add(4352));
+        let mut hv = 0usize;
+        while hv < vph {
+            let h = kk * vph + hv;
+            let vb = gc * vh + h;
+            let neg = scratch.add(vb * (5 * bts) + 3 * bts);
+            let mp0 = DN_O_M.as_ptr().add(hv * 2112);
+            // hv≥1 环头：未决组 {S₀(hv), δ(hv)}（提交序 S₀ 在先）——
+            // wait_group 1 只等 S₀ 到位开 ②，δ 留飞藏于 ② 计算
+            if hv >= 1 {
+                cp_async_wait1(core::ptr::null_mut());
+                _syncthreads();
+            }
+            macro_rules! dn_oqdec {
+                ($r:expr) => {{
+                    let (qlo, qhi) = (qt[$r] as u32, (qt[$r] >> 32) as u32);
+                    [
+                        f32::from_bits(qlo << 16),
+                        f32::from_bits(qlo & 0xffff_0000),
+                        f32::from_bits(qhi << 16),
+                        f32::from_bits(qhi & 0xffff_0000),
+                    ]
+                }};
+            }
+            // ② S₀ smem 行宏（$buf=本相缓冲）：行 v0+$c 的第 j4 u64
+            //    （块序搅动后）解 4 bf16，配 4 行 qv 各 4 fma **只落本列
+            //    $c**（out[r][v0+c] = Σ_j q̂_r[j]·S₀[v0+c][j]——行 c 不得
+            //    混入他列）。乘加序（j 升序、q_a..q_d 配 s_0..s_3）与
+            //    慢路逐位同
+            macro_rules! dn_osmem {
+                ($c:expr, $buf:expr, $j4:expr, $qv0:expr, $qv1:expr, $qv2:expr, $qv3:expr) => {{
+                    let row = v0 + $c;
+                    let u = (($j4 >> 1) ^ ((row >> 3) & 7)) << 1 | ($j4 & 1);
+                    let sv = *$buf.add(row * 34 + u);
+                    let (slo, shi) = (sv as u32, (sv >> 32) as u32);
+                    let s0v = f32::from_bits(slo << 16);
+                    let s1v = f32::from_bits(slo & 0xffff_0000);
+                    let s2v = f32::from_bits(shi << 16);
+                    let s3v = f32::from_bits(shi & 0xffff_0000);
+                    a0[$c] = fma($qv0[0], s0v, a0[$c]);
+                    a0[$c] = fma($qv0[1], s1v, a0[$c]);
+                    a0[$c] = fma($qv0[2], s2v, a0[$c]);
+                    a0[$c] = fma($qv0[3], s3v, a0[$c]);
+                    a1[$c] = fma($qv1[0], s0v, a1[$c]);
+                    a1[$c] = fma($qv1[1], s1v, a1[$c]);
+                    a1[$c] = fma($qv1[2], s2v, a1[$c]);
+                    a1[$c] = fma($qv1[3], s3v, a1[$c]);
+                    a2[$c] = fma($qv2[0], s0v, a2[$c]);
+                    a2[$c] = fma($qv2[1], s1v, a2[$c]);
+                    a2[$c] = fma($qv2[2], s2v, a2[$c]);
+                    a2[$c] = fma($qv2[3], s3v, a2[$c]);
+                    a3[$c] = fma($qv3[0], s0v, a3[$c]);
+                    a3[$c] = fma($qv3[1], s1v, a3[$c]);
+                    a3[$c] = fma($qv3[2], s2v, a3[$c]);
+                    a3[$c] = fma($qv3[3], s3v, a3[$c]);
+                }};
+            }
+            // base 行缩放（rs = e^{−C_t}·invq_t）
+            macro_rules! dn_oscale8 {
+                ($acc:ident, $r:expr) => {{
+                    if tr0 + $r < n {
+                        let rs = *neg.add(tr0 + $r)
+                            * *inv.add((t0 + tr0 + $r) * kh_n * 2 + kh * 2);
+                        for c in 0..8 {
+                            $acc[c] *= rs;
+                        }
+                    }
+                }};
+            }
+            // ③ 行宏：acc[c] += mv[r]·dv[c]
+            macro_rules! dn_ofma8 {
+                ($acc:ident, $r:literal) => {{
+                    for c in 0..8 {
+                        $acc[c] = fma(mv[$r], dv[c], $acc[c]);
+                    }
+                }};
+            }
+            // 落盘行宏：/√kd 收 bf16，8 连续 v = 2×u64 存
+            macro_rules! dn_ost8 {
+                ($acc:ident, $r:expr) => {{
+                    if tr0 + $r < n {
+                        let po =
+                            core_out.add((t0 + tr0 + $r) * vh * vd + h * vd + v0) as *mut u64;
+                        *po = dn_pack4([
+                            $acc[0] / kd_sqrt,
+                            $acc[1] / kd_sqrt,
+                            $acc[2] / kd_sqrt,
+                            $acc[3] / kd_sqrt,
+                        ]);
+                        *(po.add(1)) = dn_pack4([
+                            $acc[4] / kd_sqrt,
+                            $acc[5] / kd_sqrt,
+                            $acc[6] / kd_sqrt,
+                            $acc[7] / kd_sqrt,
+                        ]);
+                    }
+                }};
+            }
+            if e < ntasks {
+                // acc 每 hv 相回零（各相写不同 h 行——旧路任务局部重建的语义）
+                a0 = [0f32; 8];
+                a1 = [0f32; 8];
+                a2 = [0f32; 8];
+                a3 = [0f32; 8];
+                // ② 全行 j4 0..32（sbuf，① 期间/hv 尾已到位）
+                let mut j4 = 0usize;
+                while j4 < 32 {
+                    let jb = j4 * 4;
+                    for r in 0..4 {
+                        if tr0 + r < n {
+                            qt[r] = *(q.add(qrow(t0 + tr0 + r, jb)) as *const u64);
+                        }
+                    }
+                    let (qv0, qv1, qv2, qv3) =
+                        (dn_oqdec!(0), dn_oqdec!(1), dn_oqdec!(2), dn_oqdec!(3));
+                    dn_osmem!(0, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(1, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(2, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(3, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(4, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(5, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(6, sbuf, j4, qv0, qv1, qv2, qv3);
+                    dn_osmem!(7, sbuf, j4, qv0, qv1, qv2, qv3);
+                    j4 += 1;
+                }
+            }
+            _syncthreads(); // sbuf 排空 → S₀(hv+1) 入槽（藏于 ③+落盘）
+            if hv + 1 < vph {
+                dn_ostage!(gc * vh + kk * vph + hv + 1, sbuf);
+                cp_async_commit(core::ptr::null_mut());
+            }
+            // hv≥1：未决组 {δ(hv), S₀(hv+1)}（δ 提交在先）——wait_group 1
+            // 只等 δ 到位开 ③（δ 传输藏于 ②），S₀(hv+1) 留飞藏于 ③+落盘。
+            // 末相（无 S₀(hv+1)）未决数恰 1，wait_group 1 立即返回不担保
+            // δ 完成 ⇒ 必须退化全等（racecheck 抓到的 δ 读/写竞态即此）
+            if hv >= 1 {
+                if hv + 1 < vph {
+                    cp_async_wait1(core::ptr::null_mut());
+                } else {
+                    cp_async_wait_all(core::ptr::null_mut());
+                }
+                _syncthreads();
+            }
+            if e < ntasks {
+                dn_oscale8!(a0, 0);
+                dn_oscale8!(a1, 1);
+                dn_oscale8!(a2, 2);
+                dn_oscale8!(a3, 3);
+                // ③ s 升序链（s ≤ t）：Mᵀ[s][tr0..+4] smem 2×u64 + δ
+                // dbuf[s][v0>>1..+4] smem 4×u64（staged，s<n 守卫同 ③ 循环界）
+                let smax = if tr0 + 4 < n { tr0 + 4 } else { n };
+                let mut s = 0usize;
+                while s < smax {
+                    let mp = mp0.add(s * 33 + (tr0 >> 1));
+                    let m2a = *mp;
+                    let m2b = *(mp.add(1));
+                    mv = [
+                        f32::from_bits(m2a as u32),
+                        f32::from_bits((m2a >> 32) as u32),
+                        f32::from_bits(m2b as u32),
+                        f32::from_bits((m2b >> 32) as u32),
+                    ];
+                    let dp = dbuf.add(s * 64 + (v0 >> 1));
+                    let d2a = *dp;
+                    let d2b = *(dp.add(1));
+                    let d2c = *(dp.add(2));
+                    let d2d = *(dp.add(3));
+                    dv = [
+                        f32::from_bits(d2a as u32),
+                        f32::from_bits((d2a >> 32) as u32),
+                        f32::from_bits(d2b as u32),
+                        f32::from_bits((d2b >> 32) as u32),
+                        f32::from_bits(d2c as u32),
+                        f32::from_bits((d2c >> 32) as u32),
+                        f32::from_bits(d2d as u32),
+                        f32::from_bits((d2d >> 32) as u32),
+                    ];
+                    dn_ofma8!(a0, 0);
+                    dn_ofma8!(a1, 1);
+                    dn_ofma8!(a2, 2);
+                    dn_ofma8!(a3, 3);
+                    s += 1;
+                }
+                // 落盘（dn_ost8 行宏，tr<n 守卫）
+                dn_ost8!(a0, 0);
+                dn_ost8!(a1, 1);
+                dn_ost8!(a2, 2);
+                dn_ost8!(a3, 3);
+            }
+            _syncthreads(); // dbuf 排空 → δ(hv+1) 入槽（藏于 hv+1 的 ②）
+            if hv + 1 < vph {
+                dn_dstage!(kk * vph + hv + 1, dbuf);
+                cp_async_commit(core::ptr::null_mut());
+            }
+            hv += 1;
+        }
+    } else {
+        // 慢路（bt=32/128、vd%8≠0、vph>2）：4v 旧几何；Mᵀ 按 mfast 读
+        // smem 或全局 w 别名（行距 33 / bts/2 u64——tr0 偶 ⇒ 同址 f32 对齐）
         let ntg = udiv(n + 7, 8);
         let nvt = vd / 4;
         let hvt = ntg * nvt;
@@ -6623,7 +7106,11 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
             let e2 = e - hv * hvt;
             let h = kk * vph + hv;
             let vb = gc * vh + h;
-            let mbase = mscratch.add(vb * bts * bts);
+            let (mb, mstr) = if mfast {
+                (DN_O_M.as_ptr().add(hv * 2112), 33usize)
+            } else {
+                (mscratch.add(vb * bts * bts) as *const u64, bts >> 1)
+            };
             let s0 = snap.add(vb * vd * kd); // 本块首状态
             let neg = scratch.add(vb * (5 * bts) + 3 * bts);
             let tr0 = udiv(e2, nvt) * 8;
@@ -6631,8 +7118,10 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
             let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 4], [0f32; 4], [0f32; 4], [0f32; 4]);
             let (mut a4, mut a5, mut a6, mut a7) = ([0f32; 4], [0f32; 4], [0f32; 4], [0f32; 4]);
             let mut qt = [0u64; 8];
-            let mut st = [0u64; 4];
-            // ② base 行宏：qt[r] 解 4 bf16 × S₀ 4 行（c 常量展开）4 fma
+            let mut sd = [[0f32; 4]; 4];
+            let mut dv = [0f32; 4];
+            let mut mv = [0f32; 8];
+            // ② base 行宏：qt[r] 解 4 bf16 × 4 列解码片（c 常量展开）4 fma
             macro_rules! dn_orow {
                 ($acc:ident, $r:expr) => {{
                     let (qlo, qhi) = (qt[$r] as u32, (qt[$r] >> 32) as u32);
@@ -6641,11 +7130,10 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                     let qc = f32::from_bits(qhi << 16);
                     let qd = f32::from_bits(qhi & 0xffff_0000);
                     for c in 0..4 {
-                        let (slo, shi) = (st[c] as u32, (st[c] >> 32) as u32);
-                        $acc[c] = fma(qa, f32::from_bits(slo << 16), $acc[c]);
-                        $acc[c] = fma(qb, f32::from_bits(slo & 0xffff_0000), $acc[c]);
-                        $acc[c] = fma(qc, f32::from_bits(shi << 16), $acc[c]);
-                        $acc[c] = fma(qd, f32::from_bits(shi & 0xffff_0000), $acc[c]);
+                        $acc[c] = fma(qa, sd[c][0], $acc[c]);
+                        $acc[c] = fma(qb, sd[c][1], $acc[c]);
+                        $acc[c] = fma(qc, sd[c][2], $acc[c]);
+                        $acc[c] = fma(qd, sd[c][3], $acc[c]);
                     }
                 }};
             }
@@ -6658,6 +7146,14 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                         for c in 0..4 {
                             $acc[c] *= rs;
                         }
+                    }
+                }};
+            }
+            // ③ 行宏：acc[c] += mv[r]·dv[c]
+            macro_rules! dn_ofma {
+                ($acc:ident, $r:literal) => {{
+                    for c in 0..4 {
+                        $acc[c] = fma(mv[$r], dv[c], $acc[c]);
                     }
                 }};
             }
@@ -6683,7 +7179,14 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                     }
                 }
                 for c in 0..4 {
-                    st[c] = *(s0.add((v0 + c) * kd + jb) as *const u64);
+                    let sv = *(s0.add((v0 + c) * kd + jb) as *const u64);
+                    let (slo, shi) = (sv as u32, (sv >> 32) as u32);
+                    sd[c] = [
+                        f32::from_bits(slo << 16),
+                        f32::from_bits(slo & 0xffff_0000),
+                        f32::from_bits(shi << 16),
+                        f32::from_bits(shi & 0xffff_0000),
+                    ];
                 }
                 dn_orow!(a0, 0);
                 dn_orow!(a1, 1);
@@ -6704,22 +7207,25 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
             dn_oscale!(a6, 6);
             dn_oscale!(a7, 7);
             // ③ s 升序链（s ≤ t）：Mᵀ[s][tr0..+8] 4×u64 + δ[v0..+4] 2×u64
-            let smax = if tr0 + 8 < n { tr0 + 8 } else { n };
+            let smax = if tr0 + 8 < n { tr0 + 8 } else { n }; 
+            let dbase = dn.add(h * vd + v0);
             let mut s = 0usize;
             while s < smax {
-                let m2a = *(mbase.add(s * bts + tr0) as *const u64);
-                let m2b = *(mbase.add(s * bts + tr0 + 2) as *const u64);
-                let m2c = *(mbase.add(s * bts + tr0 + 4) as *const u64);
-                let m2d = *(mbase.add(s * bts + tr0 + 6) as *const u64);
-                let d2a = *(dn.add((t0 + s) * vh * vd + h * vd + v0) as *const u64);
-                let d2b = *(dn.add((t0 + s) * vh * vd + h * vd + v0 + 2) as *const u64);
-                let dv = [
+                let mp = mb.add(s * mstr + (tr0 >> 1));
+                let m2a = *mp;
+                let m2b = *(mp.add(1));
+                let m2c = *(mp.add(2));
+                let m2d = *(mp.add(3));
+                let dp = dbase.add((t0 + s) * vh * vd) as *const u64;
+                let d2a = *dp;
+                let d2b = *(dp.add(1));
+                dv = [
                     f32::from_bits(d2a as u32),
                     f32::from_bits((d2a >> 32) as u32),
                     f32::from_bits(d2b as u32),
                     f32::from_bits((d2b >> 32) as u32),
                 ];
-                let mv = [
+                mv = [
                     f32::from_bits(m2a as u32),
                     f32::from_bits((m2a >> 32) as u32),
                     f32::from_bits(m2b as u32),
@@ -6729,13 +7235,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_o(
                     f32::from_bits(m2d as u32),
                     f32::from_bits((m2d >> 32) as u32),
                 ];
-                macro_rules! dn_ofma {
-                    ($acc:ident, $r:literal) => {{
-                        for c in 0..4 {
-                            $acc[c] = fma(mv[$r], dv[c], $acc[c]);
-                        }
-                    }};
-                }
                 dn_ofma!(a0, 0);
                 dn_ofma!(a1, 1);
                 dn_ofma!(a2, 2);

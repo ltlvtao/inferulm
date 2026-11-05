@@ -227,10 +227,22 @@ const DN_CHUNK_MIN_SPAN: u32 = 256;
 /// BT=64/vsplit=8 是 dn_chunk_probe 的实测最优（6009 全段 24 层 102.35ms，
 /// 老路 332ms）
 const DN_CHUNK_BT: u32 = 64;
-const DN_CHUNK_VSPLIT: u32 = 8;
+/// vsplit 默认 4（bdim=256 起 w hi/lo smem 双缓冲档；vs8=bdim128 不 staging，
+/// 2026-11-05 探针 BT=64 档 vs4 3574µs/层 < vs8 3950）。`WEIN_DN_VSPLIT` 可覆。
+const DN_CHUNK_VSPLIT: u32 = 4;
 /// chunked 子段表容量（= kernel 侧 fwd_h scratch 的行上限 DN_CHUNK_ROWS_CAP；
 /// 混合批多请求同时大 prefill 时超出部分回退老路）
 const DN_CHUNK_ROWS: usize = 4;
+
+/// vsplit 旋钮：`WEIN_DN_VSPLIT`∈{1,2,4,8}，其余/缺省走 DN_CHUNK_VSPLIT。
+fn dn_vsplit() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("WEIN_DN_VSPLIT").ok().and_then(|s| s.parse().ok()) {
+        Some(v) if [1u32, 2, 4, 8].contains(&v) => v,
+        _ => DN_CHUNK_VSPLIT,
+    })
+}
 
 /// full_attention 层权重
 struct FullDev {
@@ -3492,7 +3504,7 @@ impl Qwen35Executor {
                                 &self.scr.bb, &w.a_log, &w.dtb, &self.lin_state[lin_i],
                                 &self.scr.core, &self.mix.dn_start, &self.mix.dn_count,
                                 &self.mix.dn_rid, &self.mix.dn_snap, p.rows, p.chunks, kh_n,
-                                vh_n, kd, vd, t32, L2_EPS, DN_CHUNK_BT, DN_CHUNK_VSPLIT,
+                                vh_n, kd, vd, t32, L2_EPS, DN_CHUNK_BT, dn_vsplit(),
                                 stream,
                             );
                             if p.old_rows > 0 {
