@@ -128,10 +128,12 @@ fn k1_ptx_artifact_structure() {
     }
     // attention v5 档（4 warp × 64 行 CTA 共享 K/V smem）
     assert!(ptx.contains(".entry paged_attn_v5("), "paged_attn_v5 入口缺失/被改名");
+    // attention v9 档（手写 PTX：LDSM + mma.sync + 99KB 动态 smem）
+    assert!(ptx.contains(".entry paged_attn_v9("), "paged_attn_v9 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        64,
-        "导出 kernel 数应为 64（63 + v5 档 1）"
+        65,
+        "导出 kernel 数应为 65（64 + v9 档 1）"
     );
 }
 

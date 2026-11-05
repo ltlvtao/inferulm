@@ -1051,6 +1051,11 @@ impl Qwen35Executor {
         // 的 16 对齐部分走 v4、尾行（<16 行）narrow 切给 online——行独立，
         // 算术序不变，**v5 ≡ v4 逐位**（o39）。开关每次调用现读（进程内 A/B）；
         // 含 decode 行的混合批禁 v5（同 v4）。
+        // v9 档（手写 PTX：LDSM + mma.sync + 99KB 动态 smem、Bc=32 双缓冲）：
+        // 与 v5 同合同（纯 prefill、单 span、64 对齐主段、16q/4kv/hd256、bf16
+        // 池），主段由 v9 接管（6009 单层 2.7-2.8ms vs v5 7.0-8.0，×2.6-2.9；
+        // o40 容差档 rel2≤1.24e-3）。余段（<64 行）仍走 v4/online。
+        // WEIN_ATTN_V9=0 回退 v5（进程内 A/B）。
         if self.attn_online
             && !has_decode_row
             && single_span
@@ -1062,12 +1067,20 @@ impl Qwen35Executor {
             && kvh == 4
             && std::env::var("WEIN_ATTN_V5").map(|v| v != "0").unwrap_or(true)
         {
+            let v9 = std::env::var("WEIN_ATTN_V9").map(|v| v != "0").unwrap_or(true);
             let t64 = t & !63;
             if t64 > 0 {
-                a.run_tile_v5(
-                    q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t64,
-                    stream,
-                );
+                if v9 {
+                    a.run_tile_v9(
+                        q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd,
+                        t64, stream,
+                    );
+                } else {
+                    a.run_tile_v5(
+                        q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd,
+                        t64, stream,
+                    );
+                }
             }
             let rem = t - t64;
             if rem > 0 {

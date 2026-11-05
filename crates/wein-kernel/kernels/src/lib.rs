@@ -4290,6 +4290,63 @@ pub unsafe extern "ptx-kernel" fn paged_attn_v5(
 
 
 
+// ═══ v9：手写 PTX kernel（build.rs `patch_v9` 整体替换函数体）═══
+//
+// 形态：FA2 风格 —— ldmatrix（LDSM）装载 + mma.sync m16n8k16(S)/m16n8k8(PV)
+// + P 的 C→A fragment 寄存器直用（省 P smem 往返）+ K/V/Q 全动态 smem
+// （101376B = 99KB opt-in，宿主 cuFuncSetAttribute）+ cp.async 双缓冲。
+// 几何与 v5 同族：CTA=128 线程（4 warp × 16 行），grid=16qh×⌈tokens/64⌉，
+// 但 KV tile 粒度 Bc=32（v5=16）。**容差档**（tile 粒度变化破位级）。
+//
+// 占位体绝不允许上线（volatile 写 out[0] 一次）——build.rs 断言兜底；
+// 全参数 volatile 读防 IPO 删参（.param 装载由替换体自写）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn paged_attn_v9(
+    q: *const u16,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    block_table: *const u32,
+    seq_ids: *const u32,
+    positions: *const u32,
+    out: *mut u16,
+    part_acc: *mut f32,
+    part_ml: *mut f32,
+    q_scale: f32,
+    bpr: u32,
+    block_size: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    tokens: u32,
+    ntok: u32,
+    jsplit: u32,
+    chunk: u32,
+    scratch: *mut f32,
+) {
+    let _ = (
+        unsafe { core::ptr::read_volatile(q) },
+        unsafe { core::ptr::read_volatile(k_cache) },
+        unsafe { core::ptr::read_volatile(v_cache) },
+        unsafe { core::ptr::read_volatile(block_table) },
+        unsafe { core::ptr::read_volatile(seq_ids) },
+        unsafe { core::ptr::read_volatile(positions) },
+        core::hint::black_box(part_acc),
+        core::hint::black_box(part_ml),
+        core::hint::black_box(q_scale),
+        core::hint::black_box(bpr),
+        core::hint::black_box(block_size),
+        core::hint::black_box(q_heads),
+        core::hint::black_box(kv_heads),
+        core::hint::black_box(head_dim),
+        core::hint::black_box(tokens),
+        core::hint::black_box(ntok),
+        core::hint::black_box(jsplit),
+        core::hint::black_box(chunk),
+        core::hint::black_box(scratch),
+    );
+    unsafe { core::ptr::write_volatile(out, 0) };
+}
+
 /// 分块档块私有 scratch 槽数：与 host 侧 `ops::ATTN_TILE_SLOTS` 同值。
 /// `ROWS_CAP` = 一块内 q 行上限（host 侧 `ATTN_TILE_ROWS_CAP`，BR 维度的
 /// 上界 = ROWS_CAP/group）。四项的定尺依据：

@@ -37,6 +37,7 @@ pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 /// cuFuncGetAttribute 的属性号（只列用到的）：local 溢出字节数与寄存器数
 /// ——qblk 档探针的 regs/spill 报告口径（与 ptxas -v 对拍过）
 pub const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
+pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 /// shared 内存字节数（静态 .shared 总量——模块级符号归属判定用）
 pub const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
 pub const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
@@ -73,6 +74,8 @@ pub struct Driver {
     ) -> CuResult,
     cu_module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResult,
+    cu_func_set_attribute:
+        unsafe extern "C" fn(*mut c_void, c_int, c_int) -> CuResult,
     cu_func_get_attribute:
         unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResult,
     cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> CuResult,
@@ -150,6 +153,7 @@ impl Driver {
                 cu_ctx_set_current: try_get(&lib, &["cuCtxSetCurrent"])?,
                 cu_module_load_data_ex: try_get(&lib, &["cuModuleLoadDataEx"])?,
                 cu_module_get_function: try_get(&lib, &["cuModuleGetFunction"])?,
+                cu_func_set_attribute: try_get(&lib, &["cuFuncSetAttribute"])?,
                 cu_func_get_attribute: try_get(&lib, &["cuFuncGetAttribute"])?,
                 cu_mem_alloc: try_get(&lib, &["cuMemAlloc_v2", "cuMemAlloc"])?,
                 cu_mem_free: try_get(&lib, &["cuMemFree_v2", "cuMemFree"])?,
@@ -273,6 +277,40 @@ impl Driver {
         let mut v = 0i32;
         self.check(unsafe { (self.cu_func_get_attribute)(&mut v, attr, f) }, "cuFuncGetAttribute")?;
         Ok(v)
+    }
+    /// 动态 smem opt-in（CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES=8）
+    pub(crate) fn func_set_attribute(
+        &self,
+        f: *mut c_void,
+        attr: c_int,
+        value: c_int,
+    ) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_func_set_attribute)(f, attr, value) }, "cuFuncSetAttribute")
+    }
+    /// launch 携带动态 smem 字节数（sharedMemBytes ≠ 0 的入口专用）
+    pub(crate) fn launch_smem(
+        &self,
+        f: *mut c_void,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        smem: u32,
+        params: &[*mut c_void],
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(
+            unsafe {
+                (self.cu_launch_kernel)(
+                    f,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
+                    smem,
+                    stream,
+                    params.as_ptr() as *mut *mut c_void,
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )
     }
     pub(crate) fn mem_alloc(&self, bytes: usize) -> Result<u64, CuError> {
         let mut ptr = 0u64;

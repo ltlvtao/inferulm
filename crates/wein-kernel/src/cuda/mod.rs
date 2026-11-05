@@ -139,6 +139,26 @@ impl Gpu {
             .expect("cuLaunchKernel");
     }
 
+    /// 一维 + 动态 smem 提交（v9 等 99KB 档专用；opt-in 属性由调用方先设）
+    pub fn launch_smem(
+        &self,
+        f: &Func,
+        grid: u32,
+        block: u32,
+        smem: u32,
+        args: &[*mut c_void],
+        stream: &Stream,
+    ) {
+        self.drv
+            .launch_smem(f.handle, (grid, 1, 1), (block, 1, 1), smem, args, stream.handle)
+            .expect("cuLaunchKernel(dyn smem)");
+    }
+
+    /// kernel 属性设置（动态 smem opt-in 等）——一次性配置
+    pub fn func_set_attribute(&self, f: &Func, attr: i32, value: i32) {
+        self.drv.func_set_attribute(f.handle, attr, value).expect("cuFuncSetAttribute");
+    }
+
     /// 编译后 kernel 属性（regs / local 溢出字节——属性号见 `driver`）
     pub fn func_attribute(&self, f: &Func, attr: i32) -> i32 {
         self.drv.func_attribute(f.handle, attr).expect("cuFuncGetAttribute")

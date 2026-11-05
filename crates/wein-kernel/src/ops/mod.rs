@@ -213,6 +213,7 @@ impl OpTable<'_> {
             pml_v3: gpu.alloc_bytes(V3_PART_ROWS * V3_SPLIT_CAP * 2 * 4),
             f_v4: m.func("paged_attn_v4"),
             f_v5: m.func("paged_attn_v5"),
+            f_v9: m.func("paged_attn_v9"),
         };
         let embed = EmbedCuda { gpu, f: m.func("embed") };
         let add = AddCuda { gpu, f: m.func("add") };
@@ -241,6 +242,11 @@ impl OpTable<'_> {
             scratch: gpu.alloc_bytes(DELTA_BLOCK_CAP * DELTA_SLOTS_PER_BLOCK * 4),
             inv: gpu.alloc_bytes(caps.delta_l2_tokens * DELTA_L2_KHEADS_CAP * 2 * 4),
         };
+        // v9 动态 smem opt-in：99KB 超 48KB 静态默认，须 launch 前显式抬
+        use crate::cuda::driver::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        paged_attn
+            .gpu
+            .func_set_attribute(&paged_attn.f_v9, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 101376);
         let deltanet_chunked = DeltanetChunkedCuda::new(gpu, &m, caps);
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
@@ -1571,6 +1577,10 @@ pub struct PagedAttnCuda<'a> {
     /// v5 档（4 warp × 64 行 CTA 共享 K/V smem）单入口：几何内建（128
     /// 线程/块 = 4 warp，grid = q_heads × ⌈tokens/64⌉）
     f_v5: Func,
+    /// v9 档（手写 PTX：LDSM + mma.sync + C→A 直用 + 动态 smem 99KB）：
+    /// 几何同 v5（128 线程 × 4 warp，grid = q_heads × ⌈tokens/64⌉），Bc=32。
+    /// 容差档（tile 粒度 16→32 破位级）
+    f_v9: Func,
     /// 分块档块私有 scratch：[ATTN_TILE_BLOCK_CAP, ATTN_TILE_SLOTS] f32
     tscratch: DevBuf<'a>,
     /// j 分片偏结果（jsplit>1 档）：acc [rows, split, hd] f32 + (m,l) [rows, split, 2]
@@ -2926,6 +2936,58 @@ impl PagedAttnCuda<'_> {
             tokens, n0, js1, c0, self.scratch
         ];
         self.gpu.launch(&self.f_v5, q_heads * row_tiles, 128, &args, stream);
+    }
+
+    /// v9 档（手写 PTX：LDSM + mma.sync + C→A 直用）：几何合同同 v5
+    /// （tokens 64 对齐、单 span、16q/4kv/hd256、bf16 池），Bc=32 容差档。
+    /// 动态 smem 101376B（构造时已 opt-in）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tile_v9(
+        &self,
+        q: &DevBuf,
+        k_cache: &DevBuf,
+        v_cache: &DevBuf,
+        block_table: &DevBuf,
+        seq_ids: &DevBuf,
+        positions: &DevBuf,
+        out: &DevBuf,
+        q_scale: f32,
+        bpr: u32,
+        block_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        assert!(tokens > 0, "paged_attn_v9: tokens=0");
+        assert!(tokens % 64 == 0, "paged_attn_v9: tokens 须 64 对齐（余段切给下一档）");
+        assert!(
+            head_dim == 256 && q_heads == 16 && kv_heads == 4,
+            "paged_attn_v9: 精确几何 16q/4kv/hd256 专用，其他形状走 v3"
+        );
+        let row_tiles = tokens / 64;
+        let (n0, js1, c0) = (0u32, 1u32, 0u32);
+        let args = crate::kernel_args![
+            *q, *k_cache, *v_cache, *block_table, *seq_ids, *positions, *out,
+            self.pacc_v3, self.pml_v3, q_scale, bpr, block_size, q_heads, kv_heads, head_dim,
+            tokens, n0, js1, c0, self.scratch
+        ];
+        self.gpu
+            .launch_smem(&self.f_v9, q_heads * row_tiles, 128, 101376, &args, stream);
+    }
+
+    /// v9 变体编译后属性（regs / local 溢出字节 / smem 字节）——探针口径
+    pub fn v9_meta(&self) -> (i32, i32, i32) {
+        use crate::cuda::driver::{
+            CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_NUM_REGS,
+            CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        };
+        (
+            self.gpu.func_attribute(&self.f_v9, CU_FUNC_ATTRIBUTE_NUM_REGS),
+            self.gpu.func_attribute(&self.f_v9, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            self.gpu.func_attribute(&self.f_v9, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+        )
     }
 
 
