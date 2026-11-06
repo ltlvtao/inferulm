@@ -139,7 +139,8 @@ fn main() {
     let (w_hi_off, w_lo_off) = (wimg * 2, wimg * 3);
     let snap = gpu.alloc_bytes(chunks * vh * vd * kd * 2);
     let sc1 = gpu.alloc_bytes(chunks * vh * 5 * bt * 4);
-    let sc2 = gpu.alloc_bytes(1 * vh * 8 * (vd / 8 * kd + 64 + 8192) * 4);
+    // 每块槽数按 sp=8 定尺（vd/8·kd/2 + 64 + 64·vd + vd·kd：末项 = ② 的 C 增量）
+    let sc2 = gpu.alloc_bytes(1 * vh * 8 * (vd / 8 * kd + 64 + 8192 + vd * kd) * 4);
     let snap_off: Vec<u32> = vec![0, chunks as u32];
     let dsn = gpu.alloc_from_slice(&snap_off);
     let (tk, tkh, tvh, tkd, tvd) = (tokens as u32, kh as u32, vh as u32, kd as u32, vd as u32);

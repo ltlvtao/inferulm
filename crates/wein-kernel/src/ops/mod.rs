@@ -974,8 +974,9 @@ pub struct DeltanetChunkedCuda<'a> {
     /// prep/o 共用的块私有 scratch（[chunks_cap×vh_cap 块, 5·BT_MAX] f32；
     /// 两 kernel 同 grid 几何、同 stream 顺序 launch——prep 写完 o 才读）
     scratch1: DevBuf<'a>,
-    /// fwd_h 的块私有 scratch（[rows×vh×vsplit 块] × (vrows·kd+BT) f32，
-    /// 按 ROWS×VH×(DIM²+VSPLIT·BT) 定尺——vsplit 越大块越多每块越小）
+    /// fwd_h 的块私有 scratch（[rows×vh×vsplit 块] × (vrows·kd/2 + BT + BT·vrows
+    /// + vrows·kd) f32，按 ROWS×VH×(DIM²/2 + BT_MAX·(1+DIM) + DIM²) 定尺——
+    /// vsplit 越大块越多每块越小；末项 vrows·kd = ② tensor-core 的 C 增量槽）
     scratch2: DevBuf<'a>,
     tokens_cap: usize,
     chunks_cap: usize,
@@ -1010,7 +1011,8 @@ impl<'a> DeltanetChunkedCuda<'a> {
                 DN_CHUNK_ROWS_CAP
                     * DN_CHUNK_VHEADS_CAP
                     * (DN_CHUNK_DIM * DN_CHUNK_DIM / 2
-                        + DN_CHUNK_BT_MAX * (1 + DN_CHUNK_DIM))
+                        + DN_CHUNK_BT_MAX * (1 + DN_CHUNK_DIM)
+                        + DN_CHUNK_DIM * DN_CHUNK_DIM)
                     * 4,
             ),
             tokens_cap: t,
@@ -1091,7 +1093,10 @@ impl DeltanetChunkedOp for DeltanetChunkedCuda<'_> {
         loop {
             let vrows = v_dim / sp;
             let need = n_rows as usize * v_heads as usize * sp as usize
-                * (vrows as usize * k_dim as usize / 2 + bt as usize + bt as usize * vrows as usize);
+                * (vrows as usize * k_dim as usize / 2
+                    + bt as usize
+                    + bt as usize * vrows as usize
+                    + vrows as usize * k_dim as usize);
             if need <= h_slots || sp == 1 {
                 break;
             }

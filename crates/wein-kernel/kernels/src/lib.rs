@@ -120,6 +120,11 @@ pub unsafe extern "ptx-kernel" fn shfl_probe(out_i: *mut i32, out_f: *mut f32) {
 unsafe extern "C" {
     #[link_name = "llvm.nvvm.wmma.m16n16k16.load.a.row.stride.bf16"]
     fn wmma_load_a(p: *const u32, ldm: i32) -> (i32, i32, i32, i32);
+    // ② Δᵀ = A：Δ 以 [t][v]（行=t）自然序落 smem，而 A 的 m=v / k=t ⇒
+    // 源矩阵是**列主序**（(m,k) 在 k·ldm+m）；.col 描述源布局、产物仍是
+    // mma.row.col 的规范 A 片段。免转置 staging、零额外 smem。
+    #[link_name = "llvm.nvvm.wmma.m16n16k16.load.a.col.stride.bf16"]
+    fn wmma_load_a_col(p: *const u32, ldm: i32) -> (i32, i32, i32, i32);
     #[link_name = "llvm.nvvm.wmma.m16n16k16.load.b.col.stride.bf16"]
     fn wmma_load_b(p: *const u32, ldm: i32) -> (i32, i32, i32, i32);
     // ② t-并行用：k̂ [t][j] 行主序直接做 B 片段（load 的 .row/.col 描述源
@@ -5913,15 +5918,21 @@ static mut DN_H2_K: [u64; 64 * 36] = [0; 64 * 36];
 static mut DN_H2_D: [F4; 64 * 4] = [F4([0.0; 4]); 64 * 4];
 #[link_section = ".shared"]
 static mut DN_H2_G: [f32; 64] = [0.0; 64];
-/// dn_chunk_h ② 的 k̂ 片静态 staging（生产档 sp=4/bdim=256 × bts=64 ×
-/// kd=128 专路）：[32 token][32 lane] u64 = 8KB，一个 chunk 的前半（token
-/// 0..32；后半落 DN_H2_K 的高 32 行——两条路互斥）。片由块内线程协作搬入，
-/// ② 的 tick 从 smem 读——旧路每 tick 每 lane 一条 8B 全局载（行距
-/// kh_n·kd·2B=4KB，8 warp 各读同一 256B/token ⇒ ×8 冗余且全暴露 HBM 延迟）。
-/// 位级不变：u64 整搬、fma 序不动。静态 22784+8192=30976 + 动态 69632 =
-/// 100608 ≤ 101376（sm_89 每块）。
+/// dn_chunk_h ② 的 Δ 片静态 staging（生产档 sp=4/bdim=256 × bts=64 ×
+/// vrows=32 × kd=128 专路）：Δ[t][v] = δ″[t][v]·g[t] 自然序
+/// [64 token][32 v] bf16，**hi/lo 双 tile**（hi = bf16(Δ)、lo = bf16(Δ−hi)，
+/// ε²≈1.5e-5 ≈ f32 等效——纯 bf16 单发实测同 ① 的 4.07e-3 越门，故拆分）。
+/// 由 elementwise 段顺路落（g 已折入 ⇒ ② 内零 g 广播），② 以其为 mma 的
+/// A = Δᵀ（列主序直读，见 wmma_load_a_col）。合计 8KB——与旧 k̂ staging
+/// 同额，静态 22784+8192=30976 + 动态 69632 = 100608 ≤ 101376（sm_89 每块）。
+/// 32B 对齐是 wmma 源址的硬要求（[u16] 自然对齐仅 2B，故包一层）。
+#[repr(align(32))]
+struct DnBTile([u16; 2048]);
+
 #[link_section = ".shared"]
-static mut DN_H2_S: [u64; 1024] = [0; 1024];
+static mut DN_H2_DH: DnBTile = DnBTile([0; 2048]);
+#[link_section = ".shared"]
+static mut DN_H2_DL: DnBTile = DnBTile([0; 2048]);
 /// dn_chunk_h 的动态 smem 池（extern 动态段——build.rs 改写声明，宿主
 /// launch_smem 供 69632/8704B + MAX_DYNAMIC 属性）。互斥分支分账：
 ///   · ① w hi/lo 跨 chunk 双缓冲（dblb = wst ∧ bdim≥256，即 sp≤4 生产档
@@ -5964,11 +5975,10 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
     // 2383、单槽 2300，均两波串行反慢 55%）→ 该档不 staging，① 保持
     // global 直载 + 循环顶 L2 预热 chunk i+1（纯提示零 smem，2 块/SM 不动）
     let dblb = wst && bdim >= 256;
-    // ② 的 k̂ 片静态 smem staging 门（DN_H2_S 8KB + 复用 DN_H2_K 高 32 行）：
+    // ② 的 tensor-core 秩更新门（Δ 落 DN_H2_DH/DL 的 mma A 路径）：
     // 只锁 sp=4/bdim=256 生产档（bts=64 × vrows=32 × kd=128 × VW=4）——该档
     // 8 warp 全在 vb0<vrows 内（② 的屏障若落在部分 warp 上会死锁，故门同时
-    // 保证整块一致）。其余几何（含 staged 路）② 的 k̂ 一律走旧全局载，位级
-    // 与旧路同。
+    // 保证整块一致）。其余几何（含 staged 路）② 走旧标量全局载，位级与旧路同。
     let ksm = VW == 4 && bdim == 256 && kd == 128 && bts == 64 && vrows == 32;
     // ① w 预载宏：chunk $c 的 hi/lo 全块 cp.async → 槽 $s（纯位拷贝——
     // mma 输入位样与 global 直载逐位同；读集 = 旧 ① 的 t-tile 覆盖行集，
@@ -6165,29 +6175,9 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                 *DN_H2_G.as_mut_ptr().add(t) = *d.gsc.add(t);
             }
         }
-        if ksm {
-            // ② 两半（token 0..32 / 32..64）的 k̂ 片协作预载：前半 → DN_H2_S
-            // （32 行 × 32 lane，行距 32 u64），后半 → DN_H2_K 的高 32 行
-            // （行距 36 u64；DN_H2_K 属 staged 路——staged ⇔ bdim=128，ksm ⇔
-            // bdim=256，互斥不共用）。先发射、与下方 ① mma + elementwise 并发
-            // 飞行，② 前的 _syncthreads 即对全块担保可见——② 内零新增屏障、
-            // 零暴露拷贝。只写 n 行（tick 索引恒 < n，余行不读）。
-            let kg = d.k.add(t0 * kh_n * kd + kh * kd);
-            let kt0 = DN_H2_S.as_mut_ptr();
-            let kt1 = DN_H2_K.as_mut_ptr().add(32 * 36);
-            let lim = (if n < 64 { n } else { 64 }) * 32;
-            let mut i = t;
-            while i < lim {
-                let tr = i >> 5;
-                let v = *(kg.add(tr * kh_n * kd + (i & 31) * 4) as *const u64);
-                if tr < 32 {
-                    *kt0.add(i) = v;
-                } else {
-                    *kt1.add((tr - 32) * 36 + (i & 31)) = v;
-                }
-                i += bdim;
-            }
-        }
+        // ② 的 A 片（Δ hi/lo）由下方 elementwise 段顺路落 DN_H2_DH/DL；k̂ 由
+        // ② 内 wmma load.b.row 直接从全局读（L2 驻留，v 两块 ×2 冗余）——
+        // 旧 k̂ 协作预载（DN_H2_S 8KB）随之删除，smem 挪给 Δ。
         if dblb && ci + 1 < d.nch {
             // chunk i+1 的 w hi/lo 预载入对槽（发于 ① 前——①+elementwise+③
             // 全程飞行；槽 (i+1)&1=(i-1)&1 自 ①(i-1) 后已死，无竞）。环尾
@@ -6318,6 +6308,8 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
         _syncthreads(); // x 槽就绪（跨 warp 写）
         {
             let dsp = DN_H2_D.as_mut_ptr() as *mut f32;
+            // ksm：Δ 的 hi/lo 双 tile（[t][v] 自然序，② 直接当 mma 的 A=Δᵀ）
+            let (dhp, dlp) = (DN_H2_DH.0.as_mut_ptr(), DN_H2_DL.0.as_mut_ptr());
             let mut e = t;
             while e < bts * vrows {
                 let tr = udiv(e, vrows);
@@ -6329,7 +6321,19 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                     *p = val;
                     if staged {
                         *dsp.add(tr * 16 + vv) = val; // ② smem 顺路落（行组=vv>>2=warp）
+                    } else if ksm {
+                        // Δ = δ″·g 折进 g（② 内免 g 广播）；hi/lo 拆分保精度
+                        let dlt = val * *d.gsc.add(tr);
+                        let hi = f32_to_bf16(dlt);
+                        let lo = f32_to_bf16(dlt - bf16_to_f32(hi));
+                        *dhp.add(tr * 32 + vv) = hi;
+                        *dlp.add(tr * 32 + vv) = lo;
                     }
+                } else if ksm {
+                    // n 之后的行**显式置 0**：smem 跨 chunk 存活，不置零会把
+                    // 上一 chunk 的 Δ 残值算进本 chunk 的 mma
+                    *dhp.add(e) = 0;
+                    *dlp.add(e) = 0;
                 }
                 e += bdim;
             }
@@ -6337,7 +6341,106 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
         _syncthreads();
         // ── ② 衰减 + 秩 n 更新 + 快照：warp-per-row ──
         let dlast = expf(0.0 - clast);
-        if staged {
+        if ksm {
+            // ── ② tensor core：S[v][kd] += Σ_t Δ[t][v]·k̂[t][kd] ──
+            // 映射 M=v(32) / N=kd(128) / K=t(≤64) ⇒ 16 个 m16n16k16 C tile
+            // （v 两块 × kd 八块），每 tile (n/16) 个 kstep。8 warp 平分：
+            // wid=t/32 取 mvb=wid&1（v 块）、kb ∈ {(wid>>1)*2, +1}——每 warp
+            // 2 tile、kb 恰铺满 0..7 无重复。A=Δᵀ 由 DN_H2_DH/DL 列主序直读
+            // （ldm=vrows=32：Δ 的 [t][v] 自然序即 (m,k)→k·ldm+m），B=k̂ 由
+            // load.b.row 从全局直读（ldm=kh_n·kd）——零转置 staging、零新
+            // smem、v 两块 ×2 冗余读（k̂ 片 16KB 在 L2 驻留）。hi/lo 双 mma
+            // 串在同一个 C 上（等效 f32 精度，同 ① 的 w 拆分）。
+            for r in 0..VW {
+                for j in 0..4usize {
+                    acc[r][j] *= dlast;
+                }
+            }
+            let inc = d.xsc.add(bts * vrows); // [vrows][kd] f32 块私有增量槽
+            let nfull = n & !15usize; // 整 16 的 token 数（< 16 的尾走标量）
+            let ksteps = nfull >> 4;
+            if ksteps > 0 {
+                let mvb = warp & 1;
+                let kb0 = (warp >> 1) * 2;
+                let kg = d.k.add(t0 * kh_n * kd + kh * kd);
+                let kld = (kh_n * kd) as i32;
+                let (ah, al) = (DN_H2_DH.0.as_ptr(), DN_H2_DL.0.as_ptr());
+                let mut jj = 0usize;
+                while jj < 2 {
+                    let kb = kb0 + jj;
+                    let mut c = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+                    let mut ks = 0usize;
+                    while ks < ksteps {
+                        let ab = ks * 16 * vrows + mvb * 16;
+                        let bb = kg.add(ks * 16 * kh_n * kd + kb * 16) as *const u32;
+                        let a = wmma_load_a_col(ah.add(ab) as *const u32, vrows as i32);
+                        let b = wmma_load_b_row(bb, kld);
+                        c = wmma_mma(
+                            a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4,
+                            c.5, c.6, c.7,
+                        );
+                        let a2 = wmma_load_a_col(al.add(ab) as *const u32, vrows as i32);
+                        c = wmma_mma(
+                            a2.0, a2.1, a2.2, a2.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4,
+                            c.5, c.6, c.7,
+                        );
+                        ks += 1;
+                    }
+                    wmma_store_c(
+                        inc.add(mvb * 16 * kd + kb * 16),
+                        c.0,
+                        c.1,
+                        c.2,
+                        c.3,
+                        c.4,
+                        c.5,
+                        c.6,
+                        c.7,
+                        kd as i32,
+                    );
+                    jj += 1;
+                }
+                _syncthreads(); // inc 跨 warp（v 块的产出 warp ≠ 消费 warp）
+                // 累加器 ← 寄存器态：每 lane 16 个连续 f32（[r] 的 4 个 kd
+                // 相连 + r 间 stride kd）——4 条 16B 载
+                for r in 0..VW {
+                    let iv = *(inc.add((vb0 + r) * kd + j4) as *const F4);
+                    for j in 0..4usize {
+                        acc[r][j] += iv.0[j];
+                    }
+                }
+            }
+            // 余尾 < 16 token：标量（k̂ 只读 < n 行——mma 的 kstep 会整 16 取，
+            // 越尾行在末 chunk 是越界读且可能是 NaN，0·NaN 会毒化状态，故不
+            // 用 ceil 补齐；δ″/g 走 f32 原值，精度还更高）。每行只在「末
+            // chunk 且 n%16≠0」时触发，摊到整层可忽略。
+            let ntail = n - nfull;
+            if ntail > 0 {
+                let kr = d.k.add((t0 + nfull) * kh_n * kd + kh * kd + j4);
+                let ur = d.u.add((t0 + nfull) * vh * vd + h * vd + vbase + vb0);
+                let gs = d.gsc.add(nfull);
+                let mut tt = 0usize;
+                while tt < ntail {
+                    let kq = dn_dec4(*(kr.add(tt * kh_n * kd) as *const u64));
+                    let g = *gs.add(tt);
+                    let dv = *(ur.add(tt * vh * vd) as *const F4);
+                    for r in 0..VW {
+                        let s = dv.0[r] * g;
+                        for j in 0..4usize {
+                            acc[r][j] = fma(kq[j], s, acc[r][j]);
+                        }
+                    }
+                    tt += 1;
+                }
+            }
+            for r in 0..VW {
+                let e0 = (vb0 + r) * kd + j4;
+                *(d.s16.add(e0) as *mut u64) = dn_pack4(acc[r]);
+                if ci + 1 < d.nch {
+                    *(d.snap0.add((ci + 1) * vh * vd * kd + e0) as *mut u64) = dn_pack4(acc[r]);
+                }
+            }
+        } else if staged {
             // 生产专路：acc 4×4（warp 拥行 4w..4w+4 = δ″ 行组 w），k̂/δ″/g 全
             // smem，2 深轮转（smem ~30cy < 2×每拍发射 ~48cy——盖住）。数值与
             // 旧路逐位同：k̂ u64 位样搬运、δ″/g f32 原值、fma 序不变。
@@ -6399,54 +6502,14 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                     acc[r][j] *= dlast;
                 }
             }
-            // 生产档（sp=4/bdim=256：bts=64、vrows=32、kd=128）② 分两半（各
-            // ≤32 token = 一个 smem tile），两半的 k̂ 片都在 chunk 头顶（① 前）
-            // 协作预载：前半 → DN_H2_S，后半 → DN_H2_K 的高 32 行——载入全程
-            // 与 ① mma + elementwise 并发，② 前的 _syncthreads 即对全块担保
-            // 可见，故 ② 内零新增屏障、零暴露拷贝（实测：把后半的搬运放到
-            // 两半之间 + 2 屏障，比本式再慢 ~20µs/层）。旧路每 tick 每 lane 一条
-            // 8B 全局载（行距 kh_n·kd·2B=4KB，8 warp 各读同一 256B/token ⇒
-            // ×8 冗余 + 全暴露 HBM 延迟）。其余几何单段 n 走旧全局路（ksm 门
-            // 排除了部分 warp 进屏障的死锁）。位级不变：k̂ u64 整搬、δ″/g
-            // 原值、fma 序不动。
+            // 其余几何（含 staged 路）：k̂ 走全局、δ″/g 由参数基址给，单段 n 走
+            // 旧全局流水（位级不变：k̂ u64 整载 → dn_dec4、δ″ F4、g、fma 序不
+            // 动）。ksm 档的 tensor-core 路在上方，不进此处；ksm 门同时保证了
+            // 整块每个 warp 都进屏障（部分 warp 进屏障会死锁）。
             let kstep_g = kh_n * kd; // k̂ 行距（u16 元素/token）
-            let kt = DN_H2_S.as_mut_ptr();
-            let kt1 = DN_H2_K.as_ptr().add(32 * 36 + lane); // 后半 tile[tt*36 + lane]
-            let nseg = if ksm { 2usize } else { 1usize };
-            let mut half = 0usize;
-            while half < nseg {
-                let tb = half * 32;
-                let nh = if !ksm {
-                    n
-                } else if n > tb {
-                    let r = n - tb;
-                    if r > 32 { 32 } else { r }
-                } else {
-                    0
-                };
-                if nh > 0 {
-                    let krow = if !ksm {
-                        d.k.add((t0 + tb) * kstep_g + kh * kd + j4)
-                    } else if half == 0 {
-                        kt.add(lane) as *const u16 // tile[tt*32 + lane]
-                    } else {
-                        kt1 as *const u16
-                    };
-                    // kstep 以 u16 元素计（krow 是 *const u16，载入处再 cast 成
-                    // *const u64）：smem tile 行距 32 u64 = 128 u16、DN_H2_K 行距
-                    // 36 u64 = 144 u16；全局路 = kh_n·kd
-                    let kstep = if !ksm {
-                        kstep_g
-                    } else if half == 0 {
-                        32 * 4
-                    } else {
-                        36 * 4
-                    };
-                    let urow = d.u.add((t0 + tb) * vh * vd + h * vd + vbase + vb0);
-                    dn_h2pipe!(nh, krow, kstep, urow, d.gsc.add(tb));
-                }
-                half += 1;
-            }
+            let krow = d.k.add(t0 * kstep_g + kh * kd + j4);
+            let urow = d.u.add(t0 * vh * vd + h * vd + vbase + vb0);
+            dn_h2pipe!(n, krow, kstep_g, urow, d.gsc);
             for r in 0..VW {
                 let e0 = (vb0 + r) * kd + j4;
                 *(d.s16.add(e0) as *mut u64) = dn_pack4(acc[r]);
@@ -6496,8 +6559,8 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_h(
     v_dim: u32,
     bt: u32,
     vsplit: u32, // v 行切分（1/2/4/8）
-    scratch: *mut f32, // [块, vrows·kd/2 + bt + bt·vrows] f32 槽：
-    // s_mat bf16（前半槽的字节）+ g[bt] + x[bt,vrows]
+    scratch: *mut f32, // [块, vrows·kd/2 + bt + bt·vrows + vrows·kd] f32 槽：
+    // s_mat bf16（前半槽的字节）+ g[bt] + x[bt,vrows] + ② 的 C 增量[vrows,kd]
     w_hi_off: u32, // w hi 图像元素基址（prep 尾打包产物；① 第一条 mma 源）
     w_lo_off: u32, // w lo 残差镜像元素基址（① 第二条 mma 源）
 ) {
@@ -6519,7 +6582,9 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_h(
     let cnt = *row_count.add(r) as usize;
     let nch = udiv(cnt + bts - 1, bts);
     let t = _thread_idx_x() as usize;
-    let sc = scratch.add(bid * (vrows * kd / 2 + bts + bts * vrows));
+    // 每块槽数 = s16 + g + x + ② 的 C 增量[vrows][kd]（只有 ksm 档用末段，但
+    // 步长必须对全档一致——宿主按同式定尺与钳 vsplit）
+    let sc = scratch.add(bid * (vrows * kd / 2 + bts + bts * vrows + vrows * kd));
     let s16 = sc as *mut u16; // bf16 视图占前 vrows·kd/2 槽（vrows·kd 恒偶）
     let gsc = sc.add(vrows * kd / 2);
     let xsc = gsc.add(bts);
