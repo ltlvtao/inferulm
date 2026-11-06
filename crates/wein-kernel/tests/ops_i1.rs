@@ -23,7 +23,7 @@ use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
     AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, Conv1dDwRollOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp,
     DnSplitQkvOp, EmbedOp, GemmOp, MulOp, OpTable, RmsNormGatedOp, RmsNormZcOp, RopePtOp,
-    SigmulOp, SiluMulOp, SiluOp,
+    SigmulOp, SiluMulOp, SiluOp, ZeroRowsOp,
 };
 use wein_kernel::reference;
 use wein_platform::{Device, HardwareProfile};
@@ -950,5 +950,54 @@ fn o36_fused_ops_bitwise() {
         let expect_state =
             reference::conv_state_roll(&x, &st_old, &row_start, &row_count, &row_id, conv_dim, kernel, &specs0);
         assert_bits(&format!("{tag} state vs reference"), &ds2.read_to_vec(), &expect_state);
+    }
+}
+
+/// o39 · 批量行零化（`zero_rows`）：表里每个池的第 `row` 行整行清零、其余行
+/// **逐字节不动**。三池行距/行长各异（4096/1024/512 字节），nblk=1 与 4 两档
+/// 都验——写序无关（全零），终态与逐池 `cuMemsetD8Async` 相同，故可整替代
+/// 行回收/领用的 48 发零化。
+#[test]
+fn o39_zero_rows_bitwise() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    let cfg = [(4096usize, 4usize), (1024, 4), (512, 4)];
+    let mut pats: Vec<Vec<u64>> = Vec::new();
+    let mut pools = Vec::new();
+    for (i, (stride, rows)) in cfg.iter().enumerate() {
+        let n = stride * rows / 8;
+        let pat: Vec<u64> =
+            (0..n).map(|j| 0xdead_0000_0000_0000u64 ^ ((j as u64) << 1) ^ i as u64).collect();
+        pools.push(gpu.alloc_from_slice(&pat));
+        pats.push(pat);
+    }
+    let mut tbl: Vec<u64> = Vec::new();
+    for (p, (stride, _)) in pools.iter().zip(cfg.iter()) {
+        tbl.push(p.device_ptr());
+        tbl.push(*stride as u64 | ((*stride as u64) << 32));
+    }
+    let tbl_buf = gpu.alloc_from_slice(&tbl);
+    for nblk in [1u32, 4] {
+        for (p, pat) in pools.iter().zip(pats.iter()) {
+            p.upload_on(pat, &stream);
+        }
+        t.zero_rows.run(&tbl_buf, 2, cfg.len() as u32, nblk, &stream);
+        stream.sync();
+        for (i, (stride, rows)) in cfg.iter().enumerate() {
+            let back: Vec<u64> = pools[i].read_to_vec();
+            let per = stride / 8;
+            for r in 0..*rows {
+                for j in 0..per {
+                    let got = back[r * per + j];
+                    if r == 2 {
+                        assert_eq!(got, 0, "nblk={nblk} 池{i} 第 2 行未清零 @{j}");
+                    } else {
+                        assert_eq!(got, pats[i][r * per + j], "nblk={nblk} 池{i} 行 {r} 被误写 @{j}");
+                    }
+                }
+            }
+        }
     }
 }

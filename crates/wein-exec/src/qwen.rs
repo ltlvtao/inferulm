@@ -41,7 +41,7 @@ use wein_kernel::ops::{
     AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, Conv1dDwRollOp, ConvStateRollOp,
     DeltanetChunkedOp,
     DeltanetOp, DnSplitQkvOp, EmbedOp, GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormGatedOp,
-    RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluMulOp, SiluOp,
+    RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluMulOp, SiluOp, ZeroRowsOp,
 };
 use wein_kernel::reference;
 use wein_memory::pool::BlockPool;
@@ -60,6 +60,9 @@ use crate::device::{pin, DeviceSession};
 /// （rms 归约/deltanet l2），attn 块容量走行分片（见 kernel `launch_tile`）
 /// 块表/状态行数（串行并发上限；serve 接线时 max_running 须 ≤ 此值）
 const MAX_ROWS: usize = 128;
+/// 行零化 kernel 每池块数（grid = 项数 × 本值；24 层 × 2 池 → 192 块，
+/// 每项 1024 线程覆盖 1MiB/48KiB 行长）
+const ZR_NBLK: u32 = 4;
 /// logits 紧凑表行数：一步里**需要 logits 的行**（decode 行 + 每个 prefill
 /// span 的末行 + 投机链行）落进 `[LG_CAP, vocab]` 这张紧凑表。
 /// 定尺 = decode 桶上限 `MAX_ROWS`(128) 的两倍，给混合步的 prefill span 数
@@ -937,6 +940,10 @@ pub struct Qwen35Executor {
     lin_state: Vec<DevBuf<'static>>,
     /// 24 个线性层 conv 状态池 [MAX_ROWS, 8192,3] bf16
     conv_state: Vec<DevBuf<'static>>,
+    /// 行零化表（`zero_rows` 一发覆盖全部状态池）：[ptr, stride|len<<32] × 项
+    zr_tbl: DevBuf<'static>,
+    /// 表项数（lin_state.len() + conv_state.len()；0 = 无池可零）
+    zr_n: u32,
     /// 8 个全注意力层 KV 池（k/v 成对，层序）
     k_pool: Vec<DevBuf<'static>>,
     v_pool: Vec<DevBuf<'static>>,
@@ -1551,7 +1558,25 @@ impl Qwen35Executor {
             scr.vh.zero_on(session.stream());
         }
 
+        // 行零化表：一次 launch 覆盖 24 层状态池 + 24 层 conv 池（原为 48 发
+        // cuMemsetD8Async，每发都要主机提交一发、把 graph replay 之间的流水打断）
+        let mut zr: Vec<u64> = Vec::with_capacity((lin_state.len() + conv_state.len()) * 2);
+        for (pools, stride) in [(&lin_state, lin_row), (&conv_state, conv_row)] {
+            for b in pools {
+                zr.push(b.device_ptr());
+                zr.push(stride as u64 | (stride as u64) << 32);
+            }
+        }
+        let zr_n = (zr.len() / 2) as u32;
+        if zr.is_empty() {
+            zr.push(0);
+            zr.push(0);
+        }
+        let zr_tbl: DevBuf<'static> = pin!(gpu.alloc_from_slice(&zr));
+
         Ok(Qwen35Executor {
+            zr_tbl,
+            zr_n,
             layers,
             embed,
             norm_f,
@@ -2788,14 +2813,11 @@ impl Qwen35Executor {
 
     /// 行状态零化（回收/抢占）：linear + conv 状态行的区间清零（流序）
     fn zero_row_state(&self, row: u32, stream: &Stream) {
-        let (lr, cr) = (self.lin_row, self.conv_row);
-        let off = row as usize;
-        for s in &self.lin_state {
-            s.zero_range_on(off * lr, lr, stream);
+        if self.zr_n == 0 {
+            return;
         }
-        for s in &self.conv_state {
-            s.zero_range_on(off * cr, cr, stream);
-        }
+        let tb = self.session.table();
+        tb.zero_rows.run(&self.zr_tbl, row, self.zr_n, ZR_NBLK, stream);
     }
 
     // ── radix 前缀缓存（快照原语：行↔槽位 D2D 位拷贝，无重算——
@@ -4828,13 +4850,11 @@ impl Executor for Qwen35Executor {
                 for j in 0..st.blocks.len() {
                     self.bt_host[base + j] = 0;
                 }
-                // 回收行零化（q10 钉）。投机跑过的请求有两个行号：块表行管 KV 页、
-                // 换行落定后的 state_row 管递推状态——都零化、都归还（`admitted`
-                // 领用时还会再零一次，幂等）
-                self.zero_row_state(st.state_row, &self.session.stream());
+                // 行归还**不零化**（q10 合同由 `admitted` 领用时零化保证；这里
+                // 再零一遍纯属重复——每次 25.2MB/48 发）。投机跑过的请求有两个
+                // 行号：块表行管 KV 页、换行落定后的 state_row 管递推状态，都归还
                 self.free_rows.push(st.state_row);
                 if st.row != st.state_row {
-                    self.zero_row_state(st.row, &self.session.stream());
                     self.free_rows.push(st.row);
                 }
             }

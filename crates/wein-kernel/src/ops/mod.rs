@@ -80,6 +80,7 @@ pub struct OpTable<'a> {
     pub rms_norm_zc: RmsNormZcCuda<'a>,
     pub add_norm_zc: AddNormZcCuda<'a>,
     pub dn_split_qkv: DnSplitQkvCuda<'a>,
+    pub zero_rows: ZeroRowsCuda<'a>,
     pub rope_pt: RopePtCuda<'a>,
     pub sigmul: SigmulCuda<'a>,
     pub conv1d_dw: Conv1dDwCuda<'a>,
@@ -227,6 +228,7 @@ impl OpTable<'_> {
             f: m.func("add_norm_zc"),
         };
         let dn_split_qkv = DnSplitQkvCuda { gpu, f: m.func("dn_split_qkv") };
+        let zero_rows = ZeroRowsCuda { gpu, f: m.func("zero_rows") };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
@@ -268,7 +270,7 @@ impl OpTable<'_> {
             }])?,
         )};
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
-            silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, rope_pt, sigmul, conv1d_dw, conv_state_roll,
+            silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, zero_rows, rope_pt, sigmul, conv1d_dw, conv_state_roll,
             conv1d_dw_roll,
             deltanet, deltanet_chunked,
             rms_norm_gated, argmax_rows, sample_rows })
@@ -520,6 +522,28 @@ pub trait DnSplitQkvOp {
         stream: &Stream,
     );
     fn name(&self) -> &'static str;
+}
+
+/// 批量行零化（`zero_rows`）：一次 launch 覆盖表里全部池的一行。
+/// 表项 16B = `ptr: u64` + `stride | len << 32`（宿主侧建表，见 exec）。
+pub trait ZeroRowsOp {
+    fn run(&self, tbl: &DevBuf, row: u32, entries: u32, nblk: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct ZeroRowsCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl ZeroRowsOp for ZeroRowsCuda<'_> {
+    fn run(&self, tbl: &DevBuf, row: u32, entries: u32, nblk: u32, stream: &Stream) {
+        let args = crate::kernel_args![*tbl, row, entries, nblk];
+        self.gpu.launch(&self.f, entries * nblk, 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "zero_rows/cuda"
+    }
 }
 
 pub struct DnSplitQkvCuda<'a> {

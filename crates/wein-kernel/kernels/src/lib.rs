@@ -4748,6 +4748,40 @@ pub unsafe extern "ptx-kernel" fn conv1d_dw_roll(
     }
 }
 
+/// 批量行零化：表里每个池的 `ptr + row·stride` 起 `len` 字节写零——
+/// **一次 launch 覆盖全部状态池**（替代逐池 `cuMemsetD8Async`：24 层状态池 +
+/// 24 层 conv 池 = 48 发 → 1 发）。
+///
+/// 表项 16B：`[ptr: u64][stride: u32 | (len: u32) << 32]`（各池行距/行长可不同）。
+/// 一维 grid：线程 `i` 属于项 `e = i / (nblk·bdim)`、项内槽 `s = i % (nblk·bdim)`，
+/// 以 8B 为单位按 `nblk·bdim` 步进覆盖 `len/8` 个槽——写序无关（全零），
+/// 与 `cuMemsetD8Async` 的语义/终态逐字节相同。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn zero_rows(
+    tbl: *const u64, // [entries][2]
+    row: u32,
+    entries: u32,
+    nblk: u32, // 每项的块数（grid = entries·nblk，bdim 固定 256）
+) {
+    let per = (nblk as usize) * 256;
+    let i = tid() as usize;
+    let e = udiv(i, per);
+    if e >= entries as usize {
+        return;
+    }
+    let ent = tbl.add(e * 2);
+    let base = *ent as usize;
+    let meta = *ent.add(1);
+    let stride = (meta & 0xffff_ffff) as usize;
+    let n8 = (meta >> 32) as usize / 8;
+    let dst = (base + row as usize * stride) as *mut u64;
+    let mut j = urem(i, per);
+    while j < n8 {
+        *dst.add(j) = 0;
+        j += per;
+    }
+}
+
 /// conv 状态滚动：state_out = 请求窗口（旧 state ++ 本段 x）的末 kernel-1 个。
 /// j 升序时读槽位恒 > 写槽位（见 count<3 移位分析）——原地安全
 #[no_mangle]
