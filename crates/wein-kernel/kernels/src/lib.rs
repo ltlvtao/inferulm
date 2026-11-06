@@ -4832,6 +4832,16 @@ unsafe fn dn_row128(
     *core_out.add(vin_ix) = f32_to_bf16(o);
 }
 
+/// deltanet E2 归约交换区（块内 smem，f32）：每 warp 1056 = kvm 528 + o 528，
+/// 最多 8 warp（block=256）。行跨度 33（=32+1）——写（lane s → 行 b）与折叠
+/// 读（lane b → 项 u）两向都落互不相同的 bank。
+/// **为什么不再走全局 scratch**：跨 lane 交换是 128B/行 × 2 趟，全局 mem 上
+/// 是 105MB/趟的 L2 往返（实测纯拷贝 233µs → 只加 kvm 折叠 267µs → 再加 o
+/// 折叠 299µs，正好等于整 kernel 的 300µs：算术几乎全部被带宽吸收，账全在
+/// 这 210MB 的 L2 交换流量上）。smem 同一份 128B/行落在片上。
+#[link_section = ".shared"]
+static mut DN_SX: [f32; 8 * 1056] = [0.0; 8 * 1056];
+
 /// gated deltanet（recurrent correctness-first）：kd=vd=128 走 E2 重映射
 /// （一块 = (行, v 头) × 4 warp，warp 顺序吃 v 行、lane 持 j 切片 u64
 /// 全合并——见 E2 分支内注释）；其余一块 = (请求行, v 头)，一线程一 v 维
@@ -4955,7 +4965,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     k_dim: u32,
     v_dim: u32,
     inv: *const f32, // [tokens*k_heads, 2]——q/k l2norm 倒数（前置 kernel `dn_qk_l2norm` 写，本 kernel 只读）
-    scratch: *mut f32, // [块, 1024]——E2 kvm/o 两级折叠槽（op 预分配，块按 blockIdx 私有）
+    scratch: *mut f32, // [块, 1024]——**仅 spec==1 路径**（MTP 验证链）的 kvm/o 两级折叠槽；spec==0 走块内 smem `DN_SX`
     specs: *const u32, // [rows] 逐 span：0 = 现有语义（逐字不变）；1 = 逐位置 state 行（MTP 验证链）
     vsplit: u32, // E2 chunked：v 行切分数（1 = 不切；grid = rows×v_heads×vsplit）
 ) {
@@ -4967,9 +4977,9 @@ pub unsafe extern "ptx-kernel" fn deltanet(
     // u64 跨步（一线程一 v 行时 32 sector/指令）才是状态流的 LSU/带宽真
     // 瓶颈（探针：全合并 ~880GB/s vs 散射 280-500）；每线程流长度只是
     // 第二变量（2 行/线程仅 +4%，4 行反劣——行驻寄存器串行化在途载入）。
-    // kvm/o 的跨 lane 归约走 global scratch + _syncthreads（nvptx 后端无
-    // shfl/无 smem——block_sum_strided 同习语；kvm/o 分区、(block, warp)
-    // 私有槽），归约树 = 切片内 j 升序 4 项 + 跨 lane u 升序 32 项两级
+    // kvm/o 的跨 lane 归约走**块内 smem**（`DN_SX`，每 warp 1056 f32、
+    // 行跨度 33 —— 写/读两向都落不同 bank）+ _syncthreads（块私有，
+    // (warp, 批) 槽分区），归约树 = 切片内 j 升序 4 项 + 跨 lane u 升序 32 项两级
     // 折叠——reference.rs kd=vd=128 分支同树镜像。kvm/o 分区使跨批覆写
     // 无竞态（下批 kvm 写与本批 o 折叠读不同区，两道屏障序足够）；批
     // 4 行：u64 在途 ×4 藏 DRAM 时延、屏障 16/token；k/q 切片每 token
@@ -5133,11 +5143,12 @@ pub unsafe extern "ptx-kernel" fn deltanet(
         let cnt = *row_count.add(r) as usize;
         let kd_sqrt = core::intrinsics::sqrt::<f32>(kd as f32);
         let sbase = state.add((*row_id.add(r) as usize * vh + h) * vd * kd);
-        // 批 16 行：kvm 槽 16×32/warp，o 槽同量，块内 kvm/o 区各 nwarps×512。
-        // 屏障每批 2 道（kvm→更新、更新→o 折叠）⇒ 每 warp 32 行时 4 道/token
-        // （旧 16 道），每 warp 16 行时 2 道/token
-        let wslot = scratch.add(bid * nwarps * 1024 + w * 512); // kvm 槽（+b·32+lane）
-        let oslot = wslot.add(nwarps * 512); // o 槽区（与 kvm 分区——跨批覆写无竞态）
+        // 归约交换区走**块内 smem**（`DN_SX`，每 warp 1056 f32 = kvm 528 + o
+        // 528；行跨度 33 避开两向 bank 冲突）。批 16 行 ⇒ 每 warp kvm 16×33。
+        // 屏障每批 3 道（kvm 部分和 → lane 分领折叠 → 更新+o 部分和 → o 折叠）
+        let sx = core::ptr::addr_of_mut!(DN_SX) as usize;
+        let wslot = core::ptr::with_exposed_provenance_mut::<f32>(sx + w * 1056 * 4); // kvm 槽（+b·33+lane）
+        let oslot = wslot.add(528); // o 槽区（同 warp 内紧接 kvm 区——跨批覆写无竞态）
         let mut i = 0usize;
         while i < cnt {
             let g = st + i;
@@ -5216,7 +5227,9 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             // 与块↔工作的调度映射；返回值 = 新 S0 的 u64 字（供调用处回写）
             macro_rules! dn_e2 {
                 ($ww:expr, $vr:expr, $b:literal) => {{
-                    let kvm = fold32!(wslot.add($b * 32));
+                    // kvm 的第二级折叠已由上一趟的 lane 分领折叠算好并就地写在
+                    // 本行槽首（`*wslot.add($b*33)`）——各 lane 广播读同一个字
+                    let kvm = *wslot.add($b * 33);
                     let vin = bf16_to_f32(*v.add($vr));
                     let delta = (vin - kvm) * beta;
                     let (lo, hi) = ($ww as u32, ($ww >> 32) as u32);
@@ -5229,7 +5242,7 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     o = fma(f32::from_bits(r1), (q1 * invq) / kd_sqrt, o);
                     o = fma(f32::from_bits(r2), (q2 * invq) / kd_sqrt, o);
                     o = fma(f32::from_bits(r3), (q3 * invq) / kd_sqrt, o);
-                    *oslot.add($b * 32 + s) = o;
+                    *oslot.add($b * 33 + s) = o;
                     // 新状态回寄存器：lane0 ← r0>>16；lane1 已在位；
                     // lane2 ← r2<<16；lane3 ← r3<<32（与原存储字逐位同）
                     (r0 >> 16) as u64 | r1 as u64 | (r2 as u64) << 16 | (r3 as u64) << 32
@@ -5244,40 +5257,53 @@ pub unsafe extern "ptx-kernel" fn deltanet(
                     kvm = fma(f32::from_bits(lo & 0xffff_0000) * decay, k1 * invk, kvm);
                     kvm = fma(f32::from_bits(hi << 16) * decay, k2 * invk, kvm);
                     kvm = fma(f32::from_bits(hi & 0xffff_0000) * decay, k3 * invk, kvm);
-                    *wslot.add($b * 32 + s) = kvm;
+                    *wslot.add($b * 33 + s) = kvm;
                 }};
             }
-            // 批 n 行（rows_pw / n 批 ⇒ 屏障 2 道/批）：kvm 趟 →（屏障）→
-            // 更新趟 + o 部分和（屏障）→ o 折叠 + core_out。scratch 槽位是批内
-            // 行号 0..n-1（warp 私有区，槽址 = b·32 + lane）。**每行自己的
-            // kvm/o 折叠算术序一个字不动**（切片内 j 升序 4 项 + 跨 lane u 升序
-            // 32 项两级折叠，16/8/4 行批逐字同式）——变的只是分组：同批共一道
-            // 屏障、S0 一次取齐 n 行（u64 在途 ×n vs 旧 4）。
-            // o 折叠仍是 4 行一组、lane 0..3 分领（32 lanes 分领时 o 槽 128B
-            // 跨步打点组过大，实测更慢且无必要——行内 u 升序折叠序不变）。
+            // 批 n 行（rows_pw / n 批）：kvm 趟 →（屏障）→ **lane 分领折叠**
+            // →（屏障）→ 更新趟 + o 部分和 →（屏障）→ o 折叠 + core_out。
+            // 交换槽位是批内行号 0..n-1（warp 私有区，块内 smem，槽址 = b·33 + lane）。
+            // **每行自己的 kvm/o 折叠算术序一个字不动**（切片内 j 升序 4 项 +
+            // 跨 lane u 升序 32 项两级折叠，16/8/4 行批逐字同式）。
             //
-            // 批内行号 / o 组首行号由宏参数列表给**字面量**：`[u64;16]` 的常量
-            // 下标 ⇒ SROA 提到寄存器（动态下标会落 local memory，见上）。
+            // 第二级折叠的**执行者**从"每个 lane 各折一遍同一行"改成
+            // "lane b 折第 b 行"：两项归约的 32 项链形状/加法序逐字不变，
+            // 只是把 n 行折叠加到同一组 32 条 LDG+FADD 指令上（原来一行要
+            // 32 LDG + 32 FADD 且每 lane 冗余算，n 行 ⇒ 64n 条；现在 64 条盖
+            // 全批）。SASS 实测旧批循环 130 指令/行里 64 条（49%）是这个冗余
+            // 折叠——本刀把它压到 ~5 条/行。代价：折叠结果要广播（lane b 把
+            // kvm 标量写回本行槽首 wslot[b·33]，屏障后各 lane 各读自己那行的
+            // 一个字，广播寻址 = 1 sector），故每批多一道屏障（3 道/批）。
+            //
+            // 批内行号由宏参数列表给**字面量**：`[u64;16]` 的常量下标 ⇒
+            // SROA 提到寄存器（动态下标会落 local memory，见上）。
             macro_rules! dn_batch {
-                ($vr:expr, [$($r:literal)*], [$($g:literal)*]) => {{
+                ($vr:expr, $nb:literal, [$($r:literal)*]) => {{
                     let vrow = $vr;
                     let mut sw = [0u64; 16];
                     // kvm 趟：n 行的 S0 一次取齐（u64 在途 ×n 藏 DRAM 时延；行
                     // stride 256B），每行的 kvm 部分和按切片内 j 升序 4 项折叠
-                    // 落槽（逐字同 4 行批）
+                    // 落槽
                     $( sw[$r] = *(sbase.add((vrow + $r) * kd + s * 4) as *const u64); )*
                     $( kvm4e!(sw[$r], $r); )*
+                    _syncthreads();
+                    // 第二级折叠（kvm）：lane b 折第 b 行（s < n），槽基址 =
+                    // 本行槽首（lane 相关），u 升序 32 项立即数偏移；结果就地
+                    // 写回本行槽首（本 lane 独占该行，随后各 lane 广播读回）
+                    if s < $nb {
+                        let acc = fold32!(wslot.add(s * 33));
+                        *wslot.add(s * 33) = acc;
+                    }
                     _syncthreads();
                     // 更新趟：直接用持有的 sw[..]（S0 一行只读一次——状态流 2 趟）
                     $( { let nw = dn_e2!(sw[$r], obase + vrow + $r, $r);
                          sw[$r] = nw;
                          *(sbase.add((vrow + $r) * kd + s * 4) as *mut u64) = nw; } )*
                     _syncthreads();
-                    // o 两级折叠第二级 + core_out 落点：4 行一组由 lane 0..3
-                    // 分领（访问形态与旧 4 行批逐字同）
-                    if s < 4 {
-                        $( { let o = fold32!(oslot.add(($g + s) * 32));
-                             *core_out.add(obase + vrow + $g + s) = f32_to_bf16(o); } )*
+                    // o 第二级折叠 + core_out 落点：同 lane 分领（lane b → 行 b）
+                    if s < $nb {
+                        let o = fold32!(oslot.add(s * 33));
+                        *core_out.add(obase + vrow + s) = f32_to_bf16(o);
                     }
                 }};
             }
@@ -5286,17 +5312,17 @@ pub unsafe extern "ptx-kernel" fn deltanet(
             let mut vrow = vbase + w * rows_pw;
             if rows_pw >= 16 {
                 while vrow < vbase + (w + 1) * rows_pw {
-                    dn_batch!(vrow, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15], [0 4 8 12]);
+                    dn_batch!(vrow, 16, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]);
                     vrow += 16;
                 }
             } else if rows_pw >= 8 {
                 while vrow < vbase + (w + 1) * rows_pw {
-                    dn_batch!(vrow, [0 1 2 3 4 5 6 7], [0 4]);
+                    dn_batch!(vrow, 8, [0 1 2 3 4 5 6 7]);
                     vrow += 8;
                 }
             } else {
                 while vrow < vbase + (w + 1) * rows_pw {
-                    dn_batch!(vrow, [0 1 2 3], [0]);
+                    dn_batch!(vrow, 4, [0 1 2 3]);
                     vrow += 4;
                 }
             }

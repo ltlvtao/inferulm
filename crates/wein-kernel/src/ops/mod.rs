@@ -791,7 +791,10 @@ pub struct DeltanetCuda<'a> {
     /// 前置 l2norm kernel（`dn_qk_l2norm`）
     l2f: Func,
     /// E2 warp 归约 scratch：[DELTA_BLOCK_CAP, 4096] f32（kvm/o 两区各 2048），
-    /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配
+    /// block 按 blockIdx 私有槽——resolve 一次预分配，capture 期零分配。
+    /// **只有 spec==1（MTP 验证链）路径用**：spec==0 的 kvm/o 两级折叠已改走
+    /// 块内 smem（kernel 里的 `DN_SX`，同几何同归约树），全局 scratch 那 210MB
+    /// L2 往返正是 decode 单发 313µs→242µs 的全部来源
     scratch: DevBuf<'a>,
     /// invq/invk 缓冲：[DELTA_L2_TOKENS_CAP × DELTA_L2_KHEADS_CAP, 2] f32
     /// （= 每 token 每层 2×k_heads 个 f32：kh=16 时 128 B/token/层，250 token
@@ -845,8 +848,13 @@ impl DeltanetOp for DeltanetCuda<'_> {
         self.gpu.launch(&self.l2f, n.div_ceil(DELTA_L2_BLOCK_DIM), DELTA_L2_BLOCK_DIM, &l2args, stream);
         // 块几何自带：kd=vd=128 走 E2（一块=(行, v 头)×128 线程=4 warp，
         // warp 顺序吃 v 行、lane 持 j 切片 u64——warp 指令 256B 全合并；
-        // kvm/o 归约走 scratch 两级折叠）；其余一块 = (行, v 头)、
+        // kvm/o 归约走**块内 smem** 两级折叠）；其余一块 = (行, v 头)、
         // block 宽 = v_dim（kernel 侧同条件分支）
+        // 实测（`examples/dn_dec_probe.rs`，m=100×32×128²）：本几何（vsplit=1、
+        // bdim=128）就是最好档位——纯状态流上限 233µs，本 kernel 236µs；
+        // bdim=256 → 249µs、vsplit=2/4 → 253/280µs（多块重复读 q/k + 短块），
+        // 所以 decode 的 `base = n_rows·v_heads = 3200 ≥ DELTA_SPLIT_MAX_BLOCKS`
+        // 直接给 sp=1 是对的，别为"更多块"去切。
         let e2 = k_dim == 128 && v_dim == 128;
         // ── B 档 chunked 的自适应门（仅 E2）──
         // ① 容量：块数 rows×v_heads×vsplit ≤ DELTA_BLOCK_CAP（块私有 scratch 槽）
