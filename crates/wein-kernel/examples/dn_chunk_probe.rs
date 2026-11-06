@@ -57,7 +57,8 @@ fn main() {
     let s = gpu.stream();
 
     let (kh, vh, kd, vd) = (16usize, 32usize, 128usize, 128usize);
-    let (n_rows, tpr) = (1usize, 6009usize);
+    let tpr_env: usize = std::env::var("WEIN_T").ok().and_then(|v| v.parse().ok()).unwrap_or(6009);
+    let (n_rows, tpr) = (1usize, tpr_env);
     let tokens = n_rows * tpr;
     let layers = 24usize;
     let iters = 20usize;
@@ -196,6 +197,40 @@ fn main() {
             tot * layers as f64 / 1000.0
         );
     }
+    // ── h 几何扫参：bdim × vsplit（h 单 kernel 计时）──
+    //   w 冗余读 = vsplit 倍（同 (行,v头) 的 sp 个块各读一份 w hi/lo）；
+    //   warps/SM 由 bdim 定。总 warp 数 = nr·vh·sp·(bdim/32)。
+    eprintln!("\n  h 几何扫参（µs/层；w 冗余 = vsplit 倍）");
+    for &sp in &[1u32, 2, 4, 8] {
+        let vrows = vd / sp as usize;
+        for &bd in &[128u32, 256] {
+            if (bd as usize / 32) > vrows {
+                continue; // warp 数 > v 行数 ⇒ 空转
+            }
+            // bdim≥512：255 regs × 512 > 65536 ⇒ 资源不足，不可行（除非压 regs）
+            let a3 = wein_kernel::kernel_args![dk, inv, gcum, du, dw, snap, dstate,
+                drs, drc, dri, dsn, nr, tkh, tvh, tkd, tvd, btu, sp, sc2, w_hi_off, w_lo_off];
+            let hsm = if bd == 128 { 0u32 } else { 69632 };
+            for _ in 0..3 {
+                gpu.launch_smem(&f_h, nr * tvh * sp, bd, hsm, &a3, &s);
+            }
+            s.sync();
+            let (eh0, eh1) = (gpu.event(), gpu.event());
+            eh0.record_on(&s);
+            for _ in 0..iters {
+                gpu.launch_smem(&f_h, nr * tvh * sp, bd, hsm, &a3, &s);
+            }
+            eh1.record_on(&s);
+            s.sync();
+            let us = eh1.elapsed_ms(&eh0) as f64 / iters as f64 * 1000.0;
+            eprintln!(
+                "  sp={sp:<2} bdim={bd:<5} blocks={:<4} warps/total={:<5} h {us:8.2}",
+                nr * tvh * sp,
+                nr as u32 * tvh * sp * (bd / 32),
+            );
+        }
+    }
+
     // 状态流量账（千倍削减的对外数字）
     let traffic_mb = (chunks * vh * 3 * vd * kd * 2) as f64 / 1e6;
     let floor_ms = traffic_mb * 2.0 / 1e3 / bw * layers as f64; // 快照写+读两趟近似
