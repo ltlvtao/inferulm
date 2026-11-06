@@ -11,7 +11,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
@@ -348,6 +348,11 @@ impl EngineCore {
         // 不是提交时——超容请求在 waiting 排队不占执行器行（e5）。首次准入
         // 即消费；抢占重准入不再触发（exec 保留行/状态走 recompute）
         let mut prompts: HashMap<RequestId, Vec<u32>> = HashMap::new();
+        // 步内相位计（WEIN_LOOP_PROF=1）：把"GPU 空档里主机干了什么"拆开印。
+        // [plan, exec.step, token 分发, 尾部(pump/retain/记账)]，每 100 步一行
+        let lp = std::env::var_os("WEIN_LOOP_PROF").is_some();
+        let mut lp_acc = [0f64; 4];
+        let mut lp_n = 0u32;
 
         while let Some(cmd) = cmd_rx.recv().await {
             Self::handle(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec, cmd);
@@ -363,6 +368,7 @@ impl EngineCore {
                 // 两段式：准入相位 → 回放事件（建行 + 前缀命中对账 + 完成
                 // 回收）→ 规划相位。命中必须在规划之前进账：晚一步本步预算
                 // 会按未命中的债切 chunk，执行器按真实游标少喂 → 两侧漂移
+                let tp0 = if lp { Some(Instant::now()) } else { None };
                 sched.advance();
                 // 事件先于 exec.step：本步新准入者先建行（exec.admitted）
                 // 再进前向——否则 step 查不到行会静默空转
@@ -387,8 +393,11 @@ impl EngineCore {
                 // 调度器 plan() 每步只记 1 个；第 2 个起在此按真实发射补账
                 // （sched.on_emitted），额度耗尽/已终止则丢弃该 token——请求
                 // 随即以 Length 完成（执行器内部序列可能多推进，但已终结）。
+                let tp1 = Instant::now();
+                let step_out = exec.step(&plan);
+                let tp2 = Instant::now();
                 let mut emitted: HashMap<ReqId, u32> = HashMap::new();
-                for (id, tok) in exec.step(&plan) {
+                for (id, tok) in step_out {
                     let n = emitted.entry(id).or_insert(0);
                     if *n > 0 && (!senders.contains_key(&id) || !sched.on_emitted(id)) {
                         continue; // 已停止（停止词/取消）或超额：丢弃不外吐
@@ -415,6 +424,7 @@ impl EngineCore {
                         sched.cancel(id);
                     }
                 }
+                let tp3 = Instant::now();
                 // 执行器请求级失败（页池耗尽/vocab 越界/位置越界…）：**不 panic**，
                 // 只终结该请求。放在本步 token 发射之后：同批其他请求的 token
                 // 已经出去了，不受影响
@@ -447,6 +457,25 @@ impl EngineCore {
                 let keep: Vec<ReqId> = senders.keys().copied().collect();
                 exec.retain(&keep);
                 sched.capacity_mut().step_end();
+                if let Some(p0) = tp0 {
+                    lp_acc[0] += (tp1 - p0).as_secs_f64() * 1e3;
+                    lp_acc[1] += (tp2 - tp1).as_secs_f64() * 1e3;
+                    lp_acc[2] += (tp3 - tp2).as_secs_f64() * 1e3;
+                    lp_acc[3] += (Instant::now() - tp3).as_secs_f64() * 1e3;
+                    lp_n += 1;
+                    if lp_n == 100 {
+                        eprintln!(
+                            "[loop] 100 步均值：前进/规划 {:.3} + exec.step {:.3} + 分发 {:.3} + 尾部 {:.3} = {:.3}ms",
+                            lp_acc[0] / 100.0,
+                            lp_acc[1] / 100.0,
+                            lp_acc[2] / 100.0,
+                            lp_acc[3] / 100.0,
+                            (lp_acc[0] + lp_acc[1] + lp_acc[2] + lp_acc[3]) / 100.0
+                        );
+                        lp_acc = [0f64; 4];
+                        lp_n = 0;
+                    }
+                }
             }
         }
         // cmd_tx 全部 drop = 引擎关闭；senders 随之 drop，事件流自然关闭

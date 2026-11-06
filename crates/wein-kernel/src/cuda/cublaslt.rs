@@ -397,7 +397,13 @@ impl BlasLt<'_> {
         valid: &[HeuristicResult],
         stream: &Stream,
     ) -> [u64; 8] {
-        let ws0_pref = std::env::var("WEIN_LT_WS0").map(|v| v != "0").unwrap_or(true);
+        let ws0_mode = std::env::var("WEIN_LT_WS0").unwrap_or_default();
+        let ws0_pref = ws0_mode != "0";
+        // strict：不接受任何带工作区的 algo（时间损失不设上限）。动机：图内
+        // 每个带工作区的 gemm 会多出 memset 节点，而图回放里 **memset 节点
+        // 单价 5.4µs**（kernel 节点只 0.10µs）——几十 µs 的 gemm 为 3% 的
+        // 时间优势换来 5-10µs 发射税是净亏
+        let ws0_strict = ws0_mode == "strict";
         if capturing() {
             let rec = GemmTuneRecord { m, n, k, wt, candidates: 0, argmin: 0, chosen: 0, best_ms: 0.0, first_ms: 0.0, ws: valid[0].workspace_size };
             self.report.borrow_mut().push(rec);
@@ -442,9 +448,16 @@ impl BlasLt<'_> {
                 .filter(|&&(vi, _)| valid[vi].workspace_size == 0)
                 .min_by(|x, y| x.1.total_cmp(&y.1))
             {
-                if w0_ms <= best_ms * 1.03 {
+                let tol = if ws0_strict { f64::INFINITY } else { 1.03 };
+                if w0_ms <= best_ms * tol {
                     chosen = w0;
                 }
+            }
+        }
+        // strict 兜底：前 4 候选全带工作区 → 从完整候选集取第一个 ws==0
+        if ws0_strict && valid[chosen].workspace_size > 0 {
+            if let Some(vi) = valid.iter().position(|r| r.workspace_size == 0) {
+                chosen = vi;
             }
         }
         let rec = GemmTuneRecord { m, n, k, wt, candidates: timings.len(), argmin, chosen, best_ms, first_ms, ws: valid[chosen].workspace_size };

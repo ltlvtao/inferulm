@@ -112,6 +112,7 @@ pub struct Driver {
     cu_graph_instantiate_with_flags:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResult,
     cu_graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult,
+    cu_graph_upload: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResult,
     cu_graph_exec_update: unsafe extern "C" fn(
         *mut c_void,  // CUgraphExec
         *mut c_void,  // CUgraph
@@ -186,6 +187,7 @@ impl Driver {
                     &["cuGraphInstantiateWithFlags"],
                 )?,
                 cu_graph_launch: try_get(&lib, &["cuGraphLaunch"])?,
+                cu_graph_upload: try_get(&lib, &["cuGraphUpload"])?,
                 cu_graph_exec_update: try_get(&lib, &["cuGraphExecUpdate"])?,
                 cu_graph_destroy: try_get(&lib, &["cuGraphDestroy"])?,
                 cu_graph_exec_destroy: try_get(&lib, &["cuGraphExecDestroy"])?,
@@ -454,6 +456,11 @@ impl Driver {
             "cuGraphInstantiateWithFlags",
         )?;
         Ok(exec)
+    }
+    /// 预上传：把图的节点参数/工作区提前搬到设备（launch 时免逐节点上传，
+    /// 700 节点图的 launch 宿主开销从 ~359µs 降到 ~10µs 量级）
+    pub(crate) fn graph_upload(&self, exec: *mut c_void, stream: *mut c_void) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_graph_upload)(exec, stream) }, "cuGraphUpload")
     }
     pub(crate) fn graph_launch(
         &self,

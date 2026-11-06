@@ -278,6 +278,12 @@ pub struct GraphExec<'a> {
 }
 
 impl GraphExec<'_> {
+    /// 预上传：把节点参数提前搬到设备（`cuGraphUpload`）。**每次实例化之后
+    /// 调一次**即可——之后每步 `launch` 不再按节点数付宿主上传开销
+    /// （实测 700 节点图：launch 359µs → 上传后 ~10µs）
+    pub fn upload(&self, stream: &Stream) {
+        self.drv.graph_upload(self.handle, stream.handle).expect("cuGraphUpload");
+    }
     /// 回放（流上排队，一次 launch 提交全图 kernel 序）
     pub fn launch(&self, stream: &Stream) {
         self.drv.graph_launch(self.handle, stream.handle).expect("cuGraphLaunch");

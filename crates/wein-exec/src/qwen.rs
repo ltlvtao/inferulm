@@ -28,7 +28,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 对拍钩子的 run_forward 调用计数（s1=预填批，s2..=解码步）
@@ -1785,6 +1785,7 @@ impl Qwen35Executor {
                 &self.scr.logits, &fx_rows, &self.scr.am_scratch, &self.scr.am_out, voc, b, stream,
             );
             let exec: GraphExec<'static> = pin!(stream.end_capture().instantiate());
+            exec.upload(stream);
             execs.push(exec);
             // 采样版图：同一条前向 + argmax + 图内 sample_rows（RNG 状态常驻
             // 设备缓冲、图内前进；参数缓冲的初值全 greedy ⇒ 捕获期就是一次
@@ -1811,6 +1812,7 @@ impl Qwen35Executor {
                 stream,
             );
             let exec_smp: GraphExec<'static> = pin!(stream.end_capture().instantiate());
+            exec_smp.upload(stream);
             execs_smp.push(exec_smp);
         }
         stream.sync();
@@ -4201,6 +4203,8 @@ impl Qwen35Executor {
         }
         // 采样参数整桶覆写（尾部 greedy：temp=0 的 sink 行不进 RNG、不采样）
         let stream = self.session.stream();
+        let p2 = prof2_on();
+        let mut tk = [std::time::Instant::now(); 5];
         if any_smp {
             let mut st = vec![0f32; cap];
             let mut sk = vec![64u32; cap];
@@ -4222,6 +4226,9 @@ impl Qwen35Executor {
             self.scr.sm_seed.upload_prefix_on(&sd, stream);
             self.scr.sm_slots.upload_prefix_on(&ss, stream);
         }
+        if p2 {
+            tk[0] = std::time::Instant::now();
+        }
         {
             let g = self.graph.as_ref().expect("forward_graph 须图档");
             g.in_ids.upload_on(&ids, stream);
@@ -4230,13 +4237,22 @@ impl Qwen35Executor {
             g.in_rid.upload_on(&rid, stream);
             // 页保证已先于本调用完成（step/generate 合同）——bt_host 是最新账
             g.in_bt.upload_on(&self.bt_host, stream);
+            if p2 {
+                tk[1] = std::time::Instant::now();
+            }
             if any_smp {
                 g.execs_smp[b_idx].launch(stream);
             } else {
                 g.execs[b_idx].launch(stream);
             }
         }
+        if p2 {
+            tk[2] = std::time::Instant::now();
+        }
         stream.sync();
+        if p2 {
+            tk[3] = std::time::Instant::now();
+        }
         {
             let g = self.graph.as_mut().unwrap();
             g.replays += 1;
@@ -4258,8 +4274,53 @@ impl Qwen35Executor {
                 }
             }
         }
+        if p2 {
+            tk[4] = std::time::Instant::now();
+            prof2_add(0, tk[1] - tk[0]);
+            prof2_add(1, tk[2] - tk[1]);
+            prof2_add(2, tk[3] - tk[2]);
+            prof2_add(3, tk[4] - tk[3]);
+            prof2_maybe_print();
+        }
         out[..m].to_vec()
     }
+}
+
+// ---- 图档步内相位计（WEIN_STEP_PROF2=1，仅诊断）----
+static LP2: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static LP2N: AtomicU64 = AtomicU64::new(0);
+
+fn prof2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEIN_STEP_PROF2").is_some())
+}
+
+fn prof2_add(slot: usize, d: std::time::Duration) {
+    LP2[slot].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// 相位累加满 100 步印一行：上传 / launch / sync(等 GPU) / 回读 am / 回读 sm
+fn prof2_maybe_print() {
+    let n = LP2N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100 != 0 {
+        return;
+    }
+    let us = |i: usize| LP2[i].load(Ordering::Relaxed) as f64 / n as f64 / 1e3;
+    eprintln!(
+        "[graph] {n} 步均值(µs)：上传 {:.1} + launch {:.1} + sync {:.1} + 回读 {:.1} = {:.1}（非 GPU {:.1}）",
+        us(0),
+        us(1),
+        us(2),
+        us(3) + us(4),
+        us(0) + us(1) + us(2) + us(3) + us(4),
+        us(0) + us(1) + us(3) + us(4)
+    );
 }
 
 // ---- 布局常量辅助（open 期与运行期共用）----
