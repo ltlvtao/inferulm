@@ -72,9 +72,11 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry sigmul("), "sigmul 入口缺失/被改名");
     assert!(ptx.contains(".entry conv1d_dw("), "conv1d_dw 入口缺失/被改名");
     assert!(ptx.contains(".entry conv_state_roll("), "conv_state_roll 入口缺失/被改名");
+    assert!(ptx.contains(".entry conv1d_dw_roll("), "conv1d_dw_roll 入口缺失/被改名");
     assert!(ptx.contains(".entry deltanet("), "deltanet 入口缺失/被改名");
     assert!(ptx.contains(".entry rms_norm_gated("), "rms_norm_gated 入口缺失/被改名");
-    assert!(ptx.contains(".entry argmax_rows("), "argmax_rows 入口缺失/被改名");
+    assert!(ptx.contains(".entry argmax_rows_p1("), "argmax_rows_p1 入口缺失/被改名");
+    assert!(ptx.contains(".entry argmax_rows_p2("), "argmax_rows_p2 入口缺失/被改名");
     // 设备端采样器（需求刀 1）
     assert!(ptx.contains(".entry sample_rows("), "sample_rows 入口缺失/被改名");
     // 长序列分块 attention（KV 复用几何）三入口：两遍 + 单遍在线 + 分片合并
@@ -132,8 +134,8 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry paged_attn_v9("), "paged_attn_v9 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        65,
-        "导出 kernel 数应为 65（64 + v9 档 1）"
+        67,
+        "导出 kernel 数应为 67（65 + argmax 两级切片的 p2 + conv 融合档）"
     );
 }
 

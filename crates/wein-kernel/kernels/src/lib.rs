@@ -4442,26 +4442,27 @@ pub unsafe extern "ptx-kernel" fn attn_combine(
 // 零中心 norm / partial rope / 门控乘 / 深度因果卷积 / gated deltanet /
 // 带门 RMSNorm / 设备端 argmax——数值对齐纪律与上文同守。
 
-/// 行平方和的跨线程归约：scratch 是 kernel 参数（op 预分配，每 block 按
-/// blockIdx 私有槽 row*bdim）——stdarch nvptx 三条跨线程通道全断：
-/// 无 shfl intrinsic、asm! 未实现（无寄存器类）、`#[link_section=".shared"]`
-/// 被 rustc 后端忽略（static 落 .global 模块级，并发 block 互踩）。
+/// 行平方和的跨线程归约（**块内 smem 交换区**，per-block 私有）。
+///
 /// 线程 t 跨步占有元素 {t, t+bdim, ...}（连续线程连续地址——合并访存），
-/// 部分和 i 升序；`_syncthreads`（CUDA 语义 = 块内含 global 的可见性
-/// 屏障）后线程 0 顺序合并 u 升序 `total = s[u] + total`——reference.rs
-/// 按同式同序标量镜像（位对齐合同保持）
+/// 部分和 i 升序；`_syncthreads` 后线程 0 顺序合并 u 升序
+/// `total = s[u] + total`——reference.rs 按同式同序标量镜像（位对齐合同保持）。
+///
+/// **为什么从全局 scratch 搬 smem**：stdarch nvptx 无 shfl、无块内指针通用的
+/// 归约通道，早先只能借 `scratch` 全局槽（每块 1KB 写 + 1KB 读，每读一条
+/// 吃一次 L2 时延，256 条串在循环回边上）。`#[link_section=".shared"]` 静态
+/// 经 build.rs 的 smem 改写落成**块私有**段（deltanet 的 `DN_SX` 同款），
+/// 于是同一份部分和落在片上：写/读都是 LDS，线程 0 的折叠只剩 f32 加法链。
+/// **归约序一个字没动**（u 升序、`s[u] + total`）⇒ 位同。
+#[link_section = ".shared"]
+static mut NRM_S: [f32; 256] = [0.0; 256];
+
 #[inline(always)]
-unsafe fn block_sum_strided(
-    x: *const u16,
-    scratch: *mut f32,
-    row: usize,
-    base: usize,
-    h: usize,
-    t: usize,
-    bdim: usize,
-) -> f32 {
+unsafe fn block_sum_strided(x: *const u16, base: usize, h: usize, t: usize, bdim: usize) -> f32 {
     unsafe {
-        let slot = scratch.add(row * bdim);
+        let sp = core::ptr::with_exposed_provenance_mut::<f32>(
+            core::ptr::addr_of_mut!(NRM_S) as usize,
+        );
         let mut acc = 0.0f32;
         let mut i = t;
         while i < h {
@@ -4469,19 +4470,29 @@ unsafe fn block_sum_strided(
             acc = fma(v, v, acc);
             i += bdim;
         }
-        *slot.add(t) = acc;
+        *sp.add(t) = acc;
+        // 块宽 < 256 时把 [bdim, 256) 的闲槽铺 0：`+0.0` 对非负部分和
+        // （平方和恒 ≥ +0）精确 ⇒ 展开到 256 项的归约序与"只到 bdim"逐位同
+        let mut z = t + bdim;
+        while z < 256 {
+            *sp.add(z) = 0.0;
+            z += bdim;
+        }
         _syncthreads();
         if t == 0 {
             let mut total = 0.0f32;
             let mut u = 0usize;
-            while u < bdim {
-                total = *slot.add(u) + total;
-                u += 1;
+            while u < 256 {
+                total = *sp.add(u) + total;
+                total = *sp.add(u + 1) + total;
+                total = *sp.add(u + 2) + total;
+                total = *sp.add(u + 3) + total;
+                u += 4;
             }
-            *slot = total;
+            *sp.add(0) = total;
         }
         _syncthreads();
-        *slot
+        *sp
     }
 }
 
@@ -4497,7 +4508,6 @@ pub unsafe extern "ptx-kernel" fn rms_norm_zc(
     hidden: u32,
     eps: f32,
     rows: u32,
-    scratch: *mut f32,
 ) {
     let row = _block_idx_x() as usize;
     if row >= rows as usize {
@@ -4507,7 +4517,7 @@ pub unsafe extern "ptx-kernel" fn rms_norm_zc(
     let bdim = _block_dim_x() as usize;
     let h = hidden as usize;
     let base = row * h;
-    let total = unsafe { block_sum_strided(x, scratch, row, base, h, t, bdim) };
+    let total = unsafe { block_sum_strided(x, base, h, t, bdim) };
     let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
     let mut i = t;
     while i < h {
@@ -4532,7 +4542,6 @@ pub unsafe extern "ptx-kernel" fn add_norm_zc(
     hidden: u32,
     eps: f32,
     rows: u32,
-    scratch: *mut f32,
 ) {
     let row = _block_idx_x() as usize;
     if row >= rows as usize {
@@ -4550,7 +4559,7 @@ pub unsafe extern "ptx-kernel" fn add_norm_zc(
             i += bdim;
         }
         // 写/读同线程同地址（同跨步占有）——无需屏障即读到自写值
-        let total = block_sum_strided(sum_out, scratch, row, base, h, t, bdim);
+        let total = block_sum_strided(sum_out, base, h, t, bdim);
         let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
         let mut i = t;
         while i < h {
@@ -4684,6 +4693,59 @@ pub unsafe extern "ptx-kernel" fn conv1d_dw(
     let conv = f32_to_bf16(acc);
     let v = bf16_to_f32(conv);
     *out.add(g * cd + c) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+}
+
+/// conv1d_dw + conv_state_roll **合一**（纯 decode 档：每段恰 1 token、
+/// 无投机链）。两发原本读同一块 conv 状态：`conv1d_dw` 用窗口算 depthwise
+/// 卷积、`conv_state_roll` 把窗口前移并写入新 v——合一后**新 token 只读一次**
+/// （省 1 份 x 流量），且状态只过一遍。
+///
+/// 位级合同（纯 decode 的等价推导）：
+/// - conv：段内局部位置 p ≡ 0 ⇒ `idx = p − (k−1) + k' = k' − st`，
+///   `k' < st` 取旧状态槽 `k'`、`k' == st` 取 x[g]——与本线程读的
+///   `state[row, c, k']` 同址，累加式 `acc = v·w + acc`（k′ 升序）逐字保留；
+/// - 滚动：`idx = count − st + j = 1 − st + j`，`j < st−1` 取旧槽 `j+1`、
+///   `j == st−1` 取 x[g]——j 升序读写恒"读槽 > 写槽"，原地安全（同旧 kernel）。
+///
+/// 状态写回必须用**原始 qkv**（conv 前）——`xv` 直接取自 x，不碰 conv 输出。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn conv1d_dw_roll(
+    x: *const u16,        // [tokens, conv_dim]（conv 前原始 qkv）
+    w: *const u16,        // [conv_dim, kernel]
+    state: *mut u16,      // [rows, conv_dim, kernel-1] 原地，行号经 tok_row 间接
+    out: *mut u16,        // [tokens, conv_dim]
+    tok_row: *const u32,  // [tokens] → 状态行
+    conv_dim: u32,
+    kernel: u32,
+    tokens: u32,
+) {
+    let cd = conv_dim as usize;
+    let ks = kernel as usize;
+    let st = ks - 1;
+    let i = tid() as usize;
+    if i >= tokens as usize * cd {
+        return;
+    }
+    let (g, c) = (udiv(i, cd), urem(i, cd));
+    let row = *tok_row.add(g) as usize;
+    let sb = state.add(row * cd * st + c * st);
+    let xv = *x.add(g * cd + c); // 新 token（段内局部位置 0）
+    let mut acc = 0.0f32;
+    let mut k = 0usize;
+    while k < ks {
+        let v = if k < st { bf16_to_f32(*sb.add(k)) } else { bf16_to_f32(xv) };
+        acc = v * bf16_to_f32(*w.add(c * ks + k)) + acc;
+        k += 1;
+    }
+    let conv = f32_to_bf16(acc);
+    let v = bf16_to_f32(conv);
+    *out.add(g * cd + c) = f32_to_bf16(v * (1.0f32 / (1.0f32 + expf(-v))));
+    // 状态前移（写槽 j，读槽 j+1）
+    let mut j = 0usize;
+    while j < st {
+        *sb.add(j) = if j + 1 < st { *sb.add(j + 1) } else { xv };
+        j += 1;
+    }
 }
 
 /// conv 状态滚动：state_out = 请求窗口（旧 state ++ 本段 x）的末 kernel-1 个。
@@ -7574,7 +7636,6 @@ pub unsafe extern "ptx-kernel" fn rms_norm_gated(
     hidden: u32,
     eps: f32,
     rows: u32,
-    scratch: *mut f32,
 ) {
     let row = _block_idx_x() as usize;
     if row >= rows as usize {
@@ -7584,7 +7645,7 @@ pub unsafe extern "ptx-kernel" fn rms_norm_gated(
     let bdim = _block_dim_x() as usize;
     let h = hidden as usize;
     let base = row * h;
-    let total = unsafe { block_sum_strided(x, scratch, row, base, h, t, bdim) };
+    let total = unsafe { block_sum_strided(x, base, h, t, bdim) };
     let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
     let mut i = t;
     while i < h {
@@ -7596,54 +7657,144 @@ pub unsafe extern "ptx-kernel" fn rms_norm_gated(
     }
 }
 
-/// 设备端行 argmax（bf16 logits → u32 索引）：一块一行（256 线程跨步扫，
-/// 各线程局部最优 → 全局 scratch → syncthreads → 线程 0 全序挑选）。
-/// 全序 (值严格大，或相等下标小) 与扫描序无关——归约确定
+/// 行 argmax 的第一级几何：一行切 `ARGMAX_SPLIT` 个连续切片，一块一片。
+/// **为什么切**：一行 248320 bf16 = 0.5MB，一块一行（100 块）在 128 SM 上
+/// 只喂 78% 的 SM，且单块串行扫 248KB 是延迟受限（实测 194 GB/s）；
+/// 切 8 片后 800 块铺满 128 SM，切片连续 ⇒ 合并访存不退化。
+pub const ARGMAX_SPLIT: usize = 8;
+/// 每块 lane 数（与 ops 侧 `ARGMAX_T` 一一对应）
+pub const ARGMAX_T: usize = 256;
+/// 每行 scratch 字数：切片结果表 `ARGMAX_SPLIT`×2 + 一级 lane 部分最优
+/// `ARGMAX_SPLIT`×`ARGMAX_T`×2（与 ops 侧 `ARGMAX_SLOT` 一一对应）
+pub const ARGMAX_SLOT: usize = ARGMAX_SPLIT * (2 + ARGMAX_T * 2);
+
+/// 全序对 (val, idx) 的合并：值严格大，或相等下标小。这是**交换半格**
+/// （单位元 = (−inf, 0xFFFFFFFF)）⇒ 合并序任意，结果恒同 —— 切片式两级
+/// 归约与早先的"一块一行扫全行"位同（o21 对拍）。
+#[inline(always)]
+fn amax(bv: f32, bi: u32, v: f32, idx: u32) -> (f32, u32) {
+    if v > bv || (v == bv && idx < bi) { (v, idx) } else { (bv, bi) }
+}
+
+/// 设备端行 argmax 第一级（bf16 logits → 每 (行, 切片) 一个局部 argmax）。
+/// grid = s×ARGMAX_SPLIT，block = ARGMAX_T。
+/// 全序归约（值严格大，或相等下标小）与扫描序无关——切片只改"谁扫哪段"。
 #[no_mangle]
-pub unsafe extern "ptx-kernel" fn argmax_rows(
+pub unsafe extern "ptx-kernel" fn argmax_rows_p1(
     x: *const u16,     // [row_total, n] bf16
     rows: *const u32,  // [s] 采样的全局行号
-    scratch: *mut u32, // [s, 256]×2（val_bits, idx 对）
-    out: *mut u32,     // [s]
+    scratch: *mut u32, // [s, ARGMAX_SLOT]
     n: u32,
     s: u32,
 ) {
     let blk = _block_idx_x() as usize;
-    if blk >= s as usize {
+    if blk >= s as usize * ARGMAX_SPLIT {
         return;
     }
-    let lane = _thread_idx_x() as usize; // < 256（block 恒 256）
-    let base = *rows.add(blk) as usize * n as usize;
-    let mut bv = f32::NEG_INFINITY;
-    let mut bi = 0xffffffffu32;
-    let mut i = lane;
-    while i < n as usize {
-        let v = bf16_to_f32(*x.add(base + i));
-        if v > bv || (v == bv && (i as u32) < bi) {
-            bv = v;
-            bi = i as u32;
-        }
-        i += 256;
+    let (r, q) = (udiv(blk, ARGMAX_SPLIT), urem(blk, ARGMAX_SPLIT));
+    let lane = _thread_idx_x() as usize;
+    let nn = n as usize;
+    let base = *rows.add(r) as usize * nn;
+    let lo = nn * q / ARGMAX_SPLIT;
+    let hi = nn * (q + 1) / ARGMAX_SPLIT;
+    // 4 路展开：lane 吃 [lo+4·lane, +3] 起、步长 4·ARGMAX_T——4 条独立
+    // 载入并发（同一条依赖链变 4 条），循环回边降 4 倍
+    let mut bv0 = f32::NEG_INFINITY;
+    let mut bi0 = 0xffffffffu32;
+    let mut bv1 = f32::NEG_INFINITY;
+    let mut bi1 = 0xffffffffu32;
+    let mut bv2 = f32::NEG_INFINITY;
+    let mut bi2 = 0xffffffffu32;
+    let mut bv3 = f32::NEG_INFINITY;
+    let mut bi3 = 0xffffffffu32;
+    let step = ARGMAX_T * 4;
+    let len = hi - lo;
+    let nfull = len / step;
+    let mut k = 0usize;
+    let mut i = lo + lane * 4;
+    while k < nfull {
+        let v0 = bf16_to_f32(*x.add(base + i));
+        let v1 = bf16_to_f32(*x.add(base + i + 1));
+        let v2 = bf16_to_f32(*x.add(base + i + 2));
+        let v3 = bf16_to_f32(*x.add(base + i + 3));
+        let (a, b) = amax(bv0, bi0, v0, i as u32);
+        bv0 = a;
+        bi0 = b;
+        let (a, b) = amax(bv1, bi1, v1, i as u32 + 1);
+        bv1 = a;
+        bi1 = b;
+        let (a, b) = amax(bv2, bi2, v2, i as u32 + 2);
+        bv2 = a;
+        bi2 = b;
+        let (a, b) = amax(bv3, bi3, v3, i as u32 + 3);
+        bv3 = a;
+        bi3 = b;
+        i += step;
+        k += 1;
     }
-    let sb = scratch.add(blk * 512);
-    *sb.add(lane * 2) = bv.to_bits();
-    *sb.add(lane * 2 + 1) = bi;
+    // 尾段（len % step < 4·ARGMAX_T 个元素）：lane 从尾段起点跨步吃满
+    let mut j = lo + nfull * step + lane;
+    while j < hi {
+        let v = bf16_to_f32(*x.add(base + j));
+        let (a, b) = amax(bv0, bi0, v, j as u32);
+        bv0 = a;
+        bi0 = b;
+        j += ARGMAX_T;
+    }
+    // lane 内 4 条链合一（半格合并，序无关）
+    let (mut bv, mut bi) = amax(bv0, bi0, bv1, bi1);
+    let (a, b) = amax(bv2, bi2, bv3, bi3);
+    let (x0, x1) = amax(bv, bi, a, b);
+    bv = x0;
+    bi = x1;
+    let sb = scratch.add(r * ARGMAX_SLOT);
+    let lanes = sb.add(ARGMAX_SPLIT * 2); // 一级 lane 部分最优区（每切片 ARGMAX_T 对）
+    *lanes.add((q * ARGMAX_T + lane) * 2) = bv.to_bits();
+    *lanes.add((q * ARGMAX_T + lane) * 2 + 1) = bi;
     _syncthreads();
     if lane == 0 {
         let mut bv = f32::NEG_INFINITY;
         let mut bi = 0xffffffffu32;
         let mut l = 0usize;
-        while l < 256 {
-            let v = f32::from_bits(*sb.add(l * 2));
-            let idx = *sb.add(l * 2 + 1);
-            if v > bv || (v == bv && idx < bi) {
-                bv = v;
-                bi = idx;
-            }
+        while l < ARGMAX_T {
+            let v = f32::from_bits(*lanes.add((q * ARGMAX_T + l) * 2));
+            let idx = *lanes.add((q * ARGMAX_T + l) * 2 + 1);
+            let (a, b) = amax(bv, bi, v, idx);
+            bv = a;
+            bi = b;
             l += 1;
         }
-        *out.add(blk) = bi;
+        *sb.add(q * 2) = bv.to_bits();
+        *sb.add(q * 2 + 1) = bi;
     }
+}
+
+/// 行 argmax 第二级：按**切片升序**合并每行的 `ARGMAX_SPLIT` 个局部 argmax。
+/// grid = s（一线程一块，纯标量合并——8 项）。半格合并 ⇒ 与一级切片划分
+/// 无关，与"一块扫全行"的旧形态逐位同。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn argmax_rows_p2(
+    scratch: *const u32, // [s, ARGMAX_SLOT]
+    out: *mut u32,       // [s]
+    s: u32,
+) {
+    let blk = _block_idx_x() as usize;
+    if blk >= s as usize || _thread_idx_x() != 0 {
+        return;
+    }
+    let sb = scratch.add(blk * ARGMAX_SLOT);
+    let mut bv = f32::NEG_INFINITY;
+    let mut bi = 0xffffffffu32;
+    let mut q = 0usize;
+    while q < ARGMAX_SPLIT {
+        let v = f32::from_bits(*sb.add(q * 2));
+        let idx = *sb.add(q * 2 + 1);
+        let (a, b) = amax(bv, bi, v, idx);
+        bv = a;
+        bi = b;
+        q += 1;
+    }
+    *out.add(blk) = bi;
 }
 
 // ───────────────────── I2 设备端采样器（top-k / top-p） ─────────────────────

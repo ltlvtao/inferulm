@@ -38,7 +38,8 @@ use wein_engine::{Executor, SampleParams, StepError};
 use wein_kernel::cuda::driver::CuBatchOp;
 use wein_kernel::cuda::{DevBuf, Event, GraphExec, Stream};
 use wein_kernel::ops::{
-    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp,
+    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, Conv1dDwRollOp, ConvStateRollOp,
+    DeltanetChunkedOp,
     DeltanetOp, DnSplitQkvOp, EmbedOp, GemmOp, KvScatterOp, MulOp, PagedAttnOp, RmsNormGatedOp,
     RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluMulOp, SiluOp,
 };
@@ -422,7 +423,7 @@ struct ScrDev {
     /// logits 的 gather 落点 [LG_CAP, 2560]：混合步先把要算的 n2 行拷进来，
     /// lm_head 只对这个紧凑块做（m = 行数）。恒等步不用它
     lg_in: DevBuf<'static>,
-    am_scratch: DevBuf<'static>, // [T,512] u32
+    am_scratch: DevBuf<'static>, // [T, ARGMAX_SLOT] u32（argmax 两级切片 scratch）
     am_out: DevBuf<'static>, // [T] u32
     // —— 设备端采样器（top-k/top-p）：逐行参数 + RNG 槽状态，全部常驻 ——
     /// 逐行温度 [T_MAX] f32（0 = greedy → kernel 内走 argmax 分支）
@@ -1241,14 +1242,10 @@ impl Qwen35Executor {
         ctx::check()?; // 上下文容量组合须可满足（不带病启动）
         let cfg = Qwen35Config::load(dir).map_err(|e| format!("config：{e}"))?;
         cfg.validate().map_err(|e| format!("config：{e}"))?;
-        // kernel scratch 容量按 t_max 推导（rms 归约 rows×块宽 / deltanet
-        // l2 tokens）。默认档（t_max=512）= 历史 compile 期常量，逐字节不变
+        // kernel scratch 容量按 t_max 推导（deltanet l2 tokens / chunked 递推）。
+        // 默认档（t_max=512）= 历史 compile 期常量，逐字节不变
         let t_max = ctx::t_max();
-        let npot = |x: usize| x.min(256).next_power_of_two();
-        let r_zc = cfg.num_heads as usize * npot(cfg.head_dim as usize);
-        let r_gated = cfg.linear_num_v_heads as usize * npot(cfg.linear_v_dim as usize);
         let caps = wein_kernel::ops::ScratchCaps {
-            reduce_floats: t_max * r_zc.max(r_gated),
             delta_l2_tokens: t_max,
             delta_chunk_tokens: t_max,
         };
@@ -1430,7 +1427,7 @@ impl Qwen35Executor {
             d: pin!(gpu.alloc_bytes(bf(t_max * h))),
             logits: pin!(gpu.alloc_bytes(bf(LG_CAP * voc))),
             lg_in: pin!(gpu.alloc_bytes(bf(LG_CAP * h))),
-            am_scratch: pin!(gpu.alloc_bytes(t_max * 512 * 4)),
+            am_scratch: pin!(gpu.alloc_bytes(t_max * wein_kernel::ops::ARGMAX_SLOT as usize * 4)),
             am_out: pin!(gpu.alloc_bytes(t_max * 4)),
             // 采样器逐行参数 + RNG 槽：**open 期一次分配**（图捕获区间内
             // 不许分配——gr5 守卫会 panic）。初值全 greedy（temp=0），
@@ -3358,6 +3355,14 @@ impl Qwen35Executor {
         //     容量不足 → None（老路单发，HEAD 位级不动）──
         let dn_plan = self.dn_chunk_plan(t32, spans, stream);
 
+        // ── conv 融合档判据（纯 decode：每段恰 1 token、无投机链）──
+        // 段表是 host 镜像（图档传合成纯 decode 表：count 全 1 / spec 全 0），
+        // 判据全在 host 上算，**捕获期零设备查询**。真时 conv1d_dw 与
+        // conv_state_roll 合成一发（逐位同，见 kernels 的 conv1d_dw_roll）；
+        // prefill/混合/链段（段内多 token）退回两发老路。
+        let conv_fused = spans.count.iter().all(|&c| c == 1)
+            && spans.spec.iter().all(|&s| s == 0);
+
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
         let mut lin_i = 0usize;
         let mut full_i = 0usize;
@@ -3457,16 +3462,24 @@ impl Qwen35Executor {
                     self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.qkv, &self.scr.qkv, t32, cd, h, stream);
                     self.prof_mark("conv");
-                    tb.conv1d_dw.run(
-                        &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc, inp.trow,
-                        inp.tpos, cd, self.cfg.conv_kernel, t32, stream,
-                    );
-                    tb.conv_state_roll.run(
-                        // 状态存**原始 qkv**（conv 前）——tap 与段内同源；
-                        // 存 qkvc（conv+silu 后）是解码递推偏差的根源
-                        &self.scr.qkv, &self.conv_state[lin_i], inp.start, inp.count, inp.rid, cd,
-                        self.cfg.conv_kernel, n_rows, inp.specs, stream,
-                    );
+                    if conv_fused {
+                        // 纯 decode：算输出 + 滚状态一发（新 token 只读一次）
+                        tb.conv1d_dw_roll.run(
+                            &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc,
+                            inp.trow, cd, self.cfg.conv_kernel, t32, stream,
+                        );
+                    } else {
+                        tb.conv1d_dw.run(
+                            &self.scr.qkv, &w.conv, &self.conv_state[lin_i], &self.scr.qkvc,
+                            inp.trow, inp.tpos, cd, self.cfg.conv_kernel, t32, stream,
+                        );
+                        tb.conv_state_roll.run(
+                            // 状态存**原始 qkv**（conv 前）——tap 与段内同源；
+                            // 存 qkvc（conv+silu 后）是解码递推偏差的根源
+                            &self.scr.qkv, &self.conv_state[lin_i], inp.start, inp.count, inp.rid,
+                            cd, self.cfg.conv_kernel, n_rows, inp.specs, stream,
+                        );
+                    }
                     self.prof_mark("gather");
                     if self.fused {
                         tb.dn_split_qkv.run(

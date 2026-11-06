@@ -38,15 +38,12 @@ pub enum RmsNormImpl<'a> {
 
 /// 启动期 scratch 容量参数（exec 按批行上限 t_max 推导后经
 /// `resolve_tuned_with` 传入；默认值 = 历史编译期常量，默认路径逐字节不变）。
-/// 只装"容量随批行数线性放大"的两类：rms 块归约 scratch 与 deltanet
-/// l2norm 前置 inv——attn 的单次 launch 块容量不在此列（走行分片，见
-/// `launch_tile`/`launch_blk`）
+/// 只装"容量随批行数线性放大"的项：deltanet l2norm 前置 inv 与 chunked
+/// 递推——attn 单次 launch 的块容量不在此列（走行分片，见
+/// `launch_tile`/`launch_blk`）；rms 系归约已在块内 smem 完成，不再需要
+/// 随行数放大的全局 scratch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScratchCaps {
-    /// rms_norm_zc / rms_norm_gated 的块归约 scratch（f32 槽数）。
-    /// 需求 = rows × min(hidden,256)（b = 2 幂块宽）：zc 是 t×q 头、
-    /// gated 是 t×v 头，取两者最大
-    pub reduce_floats: usize,
     /// deltanet l2norm 前置 inv 的 token 容量（× k 头上限 × 2 f32）
     pub delta_l2_tokens: usize,
     /// deltanet chunked（BT=64 分块递推）的 token 容量：gcum/u/w/snap
@@ -56,11 +53,10 @@ pub struct ScratchCaps {
 }
 
 impl Default for ScratchCaps {
-    /// 历史 compile 期常量档（T_MAX=512）：rms 8192×256 槽 + l2 512 token +
-    /// chunked 默认档（小形状容差测试够用）
+    /// 历史 compile 期常量档（T_MAX=512）：l2 512 token + chunked 默认档
+    /// （小形状容差测试够用）
     fn default() -> Self {
         Self {
-            reduce_floats: REDUCE_ROWS_CAP * 256,
             delta_l2_tokens: DELTA_L2_TOKENS_CAP,
             delta_chunk_tokens: DN_CHUNK_TOKENS_DEFAULT,
         }
@@ -88,6 +84,8 @@ pub struct OpTable<'a> {
     pub sigmul: SigmulCuda<'a>,
     pub conv1d_dw: Conv1dDwCuda<'a>,
     pub conv_state_roll: ConvStateRollCuda<'a>,
+    /// conv 输出 + 状态滚动合一（纯 decode 档）
+    pub conv1d_dw_roll: Conv1dDwRollCuda<'a>,
     pub deltanet: DeltanetCuda<'a>,
     pub deltanet_chunked: DeltanetChunkedCuda<'a>,
     pub rms_norm_gated: RmsNormGatedCuda<'a>,
@@ -223,18 +221,17 @@ impl OpTable<'_> {
         let rms_norm_zc = RmsNormZcCuda {
             gpu,
             f: m.func("rms_norm_zc"),
-            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
         let add_norm_zc = AddNormZcCuda {
             gpu,
             f: m.func("add_norm_zc"),
-            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
         let dn_split_qkv = DnSplitQkvCuda { gpu, f: m.func("dn_split_qkv") };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
         let conv_state_roll = ConvStateRollCuda { gpu, f: m.func("conv_state_roll") };
+        let conv1d_dw_roll = Conv1dDwRollCuda { gpu, f: m.func("conv1d_dw_roll") };
         let deltanet = DeltanetCuda {
             gpu,
             f: m.func("deltanet"),
@@ -251,9 +248,12 @@ impl OpTable<'_> {
         let rms_norm_gated = RmsNormGatedCuda {
             gpu,
             f: m.func("rms_norm_gated"),
-            scratch: gpu.alloc_bytes(caps.reduce_floats * 4),
         };
-        let argmax_rows = ArgmaxRowsCuda { gpu, f: m.func("argmax_rows") };
+        let argmax_rows = ArgmaxRowsCuda {
+            gpu,
+            f1: m.func("argmax_rows_p1"),
+            f2: m.func("argmax_rows_p2"),
+        };
         let sample_rows = SampleRowsCuda {
             gpu,
             f: m.func("sample_rows"),
@@ -269,6 +269,7 @@ impl OpTable<'_> {
         )};
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
             silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, rope_pt, sigmul, conv1d_dw, conv_state_roll,
+            conv1d_dw_roll,
             deltanet, deltanet_chunked,
             rms_norm_gated, argmax_rows, sample_rows })
     }
@@ -373,9 +374,6 @@ pub trait RmsNormZcOp {
     fn name(&self) -> &'static str;
 }
 
-/// 块归约 scratch 行容量：满批 q-norm 128×16=2048 行，×4 余量
-const REDUCE_ROWS_CAP: usize = 8192;
-
 /// E2 warp 归约块容量：满批 rows(128)×v_heads(32)
 const DELTA_BLOCK_CAP: usize = 4096;
 /// E2 的 block 宽（线程数）：32 的倍数 = warp 数，vd=128 行按 warp 等分。
@@ -443,22 +441,14 @@ const DN_CHUNK_CHUNK_SLACK: usize = 8;
 pub struct RmsNormZcCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
-    /// 块归约 scratch：[REDUCE_ROWS_CAP, 256] f32，block 按 blockIdx 私有槽
-    /// （resolve 一次预分配——capture 期不触 alloc_guard，运行时零分配）
-    scratch: DevBuf<'a>,
 }
 
 impl RmsNormZcOp for RmsNormZcCuda<'_> {
     fn run(&self, x: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
-        let args = crate::kernel_args![*x, *w, *out, hidden, eps, rows, self.scratch];
-        // block-per-row：块宽 = min(hidden,256) 上取 2 幂（kernel 的
-        // scratch 块归约按 blockDim 同构——reference.rs 镜像同式）
+        let args = crate::kernel_args![*x, *w, *out, hidden, eps, rows];
+        // block-per-row：块宽 = min(hidden,256) 上取 2 幂（kernel 的 smem
+        // 块归约按 blockDim 同构——reference.rs 镜像同式）
         let b = hidden.min(256).next_power_of_two();
-        assert!(
-            rows as usize * b as usize * 4 <= self.scratch.bytes(),
-            "rms_norm_zc rows={rows} 超 scratch 容量 {} 槽",
-            self.scratch.bytes() / 4
-        );
         self.gpu.launch(&self.f, rows, b, &args, stream);
     }
     fn name(&self) -> &'static str {
@@ -489,8 +479,6 @@ pub trait AddNormZcOp {
 pub struct AddNormZcCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
-    /// 块归约 scratch（同 RmsNormZcCuda——resolve 期预分配，capture 期零分配）
-    scratch: DevBuf<'a>,
 }
 
 impl AddNormZcOp for AddNormZcCuda<'_> {
@@ -506,15 +494,9 @@ impl AddNormZcOp for AddNormZcCuda<'_> {
         eps: f32,
         stream: &Stream,
     ) {
-        let args =
-            crate::kernel_args![*a, *b, *w, *sum_out, *norm_out, hidden, eps, rows, self.scratch];
+        let args = crate::kernel_args![*a, *b, *w, *sum_out, *norm_out, hidden, eps, rows];
         // 块几何与 rms_norm_zc 同构（归约树位级复刻的前提）
         let b = hidden.min(256).next_power_of_two();
-        assert!(
-            rows as usize * b as usize * 4 <= self.scratch.bytes(),
-            "add_norm_zc rows={rows} 超 scratch 容量 {} 槽",
-            self.scratch.bytes() / 4
-        );
         self.gpu.launch(&self.f, rows, b, &args, stream);
     }
     fn name(&self) -> &'static str {
@@ -682,6 +664,55 @@ impl Conv1dDwOp for Conv1dDwCuda<'_> {
     }
     fn name(&self) -> &'static str {
         "conv1d_dw/cuda"
+    }
+}
+
+/// conv1d_dw + conv_state_roll 合一（**纯 decode 档**：每段恰 1 token 且无
+/// 投机链）。算术与两发版逐字同（同一份 bf16 输入、k′ 升序同一累加式、
+/// 状态写回同一行序与钳位），只是把"读旧状态 + 读新 v + 写输出 + 写新状态"
+/// 收成一发——新 token 由两发读两次变一次。
+pub trait Conv1dDwRollOp {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        w: &DevBuf,
+        state: &DevBuf,
+        out: &DevBuf,
+        tok_row: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        tokens: u32,
+        stream: &Stream,
+    );
+    fn name(&self) -> &'static str;
+}
+
+pub struct Conv1dDwRollCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl Conv1dDwRollOp for Conv1dDwRollCuda<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        x: &DevBuf,
+        w: &DevBuf,
+        state: &DevBuf,
+        out: &DevBuf,
+        tok_row: &DevBuf,
+        conv_dim: u32,
+        kernel: u32,
+        tokens: u32,
+        stream: &Stream,
+    ) {
+        let n = tokens * conv_dim;
+        let args = crate::kernel_args![*x, *w, *state, *out, *tok_row, conv_dim, kernel, tokens];
+        self.gpu.launch(&self.f, n.div_ceil(256), 256, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "conv1d_dw_roll/cuda"
     }
 }
 
@@ -1178,19 +1209,12 @@ pub trait RmsNormGatedOp {
 pub struct RmsNormGatedCuda<'a> {
     gpu: &'a Gpu,
     f: Func,
-    /// 块归约 scratch（同 RmsNormZcCuda）
-    scratch: DevBuf<'a>,
 }
 
 impl RmsNormGatedOp for RmsNormGatedCuda<'_> {
     fn run(&self, x: &DevBuf, z: &DevBuf, w: &DevBuf, out: &DevBuf, rows: u32, hidden: u32, eps: f32, stream: &Stream) {
-        let args = crate::kernel_args![*x, *z, *w, *out, hidden, eps, rows, self.scratch];
+        let args = crate::kernel_args![*x, *z, *w, *out, hidden, eps, rows];
         let b = hidden.min(256).next_power_of_two(); // block-per-row（同 rms_norm_zc）
-        assert!(
-            rows as usize * b as usize * 4 <= self.scratch.bytes(),
-            "rms_norm_gated rows={rows} 超 scratch 容量 {} 槽",
-            self.scratch.bytes() / 4
-        );
         self.gpu.launch(&self.f, rows, b, &args, stream);
     }
     fn name(&self) -> &'static str {
@@ -1198,22 +1222,40 @@ impl RmsNormGatedOp for RmsNormGatedCuda<'_> {
     }
 }
 
-/// 设备端行 argmax（greedy 采样）：全序归约确定，等值取小下标
+/// 设备端行 argmax（greedy 采样）：全序归约确定，等值取小下标。
+/// **两级发射**（切片式）：一行切 `ARGMAX_SPLIT` 片并行扫（一级），再按
+/// 切片升序合并（二级）。全序对是交换半格 ⇒ 与"一块扫全行"逐位同。
 pub trait ArgmaxRowsOp {
-    /// x: [row_total, n] bf16；rows: [s] 采样的全局行号；scratch: [s,512] u32
+    /// x: [row_total, n] bf16；rows: [s] 采样的全局行号；
+    /// scratch: [s, ARGMAX_SLOT] u32（`argmax_scratch_words`）
     fn run(&self, x: &DevBuf, rows: &DevBuf, scratch: &DevBuf, out: &DevBuf, n: u32, s: u32, stream: &Stream);
     fn name(&self) -> &'static str;
 }
 
+/// 一行切几片——与 kernels/ 的 `ARGMAX_SPLIT` 一一对应（改动须两侧同改）
+pub const ARGMAX_SPLIT: u32 = 8;
+/// 一级块宽——与 kernels/ 的 `ARGMAX_T` 一一对应
+pub const ARGMAX_T: u32 = 256;
+/// 每行 scratch 字数——与 kernels/ 的 `ARGMAX_SLOT` 一一对应
+pub const ARGMAX_SLOT: u32 = ARGMAX_SPLIT * (2 + ARGMAX_T * 2);
+
+/// argmax 两级发射的 scratch 需求（字数，**每行**）——调用方按 s 乘
+pub fn argmax_scratch_words(rows: u32) -> u32 {
+    rows * ARGMAX_SLOT
+}
+
 pub struct ArgmaxRowsCuda<'a> {
     gpu: &'a Gpu,
-    f: Func,
+    f1: Func,
+    f2: Func,
 }
 
 impl ArgmaxRowsOp for ArgmaxRowsCuda<'_> {
     fn run(&self, x: &DevBuf, rows: &DevBuf, scratch: &DevBuf, out: &DevBuf, n: u32, s: u32, stream: &Stream) {
-        let args = crate::kernel_args![*x, *rows, *scratch, *out, n, s];
-        self.gpu.launch(&self.f, s, 256, &args, stream);
+        let args = crate::kernel_args![*x, *rows, *scratch, n, s];
+        self.gpu.launch(&self.f1, s * ARGMAX_SPLIT, ARGMAX_T, &args, stream);
+        let join = crate::kernel_args![*scratch, *out, s];
+        self.gpu.launch(&self.f2, s, 32, &join, stream);
     }
     fn name(&self) -> &'static str {
         "argmax_rows/cuda"

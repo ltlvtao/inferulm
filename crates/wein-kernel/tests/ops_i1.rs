@@ -21,7 +21,7 @@
 #![allow(dead_code)]
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
-    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp,
+    AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, Conv1dDwRollOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp,
     DnSplitQkvOp, EmbedOp, GemmOp, MulOp, OpTable, RmsNormGatedOp, RmsNormZcOp, RopePtOp,
     SigmulOp, SiluMulOp, SiluOp,
 };
@@ -568,7 +568,7 @@ fn o21_argmax_rows_golden_bitwise() {
     assert_eq!(expect, vec![123, 999, 999], "参考端先钉真值（平局/全负/末位）");
 
     let (dx, dr) = (gpu.alloc_from_slice(&flat), gpu.alloc_from_slice(&picked));
-    let scratch = gpu.alloc_bytes(picked.len() * 512 * 4);
+    let scratch = gpu.alloc_bytes(wein_kernel::ops::argmax_scratch_words(picked.len() as u32) as usize * 4);
     let dout = gpu.alloc_bytes(picked.len() * 4);
     t.argmax_rows.run(&dx, &dr, &scratch, &dout, n as u32, picked.len() as u32, &stream);
     stream.sync();
@@ -893,5 +893,62 @@ fn o36_fused_ops_bitwise() {
             &dv2.read_to_vec(),
             &dv.read_to_vec(),
         );
+    }
+
+    // ── conv1d_dw_roll（合一档）vs conv1d_dw → conv_state_roll（两发档）──
+    // 纯 decode 段形：每段恰 1 token（row_count 全 1、specs 全 0）。逐位比
+    // **输出**与**滚动后的状态**；状态池按 row_id 非平凡间接（打乱行序，
+    // 若融合版拿 token 序号当行号写会立刻现形）。
+    for (tokens, conv_dim, kernel) in [
+        (7usize, 16usize, 4usize),
+        (5, 128, 4),
+        (4, 96, 2), // kernel=2：st=1（窗口只 1 槽，边界读 j+1 不存在）
+        (3, 64, 3),
+    ] {
+        let st = kernel - 1;
+        let pool_rows = tokens + 2;
+        // 行号是**非本征排列**（倒序），但每段必须独占一行——纯 decode 的
+        // 段形（executor 一请求一行）。重复行号在两发档里本就是两块写同一槽
+        // 的未定义序，不属本 kernel 的语义域
+        let row_id: Vec<u32> = (0..tokens as u32).map(|i| (pool_rows - 1 - i as usize) as u32).collect();
+        let row_start: Vec<u32> = (0..tokens as u32).collect();
+        let row_count: Vec<u32> = vec![1; tokens];
+        let specs0: Vec<u32> = vec![0; tokens];
+        let x = vec_bf16(0x7707, tokens * conv_dim, 2.0);
+        let w = vec_bf16(0x8808, conv_dim * kernel, 0.5);
+        let st_old = vec_bf16(0x9909, pool_rows * conv_dim * st, 2.0);
+
+        // 两发档
+        let (dx, dw, ds1, dtrow) = (
+            gpu.alloc_from_slice(&x),
+            gpu.alloc_from_slice(&w),
+            gpu.alloc_from_slice(&st_old),
+            gpu.alloc_from_slice(&row_id),
+        );
+        let dtp = gpu.alloc_from_slice(&vec![0u32; tokens]);
+        let dout1 = gpu.alloc_bytes(tokens * conv_dim * 2);
+        t.conv1d_dw.run(&dx, &dw, &ds1, &dout1, &dtrow, &dtp, conv_dim as u32, kernel as u32, tokens as u32, &stream);
+        let (drs, drc, dri, dsp) = (
+            gpu.alloc_from_slice(&row_start),
+            gpu.alloc_from_slice(&row_count),
+            gpu.alloc_from_slice(&row_id),
+            gpu.alloc_from_slice(&specs0),
+        );
+        t.conv_state_roll.run(&dx, &ds1, &drs, &drc, &dri, conv_dim as u32, kernel as u32, tokens as u32, &dsp, &stream);
+
+        // 合一档
+        let ds2 = gpu.alloc_from_slice(&st_old);
+        let dout2 = gpu.alloc_bytes(tokens * conv_dim * 2);
+        t.conv1d_dw_roll.run(&dx, &dw, &ds2, &dout2, &dtrow, conv_dim as u32, kernel as u32, tokens as u32, &stream);
+        stream.sync();
+        let tag = format!("conv1d_dw_roll t={tokens} cd={conv_dim} k={kernel}");
+        assert_bits(&format!("{tag} out"), &dout2.read_to_vec(), &dout1.read_to_vec());
+        assert_bits(&format!("{tag} state"), &ds2.read_to_vec(), &ds1.read_to_vec());
+        // 真值锚：结果同时要与 reference 两条一致（不是两个错的对齐）
+        let expect_conv = reference::conv1d_dw(&x, &w, &st_old, &row_id, &vec![0u32; tokens], conv_dim, kernel);
+        assert_bits(&format!("{tag} out vs reference"), &dout2.read_to_vec(), &expect_conv);
+        let expect_state =
+            reference::conv_state_roll(&x, &st_old, &row_start, &row_count, &row_id, conv_dim, kernel, &specs0);
+        assert_bits(&format!("{tag} state vs reference"), &ds2.read_to_vec(), &expect_state);
     }
 }
