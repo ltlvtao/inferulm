@@ -5636,23 +5636,26 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
         _syncthreads();
         hv += 1;
     }
-    // ── A 下三角物化：任务 = (t 八元 × s 八元) 8×8 寄存器瓦片（绿版结构；
-    //    4×4 改写实测累加器散点污染——散点 e37/清零，未定位即弃）——每 j4
-    //    步 k 行 8+8×u64（L1 驻）→ 256 fma/16 载。Gram（k 头份）算一次，
-    //    端点缩放（β/invk/衰减）尾乘逐 v 头落位（fastf 档 A[t][s] =
+    // ── A 下三角物化：瓦片 = (t 八元 × s 八元)，**每瓦片再按 2 行拆 4 份**分给
+    //    4 个线程（bt=64 时 64 瓦片 ×4 = 256 任务 = 256 线程，全满；此前 8 行
+    //    一份只有 64 线程干活 = 25% 占用）。每元素 j4 升序 → 4 个 fma 的累加序
+    //    与 8 行版逐字同 ⇒ A 位级不变。每 j4 步 k 行 2+8×u64（L1 驻）→
+    //    64 fma/10 载（k_s 行被同瓦片 4 线程各载一次，L1 命中）。Gram（k 头份）
+    //    算一次，端点缩放（β/invk/衰减）尾乘逐 v 头落位（fastf 档 A[t][s] =
     //    (β_t·invk_t·eneg_t)·(invk_s·epos_s·E)·(k_t·k_s)；兜底档 e^{C_s−C_t}
     //    逐对 expf，C 改读 gcum 全局——与 scan 缓冲等值）──
     if true {
         let ntg = udiv(n + 7, 8);
-        let ntasks = ntg * ntg;
+        let ntasks = ntg * ntg * 4;
         let mut e = t;
         while e < ntasks {
-            let tr0 = udiv(e, ntg) * 8;
-            let sr0 = urem(e, ntg) * 8;
-            if sr0 <= tr0 + 7 {
-                let (mut a0, mut a1, mut a2, mut a3) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
-                let (mut a4, mut a5, mut a6, mut a7) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
-                let mut kt = [0u64; 8];
+            let task = udiv(e, 4);
+            let trb = udiv(task, ntg) * 8;
+            let tr0 = trb + urem(e, 4) * 2;
+            let sr0 = urem(task, ntg) * 8;
+            if sr0 <= trb + 7 {
+                let (mut a0, mut a1) = ([0f32; 8], [0f32; 8]);
+                let mut kt = [0u64; 2];
                 let mut ks = [0u64; 8];
                 macro_rules! dn_arow {
                     ($acc:ident, $r:expr) => {{
@@ -5673,7 +5676,7 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
                 let mut j4 = 0usize;
                 while j4 < 32 {
                     let jb = j4 * 4;
-                    for r in 0..8 {
+                    for r in 0..2 {
                         if tr0 + r < n {
                             kt[r] = *(k.add(krow(t0 + tr0 + r, jb)) as *const u64);
                         }
@@ -5685,12 +5688,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
                     }
                     dn_arow!(a0, 0);
                     dn_arow!(a1, 1);
-                    dn_arow!(a2, 2);
-                    dn_arow!(a3, 3);
-                    dn_arow!(a4, 4);
-                    dn_arow!(a5, 5);
-                    dn_arow!(a6, 6);
-                    dn_arow!(a7, 7);
                     j4 += 1;
                 }
                 // 逐 v 头尾乘落位（端点缩放尾乘；s<t 掩码；tr<n 尾块守卫）
@@ -5750,12 +5747,6 @@ pub unsafe extern "ptx-kernel" fn dn_chunk_prep(
                     }
                     dn_ast!(a0, 0);
                     dn_ast!(a1, 1);
-                    dn_ast!(a2, 2);
-                    dn_ast!(a3, 3);
-                    dn_ast!(a4, 4);
-                    dn_ast!(a5, 5);
-                    dn_ast!(a6, 6);
-                    dn_ast!(a7, 7);
                     hv += 1;
                 }
             }
