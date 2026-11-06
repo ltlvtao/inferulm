@@ -6310,32 +6310,133 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             let dsp = DN_H2_D.as_mut_ptr() as *mut f32;
             // ksm：Δ 的 hi/lo 双 tile（[t][v] 自然序，② 直接当 mma 的 A=Δᵀ）
             let (dhp, dlp) = (DN_H2_DH.0.as_mut_ptr(), DN_H2_DL.0.as_mut_ptr());
-            let mut e = t;
-            while e < bts * vrows {
-                let tr = udiv(e, vrows);
-                if tr < n {
-                    let vv = e - tr * vrows;
-                    let p = d.u.add((t0 + tr) * vh * vd + h * vd + vbase + vv);
-                    let m = *d.inv.add((t0 + tr) * kh_n * 2 + kh * 2 + 1);
-                    let val = m * (*p - *d.xsc.add(e));
-                    *p = val;
-                    if staged {
-                        *dsp.add(tr * 16 + vv) = val; // ② smem 顺路落（行组=vv>>2=warp）
-                    } else if ksm {
-                        // Δ = δ″·g 折进 g（② 内免 g 广播）；hi/lo 拆分保精度
-                        let dlt = val * *d.gsc.add(tr);
+            if ksm {
+                // 生产档（lim = bts·vrows = 2048 = 2 组 × 4·bdim）走 **4 深流水**：
+                // 逐元素的四路载入（u / x / g / inv）彼此独立，但串行版把它们压在
+                // 写回之前「一发一等」——载入延迟全暴露（实测迭代数减半即线性掉
+                // 196µs ⇒ 延迟受限，非吞吐）。此处先把 4 个元素的 16 条载入全部
+                // 发出去（在飞 12+），再逐元素算、逐元素写回。每元素的算式、fma
+                // 序、写址逐字不变 ⇒ 位级同。
+                let lim = bts * vrows;
+                let mut e = t;
+                while e < lim {
+                    // 组内其余 3 个元素的下标；越过 lim 的一律钳到组首元素（同址
+                    // 重复写，覆盖同值 ⇒ 位级同——生产档 lim 是 4·bdim 的整数倍，
+                    // 该钳位不触发）
+                    let e1 = if e + bdim < lim { e + bdim } else { e };
+                    let e2 = if e + 2 * bdim < lim { e + 2 * bdim } else { e };
+                    let e3 = if e + 3 * bdim < lim { e + 3 * bdim } else { e };
+                    let (ta, tb, tc, td) = (
+                        udiv(e, vrows),
+                        udiv(e1, vrows),
+                        udiv(e2, vrows),
+                        udiv(e3, vrows),
+                    );
+                    let (ja, jb, jc, jd) =
+                        (e - ta * vrows, e1 - tb * vrows, e2 - tc * vrows, e3 - td * vrows);
+                    // 载入址的 token 钳到行内末元素：ta ≥ n 的元素不写回，钳位只为
+                    // 让提前发射的载入不越界（钳后的值不进任何算式）
+                    let (ra, rb, rc, rd) = (
+                        if ta < n { ta } else { n - 1 },
+                        if tb < n { tb } else { n - 1 },
+                        if tc < n { tc } else { n - 1 },
+                        if td < n { td } else { n - 1 },
+                    );
+                    let (pa, pb, pc, pd) = (
+                        d.u.add((t0 + ra) * vh * vd + h * vd + vbase + ja),
+                        d.u.add((t0 + rb) * vh * vd + h * vd + vbase + jb),
+                        d.u.add((t0 + rc) * vh * vd + h * vd + vbase + jc),
+                        d.u.add((t0 + rd) * vh * vd + h * vd + vbase + jd),
+                    );
+                    // ── 16 条载入先全发（u ×4、x ×4、g ×4、inv ×4）──
+                    let (ua, ub, uc, ud) = (*pa, *pb, *pc, *pd);
+                    let (xa, xb, xc, xd) = (
+                        *d.xsc.add(e),
+                        *d.xsc.add(e1),
+                        *d.xsc.add(e2),
+                        *d.xsc.add(e3),
+                    );
+                    let (ga, gb, gc, gd) = (
+                        *d.gsc.add(ta),
+                        *d.gsc.add(tb),
+                        *d.gsc.add(tc),
+                        *d.gsc.add(td),
+                    );
+                    let (ma, mb, mc, md) = (
+                        *d.inv.add((t0 + ra) * kh_n * 2 + kh * 2 + 1),
+                        *d.inv.add((t0 + rb) * kh_n * 2 + kh * 2 + 1),
+                        *d.inv.add((t0 + rc) * kh_n * 2 + kh * 2 + 1),
+                        *d.inv.add((t0 + rd) * kh_n * 2 + kh * 2 + 1),
+                    );
+                    // ── 再逐元素算 + 写回（u 原位改 Δ′、Δ=δ″·g 的 hi/lo 落 smem）──
+                    if ta < n {
+                        let val = ma * (ua - xa);
+                        *pa = val;
+                        let dlt = val * ga;
                         let hi = f32_to_bf16(dlt);
                         let lo = f32_to_bf16(dlt - bf16_to_f32(hi));
-                        *dhp.add(tr * 32 + vv) = hi;
-                        *dlp.add(tr * 32 + vv) = lo;
+                        *dhp.add(ta * 32 + ja) = hi;
+                        *dlp.add(ta * 32 + ja) = lo;
+                    } else {
+                        *dhp.add(e) = 0;
+                        *dlp.add(e) = 0;
                     }
-                } else if ksm {
-                    // n 之后的行**显式置 0**：smem 跨 chunk 存活，不置零会把
-                    // 上一 chunk 的 Δ 残值算进本 chunk 的 mma
-                    *dhp.add(e) = 0;
-                    *dlp.add(e) = 0;
+                    if tb < n {
+                        let val = mb * (ub - xb);
+                        *pb = val;
+                        let dlt = val * gb;
+                        let hi = f32_to_bf16(dlt);
+                        let lo = f32_to_bf16(dlt - bf16_to_f32(hi));
+                        *dhp.add(tb * 32 + jb) = hi;
+                        *dlp.add(tb * 32 + jb) = lo;
+                    } else {
+                        *dhp.add(e1) = 0;
+                        *dlp.add(e1) = 0;
+                    }
+                    if tc < n {
+                        let val = mc * (uc - xc);
+                        *pc = val;
+                        let dlt = val * gc;
+                        let hi = f32_to_bf16(dlt);
+                        let lo = f32_to_bf16(dlt - bf16_to_f32(hi));
+                        *dhp.add(tc * 32 + jc) = hi;
+                        *dlp.add(tc * 32 + jc) = lo;
+                    } else {
+                        *dhp.add(e2) = 0;
+                        *dlp.add(e2) = 0;
+                    }
+                    if td < n {
+                        let val = md * (ud - xd);
+                        *pd = val;
+                        let dlt = val * gd;
+                        let hi = f32_to_bf16(dlt);
+                        let lo = f32_to_bf16(dlt - bf16_to_f32(hi));
+                        *dhp.add(td * 32 + jd) = hi;
+                        *dlp.add(td * 32 + jd) = lo;
+                    } else {
+                        *dhp.add(e3) = 0;
+                        *dlp.add(e3) = 0;
+                    }
+                    e += 4 * bdim;
                 }
-                e += bdim;
+            } else {
+                // 非生产档（staged 专路 / 其余几何）：逐元素串行，k̂ 的 hi/lo
+                // 落 smem 与 n 之后行置零只在 ksm 档存在（见上分支）
+                let mut e = t;
+                while e < bts * vrows {
+                    let tr = udiv(e, vrows);
+                    if tr < n {
+                        let vv = e - tr * vrows;
+                        let p = d.u.add((t0 + tr) * vh * vd + h * vd + vbase + vv);
+                        let m = *d.inv.add((t0 + tr) * kh_n * 2 + kh * 2 + 1);
+                        let val = m * (*p - *d.xsc.add(e));
+                        *p = val;
+                        if staged {
+                            *dsp.add(tr * 16 + vv) = val; // ② smem 顺路落（行组=vv>>2=warp）
+                        }
+                    }
+                    e += bdim;
+                }
             }
         }
         _syncthreads();
@@ -6345,12 +6446,14 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             // ── ② tensor core：S[v][kd] += Σ_t Δ[t][v]·k̂[t][kd] ──
             // 映射 M=v(32) / N=kd(128) / K=t(≤64) ⇒ 16 个 m16n16k16 C tile
             // （v 两块 × kd 八块），每 tile (n/16) 个 kstep。8 warp 平分：
-            // wid=t/32 取 mvb=wid&1（v 块）、kb ∈ {(wid>>1)*2, +1}——每 warp
-            // 2 tile、kb 恰铺满 0..7 无重复。A=Δᵀ 由 DN_H2_DH/DL 列主序直读
-            // （ldm=vrows=32：Δ 的 [t][v] 自然序即 (m,k)→k·ldm+m），B=k̂ 由
-            // load.b.row 从全局直读（ldm=kh_n·kd）——零转置 staging、零新
-            // smem、v 两块 ×2 冗余读（k̂ 片 16KB 在 L2 驻留）。hi/lo 双 mma
-            // 串在同一个 C 上（等效 f32 精度，同 ① 的 w 拆分）。
+            // wid=t/32 直接取 kb=wid（kd 八块恰铺满无重复），每 warp 认 2 tile
+            // = 同一 kd 块 × v 两块（mvb ∈ {0,1}）——每 kstep 的 B 片段（k̂）
+            // **只载一次喂两个 C 累加器**（旧映射每 warp 认同 v 块的相邻 kd
+            // 两块，同一片 k̂ 被两个 v 块组的 warp 各读一遍 = 2× 冗余，k̂ 的
+            // L2 读 385MB/层）。A=Δᵀ 由 DN_H2_DH/DL 列主序直读（ldm=vrows=32：
+            // Δ 的 [t][v] 自然序即 (m,k)→k·ldm+m），B=k̂ 由 load.b.row 从全局
+            // 直读（ldm=kh_n·kd）——零转置 staging、零新 smem。每片 C 上的 ks
+            // 序与 hi/lo 序都不变（等效 f32 精度，同 ① 的 w 拆分）⇒ 位级同。
             for r in 0..VW {
                 for j in 0..4usize {
                     acc[r][j] *= dlast;
@@ -6360,46 +6463,67 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             let nfull = n & !15usize; // 整 16 的 token 数（< 16 的尾走标量）
             let ksteps = nfull >> 4;
             if ksteps > 0 {
-                let mvb = warp & 1;
-                let kb0 = (warp >> 1) * 2;
+                // kb = warp：8 warp 认 8 个 kd 块；两个 C 累加器 = 同一 kd 块 ×
+                // v 两块（c → mvb=0 @ inc[kb*16]、c1 → mvb=1 @ inc[16*kd+kb*16]）
+                let kb = warp;
                 let kg = d.k.add(t0 * kh_n * kd + kh * kd);
                 let kld = (kh_n * kd) as i32;
                 let (ah, al) = (DN_H2_DH.0.as_ptr(), DN_H2_DL.0.as_ptr());
-                let mut jj = 0usize;
-                while jj < 2 {
-                    let kb = kb0 + jj;
-                    let mut c = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
-                    let mut ks = 0usize;
-                    while ks < ksteps {
-                        let ab = ks * 16 * vrows + mvb * 16;
-                        let bb = kg.add(ks * 16 * kh_n * kd + kb * 16) as *const u32;
-                        let a = wmma_load_a_col(ah.add(ab) as *const u32, vrows as i32);
-                        let b = wmma_load_b_row(bb, kld);
-                        c = wmma_mma(
-                            a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4,
-                            c.5, c.6, c.7,
-                        );
-                        let a2 = wmma_load_a_col(al.add(ab) as *const u32, vrows as i32);
-                        c = wmma_mma(
-                            a2.0, a2.1, a2.2, a2.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4,
-                            c.5, c.6, c.7,
-                        );
-                        ks += 1;
-                    }
-                    wmma_store_c(
-                        inc.add(mvb * 16 * kd + kb * 16),
-                        c.0,
-                        c.1,
-                        c.2,
-                        c.3,
-                        c.4,
-                        c.5,
-                        c.6,
-                        c.7,
-                        kd as i32,
+                let mut c = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+                let mut c1 = c;
+                let mut ks = 0usize;
+                while ks < ksteps {
+                    let ab = ks * 16 * vrows; // A（Δᵀ）的 kstep 基：v 两块 × 16
+                    let bb = kg.add(ks * 16 * kh_n * kd + kb * 16) as *const u32;
+                    let b = wmma_load_b_row(bb, kld); // 本 kstep 的 k̂：两 C 共载一次
+                    // v 块 0：hi → mma、lo → mma（同一 C，序不变）
+                    let a = wmma_load_a_col(ah.add(ab) as *const u32, vrows as i32);
+                    c = wmma_mma(
+                        a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4, c.5,
+                        c.6, c.7,
                     );
-                    jj += 1;
+                    let a2 = wmma_load_a_col(al.add(ab) as *const u32, vrows as i32);
+                    c = wmma_mma(
+                        a2.0, a2.1, a2.2, a2.3, b.0, b.1, b.2, b.3, c.0, c.1, c.2, c.3, c.4,
+                        c.5, c.6, c.7,
+                    );
+                    // v 块 1：同一个 B 片段复用（A 片段换 mvb*16 偏移）
+                    let a3 = wmma_load_a_col(ah.add(ab + 16) as *const u32, vrows as i32);
+                    c1 = wmma_mma(
+                        a3.0, a3.1, a3.2, a3.3, b.0, b.1, b.2, b.3, c1.0, c1.1, c1.2, c1.3,
+                        c1.4, c1.5, c1.6, c1.7,
+                    );
+                    let a4 = wmma_load_a_col(al.add(ab + 16) as *const u32, vrows as i32);
+                    c1 = wmma_mma(
+                        a4.0, a4.1, a4.2, a4.3, b.0, b.1, b.2, b.3, c1.0, c1.1, c1.2, c1.3,
+                        c1.4, c1.5, c1.6, c1.7,
+                    );
+                    ks += 1;
                 }
+                wmma_store_c(
+                    inc.add(kb * 16),
+                    c.0,
+                    c.1,
+                    c.2,
+                    c.3,
+                    c.4,
+                    c.5,
+                    c.6,
+                    c.7,
+                    kd as i32,
+                );
+                wmma_store_c(
+                    inc.add(16 * kd + kb * 16),
+                    c1.0,
+                    c1.1,
+                    c1.2,
+                    c1.3,
+                    c1.4,
+                    c1.5,
+                    c1.6,
+                    c1.7,
+                    kd as i32,
+                );
                 _syncthreads(); // inc 跨 warp（v 块的产出 warp ≠ 消费 warp）
                 // 累加器 ← 寄存器态：每 lane 16 个连续 f32（[r] 的 4 个 kd
                 // 相连 + r 间 stride kd）——4 条 16B 载
