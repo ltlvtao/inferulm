@@ -5913,6 +5913,15 @@ static mut DN_H2_K: [u64; 64 * 36] = [0; 64 * 36];
 static mut DN_H2_D: [F4; 64 * 4] = [F4([0.0; 4]); 64 * 4];
 #[link_section = ".shared"]
 static mut DN_H2_G: [f32; 64] = [0.0; 64];
+/// dn_chunk_h ② 的 k̂ 片静态 staging（生产档 sp=4/bdim=256 × bts=64 ×
+/// kd=128 专路）：[32 token][32 lane] u64 = 8KB，一个 chunk 的前半（token
+/// 0..32；后半落 DN_H2_K 的高 32 行——两条路互斥）。片由块内线程协作搬入，
+/// ② 的 tick 从 smem 读——旧路每 tick 每 lane 一条 8B 全局载（行距
+/// kh_n·kd·2B=4KB，8 warp 各读同一 256B/token ⇒ ×8 冗余且全暴露 HBM 延迟）。
+/// 位级不变：u64 整搬、fma 序不动。静态 22784+8192=30976 + 动态 69632 =
+/// 100608 ≤ 101376（sm_89 每块）。
+#[link_section = ".shared"]
+static mut DN_H2_S: [u64; 1024] = [0; 1024];
 /// dn_chunk_h 的动态 smem 池（extern 动态段——build.rs 改写声明，宿主
 /// launch_smem 供 69632/8704B + MAX_DYNAMIC 属性）。互斥分支分账：
 ///   · ① w hi/lo 跨 chunk 双缓冲（dblb = wst ∧ bdim≥256，即 sp≤4 生产档
@@ -5955,6 +5964,12 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
     // 2383、单槽 2300，均两波串行反慢 55%）→ 该档不 staging，① 保持
     // global 直载 + 循环顶 L2 预热 chunk i+1（纯提示零 smem，2 块/SM 不动）
     let dblb = wst && bdim >= 256;
+    // ② 的 k̂ 片静态 smem staging 门（DN_H2_S 8KB + 复用 DN_H2_K 高 32 行）：
+    // 只锁 sp=4/bdim=256 生产档（bts=64 × vrows=32 × kd=128 × VW=4）——该档
+    // 8 warp 全在 vb0<vrows 内（② 的屏障若落在部分 warp 上会死锁，故门同时
+    // 保证整块一致）。其余几何（含 staged 路）② 的 k̂ 一律走旧全局载，位级
+    // 与旧路同。
+    let ksm = VW == 4 && bdim == 256 && kd == 128 && bts == 64 && vrows == 32;
     // ① w 预载宏：chunk $c 的 hi/lo 全块 cp.async → 槽 $s（纯位拷贝——
     // mma 输入位样与 global 直载逐位同；读集 = 旧 ① 的 t-tile 覆盖行集，
     // 越尾行（t≥n）内容无害：elementwise t<n 掩掉。bt 恒 16 倍数，
@@ -6010,6 +6025,110 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
         cp_async_wait_all(core::ptr::null_mut());
     }
     _syncthreads(); // s_mat 全片就绪（① 任务跨 warp 读）+ w 槽 0 可见（dblb）
+    // ── ② 非 staged 路的单段流水（≤32 token）：k̂ 1×u64 + δ″ VW/4×F4 + g
+    //    广播，4 深预取 + 2× token 展开，A/B/C/D 四槽轮转（当拍 fma 与
+    //    tp+4 预取并发——1 深时每步裸吃整条载入延迟 ~400cy，是 ② 的主导
+    //    项）。k̂ 源 + δ″/u/g 基址由参数给出：生产档每 chunk 调两次（每半
+    //    一个 smem tile），其余几何调一次（k̂ 走全局、g 基址不偏移）。数值
+    //    路径与原循环逐位同：k̂ u64 整载 → dn_dec4、δ″ F4、g、fma 序不动。
+    macro_rules! dn_h2pipe {
+        ($nh:expr, $krow:expr, $kstep:expr, $urow:expr, $gs:expr) => {{
+            let n = $nh;
+            let krow = $krow; // k̂ 基址（本段 token 0，lane 片已在基址内）
+            let kstep = $kstep; // k̂ 行距（u16 元素/token；smem tile = 32 u64）
+            let urow = $urow;
+            let gs = $gs; // g 基址（= d.gsc + 本段首 token 的块内序号）
+            let nq = VW / 4;
+            let mut tp = 0usize;
+            // δ″ F4 载（VW/4 条；vb0 恒 4 倍 ⇒ 16B 对齐）；rq 字面展开
+            // （d_a/d_b/acc 全寄存器）；rq ≥ VW/4 有 nq 守卫
+            macro_rules! dn_h2ld {
+                ($arr:ident, $rq:literal, $ub:expr) => {{
+                    if $rq < nq {
+                        $arr[$rq] = *($ub.add($rq * 4) as *const F4);
+                    }
+                }};
+            }
+            macro_rules! dn_h2pf {
+                ($ka:ident, $ga:ident, $da:ident, $tt:expr) => {{
+                    $ka = *(krow.add($tt * kstep) as *const u64);
+                    $ga = *gs.add($tt);
+                    let un = urow.add($tt * vh * vd);
+                    dn_h2ld!($da, 0, un);
+                    dn_h2ld!($da, 1, un);
+                    dn_h2ld!($da, 2, un);
+                    dn_h2ld!($da, 3, un);
+                }};
+            }
+            macro_rules! dn_h2q {
+                ($rq:literal, $kq:ident, $g:ident, $dv:ident) => {{
+                    if $rq < nq {
+                        for rr in 0..4usize {
+                            let dvs = $dv[rr] * $g;
+                            for j in 0..4usize {
+                                acc[$rq * 4 + rr][j] = fma($kq[j], dvs, acc[$rq * 4 + rr][j]);
+                            }
+                        }
+                    }
+                }};
+            }
+            let (mut k_a, mut g_a) = (*(krow as *const u64), *gs);
+            let (mut k_b, mut g_b) = (0u64, 0f32);
+            let (mut k_c, mut g_c) = (0u64, 0f32);
+            let (mut k_d, mut g_d) = (0u64, 0f32);
+            let mut d_a = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_b = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_c = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            let mut d_d = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
+            dn_h2ld!(d_a, 0, urow);
+            dn_h2ld!(d_a, 1, urow);
+            dn_h2ld!(d_a, 2, urow);
+            dn_h2ld!(d_a, 3, urow);
+            if n > 1 {
+                dn_h2pf!(k_b, g_b, d_b, 1);
+            }
+            if n > 2 {
+                dn_h2pf!(k_c, g_c, d_c, 2);
+            }
+            if n > 3 {
+                dn_h2pf!(k_d, g_d, d_d, 3);
+            }
+            macro_rules! dn_h2tick {
+                ($kq:ident, $g:ident, $ka:ident, $ga:ident, $da:ident) => {{
+                    let kq = dn_dec4($kq);
+                    let g = $g;
+                    let d0 = $da[0].0;
+                    let d1 = $da[1].0;
+                    let d2 = $da[2].0;
+                    let d3 = $da[3].0;
+                    if tp + 4 < n {
+                        dn_h2pf!($ka, $ga, $da, tp + 4);
+                    }
+                    dn_h2q!(0, kq, g, d0);
+                    dn_h2q!(1, kq, g, d1);
+                    dn_h2q!(2, kq, g, d2);
+                    dn_h2q!(3, kq, g, d3);
+                    tp += 1;
+                }};
+            }
+            while tp < n {
+                // A/B/C/D 四槽轮转：4 深预取，每拍快照后再补 tp+4
+                dn_h2tick!(k_a, g_a, k_a, g_a, d_a);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_b, g_b, k_b, g_b, d_b);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_c, g_c, k_c, g_c, d_c);
+                if tp >= n {
+                    break;
+                }
+                dn_h2tick!(k_d, g_d, k_d, g_d, d_d);
+            }
+        }};
+    }
     let mut c0 = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
     let mut c1 = c0;
     let mut ci = 0usize;
@@ -6044,6 +6163,29 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
             }
             if t < n {
                 *DN_H2_G.as_mut_ptr().add(t) = *d.gsc.add(t);
+            }
+        }
+        if ksm {
+            // ② 两半（token 0..32 / 32..64）的 k̂ 片协作预载：前半 → DN_H2_S
+            // （32 行 × 32 lane，行距 32 u64），后半 → DN_H2_K 的高 32 行
+            // （行距 36 u64；DN_H2_K 属 staged 路——staged ⇔ bdim=128，ksm ⇔
+            // bdim=256，互斥不共用）。先发射、与下方 ① mma + elementwise 并发
+            // 飞行，② 前的 _syncthreads 即对全块担保可见——② 内零新增屏障、
+            // 零暴露拷贝。只写 n 行（tick 索引恒 < n，余行不读）。
+            let kg = d.k.add(t0 * kh_n * kd + kh * kd);
+            let kt0 = DN_H2_S.as_mut_ptr();
+            let kt1 = DN_H2_K.as_mut_ptr().add(32 * 36);
+            let lim = (if n < 64 { n } else { 64 }) * 32;
+            let mut i = t;
+            while i < lim {
+                let tr = i >> 5;
+                let v = *(kg.add(tr * kh_n * kd + (i & 31) * 4) as *const u64);
+                if tr < 32 {
+                    *kt0.add(i) = v;
+                } else {
+                    *kt1.add((tr - 32) * 36 + (i & 31)) = v;
+                }
+                i += bdim;
             }
         }
         if dblb && ci + 1 < d.nch {
@@ -6257,99 +6399,53 @@ unsafe fn dn_h_run3<const VW: usize>(d: &DnH) {
                     acc[r][j] *= dlast;
                 }
             }
-            let mut tp = 0usize;
-            // δ″ F4 载（VW/4 条；vb0 恒 4 倍 ⇒ 16B 对齐）+ 2 深软件流水 + 2×
-            // token 展开：A/B 双槽轮转，当拍 fma 与 tp+2 预取并发——1 深时
-            // 6016 步链每步裸吃整条载入延迟（~400cy），是 ② 的主导项。
-            // rq 字面展开（d_a/d_b/acc 全寄存器）；rq ≥ VW/4 有 vrows 守卫
-            let krow = d.k.add(t0 * kh_n * kd + kh * kd + j4);
-            let urow = d.u.add(t0 * vh * vd + h * vd + vbase + vb0);
-            let gs = d.gsc;
-            let nq = VW / 4;
-            macro_rules! dn_h2ld {
-                ($arr:ident, $rq:literal, $ub:expr) => {{
-                    if $rq < nq {
-                        $arr[$rq] = *($ub.add($rq * 4) as *const F4);
-                    }
-                }};
-            }
-            macro_rules! dn_h2pf {
-                ($ka:ident, $ga:ident, $da:ident, $tt:expr) => {{
-                    $ka = *(krow.add($tt * kh_n * kd) as *const u64);
-                    $ga = *gs.add($tt);
-                    let un = urow.add($tt * vh * vd);
-                    dn_h2ld!($da, 0, un);
-                    dn_h2ld!($da, 1, un);
-                    dn_h2ld!($da, 2, un);
-                    dn_h2ld!($da, 3, un);
-                }};
-            }
-            macro_rules! dn_h2q {
-                ($rq:literal, $kq:ident, $g:ident, $dv:ident) => {{
-                    if $rq < nq {
-                        for rr in 0..4usize {
-                            let dvs = $dv[rr] * $g;
-                            for j in 0..4usize {
-                                acc[$rq * 4 + rr][j] = fma($kq[j], dvs, acc[$rq * 4 + rr][j]);
-                            }
-                        }
-                    }
-                }};
-            }
-            let (mut k_a, mut g_a) = (*(krow as *const u64), *gs);
-            let (mut k_b, mut g_b) = (0u64, 0f32);
-            let (mut k_c, mut g_c) = (0u64, 0f32);
-            let (mut k_d, mut g_d) = (0u64, 0f32);
-            let mut d_a = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
-            let mut d_b = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
-            let mut d_c = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
-            let mut d_d = [F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4]), F4([0f32; 4])];
-            dn_h2ld!(d_a, 0, urow);
-            dn_h2ld!(d_a, 1, urow);
-            dn_h2ld!(d_a, 2, urow);
-            dn_h2ld!(d_a, 3, urow);
-            if n > 1 {
-                dn_h2pf!(k_b, g_b, d_b, 1);
-            }
-            if n > 2 {
-                dn_h2pf!(k_c, g_c, d_c, 2);
-            }
-            if n > 3 {
-                dn_h2pf!(k_d, g_d, d_d, 3);
-            }
-            macro_rules! dn_h2tick {
-                ($kq:ident, $g:ident, $ka:ident, $ga:ident, $da:ident) => {{
-                    let kq = dn_dec4($kq);
-                    let g = $g;
-                    let d0 = $da[0].0;
-                    let d1 = $da[1].0;
-                    let d2 = $da[2].0;
-                    let d3 = $da[3].0;
-                    if tp + 4 < n {
-                        dn_h2pf!($ka, $ga, $da, tp + 4);
-                    }
-                    dn_h2q!(0, kq, g, d0);
-                    dn_h2q!(1, kq, g, d1);
-                    dn_h2q!(2, kq, g, d2);
-                    dn_h2q!(3, kq, g, d3);
-                    tp += 1;
-                }};
-            }
-            while tp < n {
-                // A/B/C/D 四槽轮转：4 深预取，每拍快照后再补 tp+4
-                dn_h2tick!(k_a, g_a, k_a, g_a, d_a);
-                if tp >= n {
-                    break;
+            // 生产档（sp=4/bdim=256：bts=64、vrows=32、kd=128）② 分两半（各
+            // ≤32 token = 一个 smem tile），两半的 k̂ 片都在 chunk 头顶（① 前）
+            // 协作预载：前半 → DN_H2_S，后半 → DN_H2_K 的高 32 行——载入全程
+            // 与 ① mma + elementwise 并发，② 前的 _syncthreads 即对全块担保
+            // 可见，故 ② 内零新增屏障、零暴露拷贝（实测：把后半的搬运放到
+            // 两半之间 + 2 屏障，比本式再慢 ~20µs/层）。旧路每 tick 每 lane 一条
+            // 8B 全局载（行距 kh_n·kd·2B=4KB，8 warp 各读同一 256B/token ⇒
+            // ×8 冗余 + 全暴露 HBM 延迟）。其余几何单段 n 走旧全局路（ksm 门
+            // 排除了部分 warp 进屏障的死锁）。位级不变：k̂ u64 整搬、δ″/g
+            // 原值、fma 序不动。
+            let kstep_g = kh_n * kd; // k̂ 行距（u16 元素/token）
+            let kt = DN_H2_S.as_mut_ptr();
+            let kt1 = DN_H2_K.as_ptr().add(32 * 36 + lane); // 后半 tile[tt*36 + lane]
+            let nseg = if ksm { 2usize } else { 1usize };
+            let mut half = 0usize;
+            while half < nseg {
+                let tb = half * 32;
+                let nh = if !ksm {
+                    n
+                } else if n > tb {
+                    let r = n - tb;
+                    if r > 32 { 32 } else { r }
+                } else {
+                    0
+                };
+                if nh > 0 {
+                    let krow = if !ksm {
+                        d.k.add((t0 + tb) * kstep_g + kh * kd + j4)
+                    } else if half == 0 {
+                        kt.add(lane) as *const u16 // tile[tt*32 + lane]
+                    } else {
+                        kt1 as *const u16
+                    };
+                    // kstep 以 u16 元素计（krow 是 *const u16，载入处再 cast 成
+                    // *const u64）：smem tile 行距 32 u64 = 128 u16、DN_H2_K 行距
+                    // 36 u64 = 144 u16；全局路 = kh_n·kd
+                    let kstep = if !ksm {
+                        kstep_g
+                    } else if half == 0 {
+                        32 * 4
+                    } else {
+                        36 * 4
+                    };
+                    let urow = d.u.add((t0 + tb) * vh * vd + h * vd + vbase + vb0);
+                    dn_h2pipe!(nh, krow, kstep, urow, d.gsc.add(tb));
                 }
-                dn_h2tick!(k_b, g_b, k_b, g_b, d_b);
-                if tp >= n {
-                    break;
-                }
-                dn_h2tick!(k_c, g_c, k_c, g_c, d_c);
-                if tp >= n {
-                    break;
-                }
-                dn_h2tick!(k_d, g_d, k_d, g_d, d_d);
+                half += 1;
             }
             for r in 0..VW {
                 let e0 = (vb0 + r) * kd + j4;
