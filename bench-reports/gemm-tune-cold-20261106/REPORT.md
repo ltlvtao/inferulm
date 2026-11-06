@@ -48,8 +48,9 @@
 - `lm_head` 冷最优 #1 快 3.8% 但没过 5% 滞回门——单形状放宽门禁值 3.8%。
 
 ## 5. 保留物
-- `crates/wein-kernel/examples/gemm_cold_probe.rs`（默认模式 = 上面的表；`stream 40` = 流水态 A/B）。
 - `crates/wein-kernel/src/cuda/cublaslt.rs` **未改动**（与 HEAD 逐字节相同，`git diff` 空）。
+- 探针 `gemm_cold_probe.rs` **随后删除**：它依赖被回滚的 `probe_candidates/probe_launch/l2_flush`，
+  留着会让 `cargo build --examples` 红。上表全部数据已固化在本报告中（需要重测时按此表的方法重建）。
 
 ## 6. 满载账本（本刀后，仍为 3939/3936 tps）
 | 项 | ms/步 | 状态 |

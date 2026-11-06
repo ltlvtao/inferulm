@@ -925,6 +925,11 @@ pub struct Qwen35Executor {
     /// qkv 去交错三融合全部回退旧三路，A/B 对拍用；默认开。open 期一次
     /// 定死：图捕获与 eager 共用 run_forward 的同一条分支）
     fused: bool,
+    /// 消融档（`WEIN_ABLATE=ab|kv|all`）：对应 gemm **整发不发**，输出缓冲
+    /// open 期零化后保持——量化「小 N 投影每发真实占用」。数值错误，专属
+    /// 测量档；open 期一次定死（图捕获期零 env 读、零分配）
+    ablate_ab: bool,
+    ablate_kv: bool,
     /// 上一步前向的 logits 行表（需要 logits 的批内行号，升序；**空 = 恒等**
     /// ——行号即紧凑表行号，见 `logits_row` 读出）。探针/对拍口径
     last_lg_rows: Vec<u32>,
@@ -1532,6 +1537,20 @@ impl Qwen35Executor {
             (Vec::new(), Vec::new(), Vec::new())
         };
 
+        // 消融档（组织形态刀 B：小 N 投影的发射开销）。open 期一次定死，
+        // 图捕获期零 env 读；被跳过的 gemm 输出缓冲零化一次（读侧不出
+        // NaN，此后无写者）——数值错误，专属测量档，非生产
+        let abl = std::env::var("WEIN_ABLATE").unwrap_or_default();
+        let (ablate_ab, ablate_kv) = (abl == "ab" || abl == "all", abl == "kv" || abl == "all");
+        if ablate_ab {
+            scr.aa.zero_on(session.stream());
+            scr.bb.zero_on(session.stream());
+        }
+        if ablate_kv {
+            scr.kh.zero_on(session.stream());
+            scr.vh.zero_on(session.stream());
+        }
+
         Ok(Qwen35Executor {
             layers,
             embed,
@@ -1580,6 +1599,8 @@ impl Qwen35Executor {
             step_max_pos: 0,
             dn_chunk: std::env::var("WEIN_DN_CHUNK").map(|v| v != "0").unwrap_or(true),
             fused: std::env::var("WEIN_FUSED").map(|v| v != "0").unwrap_or(true),
+            ablate_ab,
+            ablate_kv,
             last_lg_rows: Vec::new(),
             lin_state,
             conv_state,
@@ -3386,8 +3407,11 @@ impl Qwen35Executor {
                     self.prof_mark("norm");
                     tb.rms_norm_zc.run(&self.scr.qh, &w.qn, &self.scr.qh, t32 * qh_n, hd, eps, stream);
                     self.prof_mark("gemm");
-                    tb.gemm.run_wt(&self.scr.n1, &w.k, &self.scr.kh, t32, he, h, stream);
-                    tb.gemm.run_wt(&self.scr.n1, &w.v, &self.scr.vh, t32, he, h, stream);
+                    if !self.ablate_kv {
+                        // 消融档（WEIN_ABLATE=kv|all）：两发整删，供发射开销折算
+                        tb.gemm.run_wt(&self.scr.n1, &w.k, &self.scr.kh, t32, he, h, stream);
+                        tb.gemm.run_wt(&self.scr.n1, &w.v, &self.scr.vh, t32, he, h, stream);
+                    }
                     if trace {
                         self.trace_buf(&format!("s{step}-L{li:02}-vh"), &self.scr.vh, t32 as usize * he as usize);
                     }
@@ -3493,8 +3517,11 @@ impl Qwen35Executor {
                     }
                     self.prof_mark("gemm");
                     tb.gemm.run_wt(&self.scr.n1, &w.z, &self.scr.z, t32, vald, h, stream);
-                    tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
-                    tb.gemm.run_wt(&self.scr.n1, &w.b, &self.scr.bb, t32, 32, h, stream);
+                    if !self.ablate_ab {
+                        // 消融档（WEIN_ABLATE=ab|all）：两发整删，供发射开销折算
+                        tb.gemm.run_wt(&self.scr.n1, &w.a, &self.scr.aa, t32, 32, h, stream);
+                        tb.gemm.run_wt(&self.scr.n1, &w.b, &self.scr.bb, t32, 32, h, stream);
+                    }
                     self.prof_mark("delta");
                     // B 档 chunked 的自适应门（保守档）：**同 span token 数 t>1**
                     // 才切 v 行。判据 = 本步 token 总数 > 行数（有任一行吃了多
