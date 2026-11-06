@@ -1,0 +1,25 @@
+{
+ "n": 100,
+ "max_tokens": 400,
+ "requests_ok": 100,
+ "errors": [],
+ "wall_s": 16.731,
+ "tokens_total": 39711,
+ "agg_tps_span": 2390.6,
+ "agg_tps_wall": 2373.5,
+ "itl_p50_ms": 19.258,
+ "itl_p99_ms": 78.083,
+ "itl_mean_ms": 41.786,
+ "ttft_p50_ms": 139.22,
+ "tokens_per_req_mean": 397.1,
+ "profile": [
+  [
+   "start",
+   3.267
+  ],
+  [
+   "stop",
+   16.038
+  ]
+ ]
+}
