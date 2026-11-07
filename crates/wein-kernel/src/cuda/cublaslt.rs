@@ -387,6 +387,18 @@ impl BlasLt<'_> {
                 .copied()
                 .collect();
             assert!(!valid.is_empty(), "无可用 algo（returned={returned}，全部 state≠0 或工作区超预算）");
+            // 探针用（`WEIN_LT_FORCE=<idx>`）：全部形状强制同一候选序位。
+            // 调优的计时在 L2 热态下做（单形状 42MB < L2 72MB），而稳态每步
+            // 160 发把 8.41GB 走一遍 ⇒ 每次访问都是 HBM 冷。用本旋钮在**真流**
+            // （`qwen_step_profile` 的 gemm 段）里扫候选，才量得到 crumb。
+            if let Ok(s) = std::env::var("WEIN_LT_FORCE") {
+                if let Ok(i) = s.parse::<usize>() {
+                    let vi = i.min(valid.len() - 1);
+                    let algo = valid[vi].algo;
+                    pins().lock().unwrap().insert((m, n, k, wt), algo);
+                    return ShapePlan { desc, lay_a, lay_b, lay_c, algo };
+                }
+            }
             // 调优门控：m ∈ 调优集才实测择优；其余（瞬态形状）heuristic
             // 首选直钉——两种路径都写进程表，同进程后开实例必同选型
             let algo = if self.tune_m.binary_search(&m).is_ok() {
