@@ -26,6 +26,7 @@ use crate::openai::{
     finish_reason_str, now, openai_error, parse_stop, wein_finish, ChatCompletionRequest,
     CompletionRequest,
 };
+use crate::reasoning::{ReasoningSplitter, Seg};
 use crate::tools::{call_delta, parser_enabled, Piece, ToolParser};
 use crate::ServeState;
 use wein_engine::{EngineEvent, EngineHandle, FinishReason, RequestId, SamplingParams};
@@ -381,7 +382,7 @@ async fn not_found() -> Response {
 
 /// 线格式：chat 用 `delta`/`chat.completion(.chunk)`，completions 用
 /// `text`/`text_completion(.chunk)`（流式对象的 chunk 后缀是 OpenAI 合同）
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Wire {
     Chat,
     Text,
@@ -422,6 +423,45 @@ fn text_chunk(id: &str, created: u64, model: &str, text: &str, finish: Option<&s
         "choices": [{ "index": 0, "text": text, "finish_reason": finish }]
     })
     .to_string()
+}
+
+/// 切分片 → SSE 帧：`Reasoning` 走 `delta.reasoning_content`（vLLM 同名字段），
+/// 正文经工具解析器后再下发（**顺序不可颠倒**：推理段里常出现 `<tool_call>` 的
+/// 格式示例，先过工具解析器会造出假调用）
+fn seg_events(
+    rid: &str,
+    created: u64,
+    model: &str,
+    segs: Vec<Seg>,
+    tp: Option<&mut ToolParser>,
+    n: &mut usize,
+) -> Vec<Event> {
+    let mut evs = Vec::new();
+    let mut tp = tp;
+    for seg in segs {
+        match seg {
+            Seg::Reasoning(s) if s.is_empty() => {}
+            Seg::Reasoning(s) => evs.push(Event::default().data(chat_chunk(
+                rid,
+                created,
+                model,
+                json!({ "reasoning_content": s }),
+                None,
+            ))),
+            Seg::Content(s) if s.is_empty() => {}
+            Seg::Content(s) => match tp.as_deref_mut() {
+                Some(par) => evs.extend(tool_events(rid, created, model, par.feed(&s), n)),
+                None => evs.push(Event::default().data(chat_chunk(
+                    rid,
+                    created,
+                    model,
+                    json!({ "content": s }),
+                    None,
+                ))),
+            },
+        }
+    }
+    evs
 }
 
 /// 解析器输出的一片 → SSE 帧（调用片转 OpenAI `tool_calls` 增量，`index` 递增）
@@ -489,6 +529,8 @@ async fn dispatch(
     stream: bool,
     // `Some(tools)` = 把生成流按工具调用解析（OpenAI `tool_calls` 形状）
     tools: Option<Value>,
+    // 输出侧思维链切分（`</think>`）：推理进 `reasoning_content`
+    reasoning: bool,
 ) -> Response {
     let (id, events) = match st.engine.submit(prompt_ids, p.max_tokens, p.sampling) {
         Ok(v) => v,
@@ -531,6 +573,7 @@ async fn dispatch(
         let rid_s = resp_id.clone();
         let model_s = model.clone();
         let mut tp = tools.map(|t| ToolParser::new(resp_id.clone(), t));
+        let mut rp = reasoning.then(ReasoningSplitter::new);
         let body = async_stream::stream! {
             yield Ok::<Event, Infallible>(first);
             let mut n_call = 0usize;
@@ -538,8 +581,12 @@ async fn dispatch(
             while let Some(o) = gen.next().await {
                 match o {
                     GenOut::Text(t) => {
-                        if let Some(par) = tp.as_mut() {
-                            for ev in tool_events(&rid_s, created, &model_s, par.feed(&t), &mut n_call) {
+                        if wire == Wire::Chat && (rp.is_some() || tp.is_some()) {
+                            let segs = match rp.as_mut() {
+                                Some(r) => r.feed(&t),
+                                None => vec![Seg::Content(t)],
+                            };
+                            for ev in seg_events(&rid_s, created, &model_s, segs, tp.as_mut(), &mut n_call) {
                                 yield Ok(ev);
                             }
                             continue;
@@ -555,7 +602,17 @@ async fn dispatch(
                         yield Ok(ev);
                     }
                     GenOut::Done { reason, .. } => {
-                        // 截断/结束前先把解析器残留吐干净（含未闭合调用 → 正文）
+                        // 截断/结束前先把解析器残留吐干净（未闭合的思考→推理尾巴，
+                        // 未闭合的调用→正文，都不丢字）
+                        if wire == Wire::Chat {
+                            let segs = match rp.as_mut() {
+                                Some(r) => r.finish(),
+                                None => vec![],
+                            };
+                            for ev in seg_events(&rid_s, created, &model_s, segs, tp.as_mut(), &mut n_call) {
+                                yield Ok(ev);
+                            }
+                        }
                         if let Some(par) = tp.as_mut() {
                             for ev in tool_events(&rid_s, created, &model_s, par.finish(), &mut n_call) {
                                 yield Ok(ev);
@@ -598,6 +655,20 @@ async fn dispatch(
                 }
             }
         }
+        // 思维链切分（非流式）：同一状态机整段过一遍 ⇒ 与流式同一语义
+        let mut reasoning_text = String::new();
+        if reasoning {
+            let mut rs = ReasoningSplitter::new();
+            let mut segs = rs.feed(&content);
+            segs.extend(rs.finish());
+            content.clear();
+            for seg in segs {
+                match seg {
+                    Seg::Reasoning(s) => reasoning_text.push_str(&s),
+                    Seg::Content(s) => content.push_str(&s),
+                }
+            }
+        }
         // 工具调用解析（非流式）：整段文本过同一个状态机 ⇒ 与流式同一语义
         let mut calls: Vec<Value> = Vec::new();
         if let Some(t) = tools {
@@ -627,8 +698,15 @@ async fn dispatch(
             Wire::Chat => {
                 // 只有调用没有正文时 content 必须是 null（OpenAI 合同）
                 let mut message = json!({ "role": "assistant" });
-                message["content"] =
-                    if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) };
+                // 只有调用时 content 必须是 null；`</think>` 后残留的空白也算"没有正文"
+                message["content"] = if content.trim().is_empty() && !calls.is_empty() {
+                    Value::Null
+                } else {
+                    json!(content)
+                };
+                if !reasoning_text.is_empty() {
+                    message["reasoning_content"] = json!(reasoning_text);
+                }
                 if !calls.is_empty() {
                     // 非流式的 tool_calls 不带 index（流式才有）
                     let flat: Vec<Value> = calls
@@ -790,6 +868,16 @@ async fn chat_completions(
     };
     let tool_schema =
         req.tools.clone().filter(|_| !tool_choice_none && parser_enabled());
+    // 输出侧思维链：服务端开关（CLI --reasoning-parser 探测模板）+ 本次请求没关思考。
+    // `enable_thinking: false` 时提示里已是闭合的 `<think>\n\n</think>`，输出不再有
+    // `</think>`——此时若仍切分，全部正文会被误判成推理。
+    let thinking_off = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.get("enable_thinking"))
+        .map(|v| v == &Value::Bool(false))
+        .unwrap_or(false);
+    let reasoning = st.reasoning && !thinking_off;
     let resp = dispatch(
         &st,
         Wire::Chat,
@@ -799,6 +887,7 @@ async fn chat_completions(
         p,
         req.stream.unwrap_or(false),
         tool_schema,
+        reasoning,
     )
     .await;
     with_rid(resp, &rid)
@@ -877,6 +966,7 @@ async fn completions(
         p,
         req.stream.unwrap_or(false),
         None,
+        false,
     )
     .await;
     with_rid(resp, &rid)

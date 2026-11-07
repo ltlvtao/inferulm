@@ -8,13 +8,16 @@
 mod api;
 mod detok;
 mod metrics;
+mod marker;
 mod mw;
+mod reasoning;
 mod openai;
 mod tools;
 
 pub use detok::{IncrementalDetok, MockTokenizer, Tokenizer};
 pub use metrics::{Inflight, Metrics};
 pub use openai::ChatMessage;
+pub use reasoning::{ReasoningSplitter, Seg};
 pub use tools::{parser_enabled, Piece, ToolCall, ToolParser};
 
 use std::net::SocketAddr;
@@ -37,6 +40,10 @@ pub struct ServeState {
     pub draining: Arc<AtomicBool>,
     /// 客户端没给 `X-Request-Id` 时的生成序号
     pub req_seq: Arc<AtomicU64>,
+    /// 输出侧思维链解析（`</think>` 切分，vLLM `--reasoning-parser` 同位）。
+    /// 默认关——只有「模板以 `<think>` 收尾」的模型该开（CLI `--reasoning-parser auto`
+    /// 按模板探测）；关时全文进 `content`，行为与旧版完全一致
+    pub reasoning: bool,
 }
 
 impl ServeState {
@@ -53,6 +60,7 @@ impl ServeState {
             inflight: Arc::new(Inflight::default()),
             draining: Arc::new(AtomicBool::new(false)),
             req_seq: Arc::new(AtomicU64::new(1)),
+            reasoning: false,
         }
     }
 }

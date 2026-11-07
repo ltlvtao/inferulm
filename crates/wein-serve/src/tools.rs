@@ -131,14 +131,7 @@ impl ToolParser {
 
 /// 保留的最长「可能是 `<tool_call>` 前缀」的后缀长度
 fn holdback(s: &str) -> usize {
-    let max = OPEN.len() - 1;
-    let bytes = s.as_bytes();
-    let start = bytes.len().saturating_sub(max);
-    // 从最长的候选（最小切点）开始：长后缀能匹配时短后缀必然不是答案
-    // （`<tool_call>` 无自重叠前缀/后缀，最多命中一个）
-    (start..bytes.len())
-        .find(|&cut| s.get(cut..).is_some_and(|suf| OPEN.starts_with(suf)))
-        .unwrap_or(bytes.len())
+    crate::marker::safe_prefix(s, OPEN)
 }
 
 /// `<function=NAME>\n<parameter=K>\nV\n</parameter>…</function>`

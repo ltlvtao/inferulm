@@ -298,7 +298,33 @@ fn main() {
                 Err(_) => eprintln!("warmup 提交失败（引擎已关闭）——跳过"),
             }
         }
-        let state = ServeState::new(model.clone(), tok, engine);
+        // 输出侧思维链解析（vLLM --reasoning-parser 同位）：
+        // auto = 渲染一条探针消息，生成提示以**未闭合**的 `<think>` 收尾就开
+        // （开思考的模型先吐推理再吐 `</think>`，不切分则推理混在 content 里）
+        let rp_mode = arg(&args, "--reasoning-parser", "auto");
+        let reasoning = match rp_mode.as_str() {
+            "none" | "off" => false,
+            "qwen3" | "deepseek_r1" | "on" => true,
+            _ => {
+                let probe = [wein_serve::ChatMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                }];
+                match tok.render_chat_template_with(&probe, &[]) {
+                    Some(Ok(s)) => match s.rfind("<think>") {
+                        Some(i) => !s[i..].contains("</think>"),
+                        None => false,
+                    },
+                    _ => false,
+                }
+            }
+        };
+        let mut state = ServeState::new(model.clone(), tok, engine);
+        state.reasoning = reasoning;
         let server = spawn_server_guarded(state, format!("0.0.0.0:{port}").parse().unwrap())
             .await
             .expect("bind failed");
@@ -312,8 +338,9 @@ fn main() {
         } else {
             graph_tag.to_string()
         };
+        let rp_tag = if reasoning { "+reasoning" } else { "" };
         println!(
-            "wein ({engine_kind}{mem_tag}{exec_tag}) listening on http://{addr}  model={model} \
+            "wein ({engine_kind}{mem_tag}{exec_tag}{rp_tag}) listening on http://{addr}  model={model} \
              ctx_limit={ctx_limit} drain_timeout={drain_ms}ms"
         );
         // SIGINT + SIGTERM 同一路径：停止接纳 → 等在飞 ≤ drain_ms → 退出码 0

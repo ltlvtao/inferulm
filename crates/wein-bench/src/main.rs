@@ -225,8 +225,13 @@ async fn one_request(client: &reqwest::Client, url: &str, model: &str, max_token
                 break 'outer;
             }
             let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
-            let content = v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
-            if !content.is_empty() {
+            // 一个数据帧 = 一个生成 token：正文与思维链（`reasoning_content`）都算。
+            // 只认 content 会把"整段都还在思考"的短请求记成 0 token（tps=0、TTFT=null）
+            let delta = &v["choices"][0]["delta"];
+            let has_tok = ["content", "reasoning_content"]
+                .iter()
+                .any(|k| delta[k].as_str().is_some_and(|s| !s.is_empty()));
+            if has_tok {
                 let now = Instant::now();
                 if stat.ttft_ms.is_none() {
                     stat.ttft_ms = Some(now.duration_since(t0).as_secs_f64() * 1e3);
