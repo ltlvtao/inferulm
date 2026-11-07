@@ -4529,6 +4529,28 @@ unsafe fn block_sum_strided(x: *const u16, base: usize, h: usize, t: usize, bdim
     unsafe {
         let mut acc = 0.0f32;
         let mut i = t;
+        // 8 发独立载入成组先发、再按 i 升序累加：算术序与逐位结果不变，但
+        // 单块（1 行 norm）的串行 stall 从 ⌈h/bdim⌉ 次降到 ⌈h/8bdim⌉ 次——
+        // 1 行 norm 的墙就是"单块喂不满 MLP"，见 bench 报告 nrm 节
+        while i + 7 * bdim < h {
+            let v0 = bf16_to_f32(*x.add(base + i));
+            let v1 = bf16_to_f32(*x.add(base + i + bdim));
+            let v2 = bf16_to_f32(*x.add(base + i + 2 * bdim));
+            let v3 = bf16_to_f32(*x.add(base + i + 3 * bdim));
+            let v4 = bf16_to_f32(*x.add(base + i + 4 * bdim));
+            let v5 = bf16_to_f32(*x.add(base + i + 5 * bdim));
+            let v6 = bf16_to_f32(*x.add(base + i + 6 * bdim));
+            let v7 = bf16_to_f32(*x.add(base + i + 7 * bdim));
+            acc = fma(v0, v0, acc);
+            acc = fma(v1, v1, acc);
+            acc = fma(v2, v2, acc);
+            acc = fma(v3, v3, acc);
+            acc = fma(v4, v4, acc);
+            acc = fma(v5, v5, acc);
+            acc = fma(v6, v6, acc);
+            acc = fma(v7, v7, acc);
+            i += 8 * bdim;
+        }
         while i < h {
             let v = bf16_to_f32(*x.add(base + i));
             acc = fma(v, v, acc);
@@ -4562,6 +4584,34 @@ pub unsafe extern "ptx-kernel" fn rms_norm_zc(
     let total = unsafe { block_sum_strided(x, base, h, t, bdim) };
     let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
     let mut i = t;
+    // 输出段同样 8 发成组：读 x / w 各 8 个独立载入先发，再逐元素写回
+    while i + 7 * bdim < h {
+        let x0 = bf16_to_f32(*x.add(base + i));
+        let x1 = bf16_to_f32(*x.add(base + i + bdim));
+        let x2 = bf16_to_f32(*x.add(base + i + 2 * bdim));
+        let x3 = bf16_to_f32(*x.add(base + i + 3 * bdim));
+        let x4 = bf16_to_f32(*x.add(base + i + 4 * bdim));
+        let x5 = bf16_to_f32(*x.add(base + i + 5 * bdim));
+        let x6 = bf16_to_f32(*x.add(base + i + 6 * bdim));
+        let x7 = bf16_to_f32(*x.add(base + i + 7 * bdim));
+        let w0 = bf16_to_f32(*w.add(i));
+        let w1 = bf16_to_f32(*w.add(i + bdim));
+        let w2 = bf16_to_f32(*w.add(i + 2 * bdim));
+        let w3 = bf16_to_f32(*w.add(i + 3 * bdim));
+        let w4 = bf16_to_f32(*w.add(i + 4 * bdim));
+        let w5 = bf16_to_f32(*w.add(i + 5 * bdim));
+        let w6 = bf16_to_f32(*w.add(i + 6 * bdim));
+        let w7 = bf16_to_f32(*w.add(i + 7 * bdim));
+        *out.add(base + i) = f32_to_bf16(x0 * inv * (1.0 + w0));
+        *out.add(base + i + bdim) = f32_to_bf16(x1 * inv * (1.0 + w1));
+        *out.add(base + i + 2 * bdim) = f32_to_bf16(x2 * inv * (1.0 + w2));
+        *out.add(base + i + 3 * bdim) = f32_to_bf16(x3 * inv * (1.0 + w3));
+        *out.add(base + i + 4 * bdim) = f32_to_bf16(x4 * inv * (1.0 + w4));
+        *out.add(base + i + 5 * bdim) = f32_to_bf16(x5 * inv * (1.0 + w5));
+        *out.add(base + i + 6 * bdim) = f32_to_bf16(x6 * inv * (1.0 + w6));
+        *out.add(base + i + 7 * bdim) = f32_to_bf16(x7 * inv * (1.0 + w7));
+        i += 8 * bdim;
+    }
     while i < h {
         let o = bf16_to_f32(*x.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
         *out.add(base + i) = f32_to_bf16(o);
@@ -4598,6 +4648,34 @@ pub unsafe extern "ptx-kernel" fn add_norm_zc(
         // i 升序 ⇒ 与回读 sum_out 再累加逐位同，省掉一整趟回读）
         let mut acc = 0.0f32;
         let mut i = t;
+        // 4 发成组（a/b 各 4 个独立载入先发）——单块 1 行时这是主延迟
+        while i + 3 * bdim < h {
+            let a0 = bf16_to_f32(*a.add(base + i));
+            let a1 = bf16_to_f32(*a.add(base + i + bdim));
+            let a2 = bf16_to_f32(*a.add(base + i + 2 * bdim));
+            let a3 = bf16_to_f32(*a.add(base + i + 3 * bdim));
+            let b0 = bf16_to_f32(*b.add(base + i));
+            let b1 = bf16_to_f32(*b.add(base + i + bdim));
+            let b2 = bf16_to_f32(*b.add(base + i + 2 * bdim));
+            let b3 = bf16_to_f32(*b.add(base + i + 3 * bdim));
+            let s0 = f32_to_bf16(a0 + b0);
+            let s1 = f32_to_bf16(a1 + b1);
+            let s2 = f32_to_bf16(a2 + b2);
+            let s3 = f32_to_bf16(a3 + b3);
+            *sum_out.add(base + i) = s0;
+            *sum_out.add(base + i + bdim) = s1;
+            *sum_out.add(base + i + 2 * bdim) = s2;
+            *sum_out.add(base + i + 3 * bdim) = s3;
+            let v0 = bf16_to_f32(s0);
+            let v1 = bf16_to_f32(s1);
+            let v2 = bf16_to_f32(s2);
+            let v3 = bf16_to_f32(s3);
+            acc = fma(v0, v0, acc);
+            acc = fma(v1, v1, acc);
+            acc = fma(v2, v2, acc);
+            acc = fma(v3, v3, acc);
+            i += 4 * bdim;
+        }
         while i < h {
             let s = f32_to_bf16(bf16_to_f32(*a.add(base + i)) + bf16_to_f32(*b.add(base + i)));
             *sum_out.add(base + i) = s;
@@ -4608,6 +4686,22 @@ pub unsafe extern "ptx-kernel" fn add_norm_zc(
         let total = block_sum_merge(acc, t, bdim);
         let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
         let mut i = t;
+        // 输出段 4 发成组（sum_out / w 各 4 个独立载入先发）
+        while i + 3 * bdim < h {
+            let x0 = bf16_to_f32(*sum_out.add(base + i));
+            let x1 = bf16_to_f32(*sum_out.add(base + i + bdim));
+            let x2 = bf16_to_f32(*sum_out.add(base + i + 2 * bdim));
+            let x3 = bf16_to_f32(*sum_out.add(base + i + 3 * bdim));
+            let w0 = bf16_to_f32(*w.add(i));
+            let w1 = bf16_to_f32(*w.add(i + bdim));
+            let w2 = bf16_to_f32(*w.add(i + 2 * bdim));
+            let w3 = bf16_to_f32(*w.add(i + 3 * bdim));
+            *norm_out.add(base + i) = f32_to_bf16(x0 * inv * (1.0 + w0));
+            *norm_out.add(base + i + bdim) = f32_to_bf16(x1 * inv * (1.0 + w1));
+            *norm_out.add(base + i + 2 * bdim) = f32_to_bf16(x2 * inv * (1.0 + w2));
+            *norm_out.add(base + i + 3 * bdim) = f32_to_bf16(x3 * inv * (1.0 + w3));
+            i += 4 * bdim;
+        }
         while i < h {
             let o = bf16_to_f32(*sum_out.add(base + i)) * inv * (1.0 + bf16_to_f32(*w.add(i)));
             *norm_out.add(base + i) = f32_to_bf16(o);

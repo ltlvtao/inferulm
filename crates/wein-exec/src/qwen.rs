@@ -3414,12 +3414,15 @@ impl Qwen35Executor {
             && spans.spec.iter().all(|&s| s == 0);
 
         // ── 层循环（x 主路：n1 ← norm(x)；h2 = x + o；x = h2 + mlp）──
+        // 跨层合并：尾残差 add 与本层 ln1 的 norm 合成一发 add_norm_zc（写入
+        // 下一层的 n1），发数 −31/步；算术序 = add 落 bf16 → norm 读回，与
+        // 两发分离路径逐位同。只有第一层的 ln1 留在循环外。
         let mut lin_i = 0usize;
         let mut full_i = 0usize;
         let last_li = self.layers.len() - 1;
+        self.prof_mark("norm");
+        tb.rms_norm_zc.run(&self.scr.x, &self.layers[0].ln1, &self.scr.n1, t32, h, eps, stream);
         for (li, layer) in self.layers.iter().enumerate() {
-            self.prof_mark("norm");
-            tb.rms_norm_zc.run(&self.scr.x, &layer.ln1, &self.scr.n1, t32, h, eps, stream);
             match &layer.attn {
                 AttnDev::Full(w) => {
                     let (qh_n, kvh, hd) = (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
@@ -3642,6 +3645,12 @@ impl Qwen35Executor {
                 tb.add_norm_zc.run(
                     &self.scr.h2, &self.scr.d, &self.norm_f, &self.scr.x, &self.scr.n2, t32, h,
                     eps, stream,
+                );
+            } else if self.fused {
+                // site B：残差 + **下一层 ln1** 一发（跨层合并，发数 −31/步）
+                tb.add_norm_zc.run(
+                    &self.scr.h2, &self.scr.d, &self.layers[li + 1].ln1, &self.scr.x,
+                    &self.scr.n1, t32, h, eps, stream,
                 );
             } else {
                 // site B（每层尾 add + 下一层 ln1）不融合（trace_x 时序/循环重构风险）
