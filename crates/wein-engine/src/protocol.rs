@@ -89,9 +89,14 @@ pub struct EngineRequest {
 pub enum FinishReason {
     /// 命中停止条件（自然停止或 stop 参数）
     Stop,
-    /// 达到 max_tokens，或**容量类**执行失败（页/行/位置上限——请求装不下，
-    /// 语义上等价于"到头了"，见 `Executor::take_failures`）
+    /// 达到 max_tokens
     Length,
+    /// **容量类**执行失败（页池/状态行/位置上限——请求根本装不下，见
+    /// `Executor::take_failures`）。2026-11-08 从 `Length` 拆出：Agent 压测里
+    /// 16 会话撞 KV 池时的对外表现是 `finish_reason: "length"` + **零 token**，
+    /// 客户端会把它当成"被截断、可以重试更短"，而真相是服务端容量不足
+    /// （要扩容或排队）——错误语义错位与"假死"同类，必须可判别
+    Capacity,
     /// 被取消（客户端断开等）
     Aborted,
     /// 请求级执行失败（执行器拒绝/真异常：vocab 越界、采样参数不可满足等）。

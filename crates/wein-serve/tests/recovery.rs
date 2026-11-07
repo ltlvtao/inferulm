@@ -9,7 +9,7 @@
 //! 本文件用**注入式执行器**（记录 `StepError` 而不是 panic）钉死：
 //! - 越界请求在 serve 前置校验处拿到 400（`ctx_limit` 由执行器上报）；
 //! - 执行器级失败以 `finish_reason:"error"`（Invalid）/ `"length"`（Capacity）
-//!   收尾，并在非流式 body 带 `wein_finish`；
+//!   收尾，并在非流式 body 带 `wein_finish`（`capacity` 自成一档）；
 //! - **其后的正常请求仍拿到正确 token**（假死回归的判据）。
 mod common;
 
@@ -184,9 +184,15 @@ async fn r2_invalid_request_errors_then_next_request_succeeds() {
     assert_eq!(ts.stats.accepted_count(), 2);
 }
 
-/// r3 · 容量类失败（页池耗尽）→ `finish_reason:"length"`（可恢复，别的请求不受影响）
+/// r3 · 容量类失败（页池耗尽）→ `finish_reason:"error"` + `wein_finish:"capacity"`
+/// （可恢复，别的请求不受影响）。
+///
+/// 2026-11-08 改判：旧语义是 `length`（"装不下 ≈ 到头了"）。Agent 压测里 16 会话
+/// 撞 KV 池时，客户端看到 `length` + **零 token**，只会当成"被截断、重试更短"，
+/// 而真相是服务端容量不足——这是错误语义错位（与当年 `assert!` 假死同类），
+/// 必须可判别
 #[tokio::test]
-async fn r3_capacity_failure_ends_as_length_and_server_survives() {
+async fn r3_capacity_failure_ends_as_capacity_and_server_survives() {
     let ts = start_poison().await;
     let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))
@@ -196,10 +202,10 @@ async fn r3_capacity_failure_ends_as_length_and_server_survives() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let v: Value = resp.json().await.unwrap();
-    assert_eq!(v["choices"][0]["finish_reason"], "length", "容量类 = length（OpenAI 可解释）");
-    // 容量类是"可解释的截断"：finish_reason 已经是 length，不再额外打
-    // wein_finish（那是 aborted/error 的判别字段）。对照表见汇报。
-    assert!(v.get("wein_finish").is_none(), "capacity → length，无额外判别字段");
+    // finish_reason 落 "error"（OpenAI 协议没有 capacity 这个值），并用
+    // wein_finish 把"容量不足"与"执行器真异常"分开
+    assert_eq!(v["choices"][0]["finish_reason"], "error");
+    assert_eq!(v["wein_finish"], "capacity", "容量不足必须可判别");
 
     let resp = client()
         .post(format!("{}/v1/chat/completions", ts.base))

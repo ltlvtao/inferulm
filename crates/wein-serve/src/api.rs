@@ -164,7 +164,7 @@ fn generation(
             FinishReason::Aborted => {
                 ctx.st.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
             }
-            FinishReason::Error => {
+            FinishReason::Error | FinishReason::Capacity => {
                 ctx.st.metrics.failed.fetch_add(1, Ordering::Relaxed);
             }
         }

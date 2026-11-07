@@ -106,7 +106,7 @@ pub fn finish_reason_str(r: FinishReason) -> &'static str {
         // 的可用性缺陷。故这里输出规范的超集值 "error"，并在非流式 body
         // 顶层附 `wein_finish`（"aborted"/"error"）、流式在终止帧前先发
         // `event: error`，客户端可无歧义判别（`tests/recovery.rs` 钉死）。
-        FinishReason::Aborted | FinishReason::Error => "error",
+        FinishReason::Aborted | FinishReason::Error | FinishReason::Capacity => "error",
     }
 }
 
@@ -115,6 +115,8 @@ pub fn wein_finish(r: FinishReason) -> Option<&'static str> {
     match r {
         FinishReason::Aborted => Some("aborted"),
         FinishReason::Error => Some("error"),
+        // 容量不足独立判别：客户端该扩容/退避，而不是"重试更短的请求"
+        FinishReason::Capacity => Some("capacity"),
         FinishReason::Stop | FinishReason::Length => None,
     }
 }

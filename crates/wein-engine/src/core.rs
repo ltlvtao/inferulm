@@ -186,8 +186,10 @@ impl EngineStats {
 /// 引擎在步间 drain 后按类别终结它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepError {
-    /// 容量类（页池耗尽 / 块表行耗尽 / 绝对位置超上限）= "这段装不下/到头了"
-    /// → 该请求以 `FinishReason::Length` 结束（serve: finish_reason "length"）
+    /// 容量类（页池耗尽 / 块表行耗尽 / 绝对位置超上限）= "这段装不下"
+    /// → 该请求以 `FinishReason::Capacity` 结束（serve: `finish_reason:"error"`
+    /// + `wein_finish:"capacity"`）；**不再**混进 "length"，否则客户端会把
+    /// 服务端容量不足读成"被截断、重试更短"
     Capacity(String),
     /// 请求本身非法或执行器真异常（vocab 越界等）
     /// → 该请求以 `FinishReason::Error` 结束（serve: finish_reason "error"）
@@ -676,8 +678,8 @@ impl EngineCore {
         for (id, err) in exec.take_failures() {
             let reason = match &err {
                 StepError::Capacity(m) => {
-                    tracing::warn!(request = id, "执行器容量不足 → 该请求以 length 结束：{m}");
-                    FinishReason::Length
+                    tracing::warn!(request = id, "执行器容量不足 → 该请求以 capacity 结束：{m}");
+                    FinishReason::Capacity
                 }
                 StepError::Invalid(m) => {
                     tracing::warn!(request = id, "执行器请求级失败 → 该请求以 error 结束：{m}");
