@@ -55,6 +55,13 @@ fn shfl_bfly_f32(x: f32, off: i32) -> f32 {
     f32::from_bits(unsafe { shfl_bfly(0xffff_ffff, x.to_bits() as i32, off, 31) } as u32)
 }
 
+/// f32 的 down shfl（位往返；块归约树用。lane l 取 min(l+off,31)——
+/// l+off>31 时回自身，host 镜像同式）
+#[inline(always)]
+fn shfl_down_f32(x: f32, off: i32) -> f32 {
+    f32::from_bits(unsafe { shfl_down(0xffff_ffff, x.to_bits() as i32, off, 31) } as u32)
+}
+
 /// 快速 exp（v3 容差档专用）：2^(x·log2e) 直落 `ex2.approx.f32`
 /// （llvm.exp2f32 在 nvptx 的唯一 HW 落点；相对误差 ~2^-22 ≪ rel2 门 3e-3）。
 /// 位级档（online/tile/decode）仍走精确 `expf`，一字不动。
@@ -4445,24 +4452,81 @@ pub unsafe extern "ptx-kernel" fn attn_combine(
 /// 行平方和的跨线程归约（**块内 smem 交换区**，per-block 私有）。
 ///
 /// 线程 t 跨步占有元素 {t, t+bdim, ...}（连续线程连续地址——合并访存），
-/// 部分和 i 升序；`_syncthreads` 后线程 0 顺序合并 u 升序
-/// `total = s[u] + total`——reference.rs 按同式同序标量镜像（位对齐合同保持）。
+/// 部分和 i 升序；合并见 `block_sum_merge`（整 warp 走 shfl 树，窄块走
+/// smem 串行折叠）——reference.rs 按同式同序标量镜像（位对齐合同保持）。
 ///
-/// **为什么从全局 scratch 搬 smem**：stdarch nvptx 无 shfl、无块内指针通用的
-/// 归约通道，早先只能借 `scratch` 全局槽（每块 1KB 写 + 1KB 读，每读一条
+/// **为什么从全局 scratch 搬 smem**：stdarch nvptx 早先无 shfl、无块内指针
+/// 通用的归约通道，只能借 `scratch` 全局槽（每块 1KB 写 + 1KB 读，每读一条
 /// 吃一次 L2 时延，256 条串在循环回边上）。`#[link_section=".shared"]` 静态
 /// 经 build.rs 的 smem 改写落成**块私有**段（deltanet 的 `DN_SX` 同款），
-/// 于是同一份部分和落在片上：写/读都是 LDS，线程 0 的折叠只剩 f32 加法链。
-/// **归约序一个字没动**（u 升序、`s[u] + total`）⇒ 位同。
+/// 于是同一份部分和落在片上。
 #[link_section = ".shared"]
 static mut NRM_S: [f32; 256] = [0.0; 256];
 
+/// 部分和的块内合并：**warp 树**（bdim ≥ 32 的整 warp）或串行折叠（窄块）。
+///
+/// 树档：per-thread 部分和 → warp 内 5 级 `shfl.down`（`v = v + v[l+off]`）
+/// → 各 warp 首槽落 smem → 一次 syncthreads → **每个 warp 各自再 5 级合并**
+/// （全 warp 得同值，免第二道屏障与广播槽）。取 256 项串行折叠（≈1.1µs
+/// 依赖链，thread 0 独担）换成 ~10 条 shfl——单块 c=1 的 norm 单价主税。
+/// 窄块（bdim<32，无整 warp）仍走 u 升序串行折叠 + 补零到 256（`+0.0` 对
+/// 非负部分和精确 ⇒ 与"只到 bdim"逐位同）。reference.rs 按同式同序镜像
+/// （`rms_block_sum` 的 merge 段）——kernel↔参考仍位对齐。
 #[inline(always)]
-unsafe fn block_sum_strided(x: *const u16, base: usize, h: usize, t: usize, bdim: usize) -> f32 {
+unsafe fn block_sum_merge(acc: f32, t: usize, bdim: usize) -> f32 {
     unsafe {
         let sp = core::ptr::with_exposed_provenance_mut::<f32>(
             core::ptr::addr_of_mut!(NRM_S) as usize,
         );
+        if bdim >= 32 && bdim % 32 == 0 {
+            let (lane, w, nw) = (t & 31, t >> 5, bdim >> 5);
+            let mut v = acc;
+            let mut off = 16i32;
+            while off > 0 {
+                v = v + shfl_down_f32(v, off);
+                off >>= 1;
+            }
+            if lane == 0 {
+                *sp.add(w) = v;
+            }
+            _syncthreads();
+            let mut u = if lane < nw { *sp.add(lane) } else { 0.0 };
+            let mut off = 16i32;
+            while off > 0 {
+                u = u + shfl_down_f32(u, off);
+                off >>= 1;
+            }
+            // down 树只有 lane 0 拿到总和——广播到全 warp（窄块档靠 sp[0] 广播）
+            shfl_idx_f32(0xffff_ffff, u, 0, 31)
+        } else {
+            *sp.add(t) = acc;
+            let mut z = t + bdim;
+            while z < 256 {
+                *sp.add(z) = 0.0;
+                z += bdim;
+            }
+            _syncthreads();
+            if t == 0 {
+                let mut total = 0.0f32;
+                let mut u = 0usize;
+                while u < 256 {
+                    total = *sp.add(u) + total;
+                    total = *sp.add(u + 1) + total;
+                    total = *sp.add(u + 2) + total;
+                    total = *sp.add(u + 3) + total;
+                    u += 4;
+                }
+                *sp.add(0) = total;
+            }
+            _syncthreads();
+            *sp
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn block_sum_strided(x: *const u16, base: usize, h: usize, t: usize, bdim: usize) -> f32 {
+    unsafe {
         let mut acc = 0.0f32;
         let mut i = t;
         while i < h {
@@ -4470,29 +4534,7 @@ unsafe fn block_sum_strided(x: *const u16, base: usize, h: usize, t: usize, bdim
             acc = fma(v, v, acc);
             i += bdim;
         }
-        *sp.add(t) = acc;
-        // 块宽 < 256 时把 [bdim, 256) 的闲槽铺 0：`+0.0` 对非负部分和
-        // （平方和恒 ≥ +0）精确 ⇒ 展开到 256 项的归约序与"只到 bdim"逐位同
-        let mut z = t + bdim;
-        while z < 256 {
-            *sp.add(z) = 0.0;
-            z += bdim;
-        }
-        _syncthreads();
-        if t == 0 {
-            let mut total = 0.0f32;
-            let mut u = 0usize;
-            while u < 256 {
-                total = *sp.add(u) + total;
-                total = *sp.add(u + 1) + total;
-                total = *sp.add(u + 2) + total;
-                total = *sp.add(u + 3) + total;
-                u += 4;
-            }
-            *sp.add(0) = total;
-        }
-        _syncthreads();
-        *sp
+        block_sum_merge(acc, t, bdim)
     }
 }
 
@@ -4552,14 +4594,18 @@ pub unsafe extern "ptx-kernel" fn add_norm_zc(
     let h = hidden as usize;
     let base = row * h;
     unsafe {
+        // 一趟：写 sum_out 的同时把**已收 bf16 的值**平方累加（同跨步同
+        // i 升序 ⇒ 与回读 sum_out 再累加逐位同，省掉一整趟回读）
+        let mut acc = 0.0f32;
         let mut i = t;
         while i < h {
-            *sum_out.add(base + i) =
-                f32_to_bf16(bf16_to_f32(*a.add(base + i)) + bf16_to_f32(*b.add(base + i)));
+            let s = f32_to_bf16(bf16_to_f32(*a.add(base + i)) + bf16_to_f32(*b.add(base + i)));
+            *sum_out.add(base + i) = s;
+            let v = bf16_to_f32(s);
+            acc = fma(v, v, acc);
             i += bdim;
         }
-        // 写/读同线程同地址（同跨步占有）——无需屏障即读到自写值
-        let total = block_sum_strided(sum_out, base, h, t, bdim);
+        let total = block_sum_merge(acc, t, bdim);
         let inv = 1.0f32 / core::intrinsics::sqrt::<f32>(total / hidden as f32 + eps);
         let mut i = t;
         while i < h {

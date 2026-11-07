@@ -354,12 +354,49 @@ pub fn softplus(x: f32) -> f32 {
     }
 }
 
+/// 块归约 merge 段镜像（与 kernels::block_sum_merge 同式同序）：
+/// 整 warp（bdim ≥ 32 的 32 倍数）走两级 shfl.down 树（warp 内 5 级 →
+/// nw 个 warp 首槽再 5 级），窄块走 u 升序串行折叠。
+fn merge_parts(s: &[f32]) -> f32 {
+    let bdim = s.len();
+    if bdim >= 32 && bdim % 32 == 0 {
+        let nw = bdim / 32;
+        let mut warp = vec![0f32; nw];
+        for w in 0..nw {
+            let mut l = s[w * 32..w * 32 + 32].to_vec();
+            for &off in &[16usize, 8, 4, 2, 1] {
+                for i in 0..32 {
+                    if i + off < 32 {
+                        l[i] = l[i] + l[i + off];
+                    }
+                }
+            }
+            warp[w] = l[0];
+        }
+        let mut l2 = vec![0f32; 32];
+        l2[..nw].copy_from_slice(&warp);
+        for &off in &[16usize, 8, 4, 2, 1] {
+            for i in 0..32 {
+                if i + off < 32 {
+                    l2[i] = l2[i] + l2[i + off];
+                }
+            }
+        }
+        l2[0]
+    } else {
+        let mut total = 0.0f32;
+        for u in 0..bdim {
+            total = s[u] + total;
+        }
+        total
+    }
+}
+
 /// 行平方和块归约镜像（与 kernels::block_sum_strided 同式同序）：
 /// block 宽 bdim = min(hidden,256).next_power_of_two()（host 同式），
 /// "线程" t 跨步占有 {t, t+bdim, ...} 部分和（i 升序，`acc = v·v + acc`）
-/// → 线程 0 顺序合并 u 升序 `total = s[u] + total`。GPU 块归约的确定性
-/// 序在标量域逐步复现——kernel↔参考位对齐保持（序 ≠ 单线程顺序累加，
-/// 但两侧一致）
+/// → merge_parts。GPU 块归约的确定性序在标量域逐步复现——kernel↔参考
+/// 位对齐保持（序 ≠ 单线程顺序累加，但两侧一致）
 fn rms_block_sum(x: &[u16], base: usize, hidden: usize) -> f32 {
     let bdim = hidden.min(256).next_power_of_two();
     let mut s = vec![0f32; bdim];
@@ -373,11 +410,7 @@ fn rms_block_sum(x: &[u16], base: usize, hidden: usize) -> f32 {
         }
         s[t] = acc;
     }
-    let mut total = 0.0f32;
-    for u in 0..bdim {
-        total = s[u] + total;
-    }
-    total
+    merge_parts(&s)
 }
 
 /// 零中心 RMSNorm（Qwen3_5RMSNorm 同语义）：out = x·rsqrt(mean(x²)+eps)·(1+w)，
