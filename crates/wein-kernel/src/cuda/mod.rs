@@ -398,8 +398,23 @@ impl DevBuf<'_> {
 
 impl Drop for DevBuf<'_> {
     fn drop(&mut self) {
-        if self.owned {
-            self.drv.mem_free(self.ptr).expect("cuMemFree");
+        if !self.owned {
+            return;
+        }
+        // 终止路径上释放失败是**预期**：进程退出时 CUDA 上下文已被销毁，
+        // `cuMemFree` 只能拿到 INVALID_CONTEXT/DEINITIALIZED/CONTEXT_IS_DESTROYED
+        // ——显存随上下文一起由驱动回收。这里不能 `expect`：panic 发生在 Drop 里
+        // 会 abort（实测 SIGTERM 停服 → "Segmentation fault (core dumped)"，
+        // 运维看着像崩溃）。其余错误码照旧炸，泄漏检测不放水。
+        use crate::cuda::driver::{
+            CUDA_ERROR_CONTEXT_IS_DESTROYED, CUDA_ERROR_DEINITIALIZED, CUDA_ERROR_INVALID_CONTEXT,
+        };
+        if let Err(e) = self.drv.mem_free(self.ptr) {
+            let gone = matches!(
+                e.code,
+                CUDA_ERROR_DEINITIALIZED | CUDA_ERROR_INVALID_CONTEXT | CUDA_ERROR_CONTEXT_IS_DESTROYED
+            );
+            assert!(gone, "cuMemFree: {e:?}");
         }
     }
 }

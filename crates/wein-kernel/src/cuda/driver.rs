@@ -10,6 +10,11 @@ use libloading::Library;
 
 pub type CuResult = c_int;
 pub const CUDA_SUCCESS: CuResult = 0;
+/// 上下文已销毁类错误码（终止路径上 `cuMemFree` 的**预期**返回）：
+/// CUDA_ERROR_DEINITIALIZED / CUDA_ERROR_INVALID_CONTEXT / CONTEXT_IS_DESTROYED
+pub const CUDA_ERROR_DEINITIALIZED: CuResult = 3;
+pub const CUDA_ERROR_INVALID_CONTEXT: CuResult = 4;
+pub const CUDA_ERROR_CONTEXT_IS_DESTROYED: CuResult = 709;
 
 /// cuMemcpyBatchAsync 的段描述（Rust 侧形态；驱动 API 是并列数组，wrapper 摊平）
 #[repr(C)]
