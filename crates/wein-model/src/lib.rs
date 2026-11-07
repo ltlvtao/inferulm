@@ -14,7 +14,7 @@ mod tokenizer;
 mod weights;
 
 pub use config::{LayerType, Qwen35Config};
-pub use template::{ChatMsg, ChatTemplate};
+pub use template::{normalize_tool_calls, ChatMsg, ChatTemplate};
 pub use tokenizer::HfTokenizer;
 pub use weights::{Dtype, TensorRef, WeightStore};
 

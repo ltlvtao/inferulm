@@ -26,6 +26,7 @@ use crate::openai::{
     finish_reason_str, now, openai_error, parse_stop, wein_finish, ChatCompletionRequest,
     CompletionRequest,
 };
+use crate::tools::{call_delta, parser_enabled, Piece, ToolParser};
 use crate::ServeState;
 use wein_engine::{EngineEvent, EngineHandle, FinishReason, RequestId, SamplingParams};
 
@@ -423,6 +424,34 @@ fn text_chunk(id: &str, created: u64, model: &str, text: &str, finish: Option<&s
     .to_string()
 }
 
+/// 解析器输出的一片 → SSE 帧（调用片转 OpenAI `tool_calls` 增量，`index` 递增）
+fn tool_events(rid: &str, created: u64, model: &str, ps: Vec<Piece>, n: &mut usize) -> Vec<Event> {
+    let mut evs = Vec::new();
+    for p in ps {
+        match p {
+            Piece::Content(s) if s.is_empty() => {}
+            Piece::Content(s) => evs.push(Event::default().data(chat_chunk(
+                rid,
+                created,
+                model,
+                json!({ "content": s }),
+                None,
+            ))),
+            Piece::Call(c) => {
+                evs.push(Event::default().data(chat_chunk(
+                    rid,
+                    created,
+                    model,
+                    call_delta(*n, &c),
+                    None,
+                )));
+                *n += 1;
+            }
+        }
+    }
+    evs
+}
+
 /// 异常收尾的 SSE 帧：先一帧 `event: error`（可判别），再一帧带
 /// `finish_reason = "error"` 的终止块。
 fn error_frames(rid: &str, reason: FinishReason) -> Vec<Event> {
@@ -458,6 +487,8 @@ async fn dispatch(
     prompt_tokens: usize,
     p: Prepared,
     stream: bool,
+    // `Some(tools)` = 把生成流按工具调用解析（OpenAI `tool_calls` 形状）
+    tools: Option<Value>,
 ) -> Response {
     let (id, events) = match st.engine.submit(prompt_ids, p.max_tokens, p.sampling) {
         Ok(v) => v,
@@ -499,12 +530,20 @@ async fn dispatch(
         };
         let rid_s = resp_id.clone();
         let model_s = model.clone();
+        let mut tp = tools.map(|t| ToolParser::new(resp_id.clone(), t));
         let body = async_stream::stream! {
             yield Ok::<Event, Infallible>(first);
+            let mut n_call = 0usize;
             let mut gen = Box::pin(gen);
             while let Some(o) = gen.next().await {
                 match o {
                     GenOut::Text(t) => {
+                        if let Some(par) = tp.as_mut() {
+                            for ev in tool_events(&rid_s, created, &model_s, par.feed(&t), &mut n_call) {
+                                yield Ok(ev);
+                            }
+                            continue;
+                        }
                         let ev = match wire {
                             Wire::Chat => Event::default().data(chat_chunk(
                                 &rid_s, created, &model_s, json!({ "content": t }), None,
@@ -516,10 +555,21 @@ async fn dispatch(
                         yield Ok(ev);
                     }
                     GenOut::Done { reason, .. } => {
+                        // 截断/结束前先把解析器残留吐干净（含未闭合调用 → 正文）
+                        if let Some(par) = tp.as_mut() {
+                            for ev in tool_events(&rid_s, created, &model_s, par.finish(), &mut n_call) {
+                                yield Ok(ev);
+                            }
+                        }
                         for ev in error_frames(&rid_s, reason) {
                             yield Ok(ev);
                         }
-                        let fin = finish_reason_str(reason);
+                        // 有调用且正常停 ⇒ OpenAI 合同 finish_reason = "tool_calls"
+                        let fin = if n_call > 0 && matches!(reason, FinishReason::Stop) {
+                            "tool_calls"
+                        } else {
+                            finish_reason_str(reason)
+                        };
                         let ev = match wire {
                             Wire::Chat => Event::default().data(chat_chunk(
                                 &rid_s, created, &model_s, json!({}), Some(fin),
@@ -548,19 +598,53 @@ async fn dispatch(
                 }
             }
         }
-        let fin = finish_reason_str(reason);
+        // 工具调用解析（非流式）：整段文本过同一个状态机 ⇒ 与流式同一语义
+        let mut calls: Vec<Value> = Vec::new();
+        if let Some(t) = tools {
+            let mut par = ToolParser::new(resp_id.clone(), t);
+            let mut ps = par.feed(&content);
+            ps.extend(par.finish());
+            let mut text = String::new();
+            for piece in ps {
+                match piece {
+                    Piece::Content(s) => text.push_str(&s),
+                    Piece::Call(c) => { calls.push(call_delta(calls.len(), &c)); }
+                }
+            }
+            content = text;
+        }
+        let fin = if !calls.is_empty() && matches!(reason, FinishReason::Stop) {
+            "tool_calls"
+        } else {
+            finish_reason_str(reason)
+        };
         let usage = json!({
             "prompt_tokens": prompt_tokens,
             "completion_tokens": tokens,
             "total_tokens": prompt_tokens + tokens as usize,
         });
         let choices = match wire {
-            Wire::Chat => json!([{
-                "index": 0,
-                "message": { "role": "assistant", "content": content },
-                "finish_reason": fin,
-                "logprobs": null,
-            }]),
+            Wire::Chat => {
+                // 只有调用没有正文时 content 必须是 null（OpenAI 合同）
+                let mut message = json!({ "role": "assistant" });
+                message["content"] =
+                    if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) };
+                if !calls.is_empty() {
+                    // 非流式的 tool_calls 不带 index（流式才有）
+                    let flat: Vec<Value> = calls
+                        .iter()
+                        .map(|c| {
+                            let mut c = c["tool_calls"][0].clone();
+                            c.as_object_mut().map(|o| o.remove("index"));
+                            c
+                        })
+                        .collect();
+                    message["tool_calls"] = Value::Array(flat);
+                }
+                json!([{
+                    "index": 0, "message": message, "finish_reason": fin, "logprobs": null,
+                }])
+            }
             Wire::Text => json!([{
                 "index": 0, "text": content, "logprobs": null, "finish_reason": fin,
             }]),
@@ -616,9 +700,66 @@ async fn chat_completions(
             &rid,
         );
     }
+    // 工具调用（tools）：`tools` 必须是数组（vLLM 同约束，坏形状 400 而非
+    // 拿去做 prompt）；`tool_choice` 只认 none/auto/required/函数对象。
+    // `none` ⇒ 不把工具描述注入 prompt（模型看不到就不会调），也不做解析。
+    if let Some(t) = &req.tools {
+        if !t.is_array() {
+            return with_rid(
+                openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "'tools' must be an array of function definitions",
+                ),
+                &rid,
+            );
+        }
+    }
+    let tool_choice_none = match &req.tool_choice {
+        None => false,
+        Some(Value::String(s)) if s == "none" => true,
+        Some(Value::String(s)) if s == "auto" || s == "required" => false,
+        Some(Value::Object(_)) => false,
+        Some(_) => {
+            return with_rid(
+                openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "'tool_choice' must be \"none\", \"auto\", \"required\" or a function object",
+                ),
+                &rid,
+            )
+        }
+    };
+
     // chat 模板（W5 真身）：tokenizer 有模板即渲染（模型侧 raise → 400）；
-    // 无模板（mock/未接）回退占位包装——既有验收即 parity
-    let prompt_ids = match st.tokenizer.render_chat_template(&req.messages) {
+    // 无模板（mock/未接）回退占位包装——既有验收即 parity。
+    // 模板顶层 kwargs：`tools`（函数调用，vLLM 同语义）+ `chat_template_kwargs`
+    // 直通（`enable_thinking` 等）；两者都只在模板侧消费，serve 不做解释
+    let mut extra: Vec<(String, Value)> = Vec::new();
+    if let Some(t) = req.tools.as_ref().filter(|_| !tool_choice_none) {
+        extra.push(("tools".into(), t.clone()));
+    }
+    if let Some(k) = &req.chat_template_kwargs {
+        match k.as_object() {
+            Some(obj) => {
+                for (name, v) in obj {
+                    extra.push((name.clone(), v.clone()));
+                }
+            }
+            None => {
+                return with_rid(
+                    openai_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "'chat_template_kwargs' must be an object",
+                    ),
+                    &rid,
+                )
+            }
+        }
+    }
+    let prompt_ids = match st.tokenizer.render_chat_template_with(&req.messages, &extra) {
         Some(Ok(text)) => st.tokenizer.encode(&text),
         Some(Err(msg)) => {
             return with_rid(
@@ -627,8 +768,11 @@ async fn chat_completions(
             )
         }
         None => {
-            let prompt: String =
-                req.messages.iter().map(|m| format!("{}: {}\n", m.role, m.content)).collect();
+            let prompt: String = req
+                .messages
+                .iter()
+                .map(|m| format!("{}: {}\n", m.role, m.content.as_deref().unwrap_or("")))
+                .collect();
             st.tokenizer.encode(&prompt)
         }
     };
@@ -644,6 +788,8 @@ async fn chat_completions(
         Ok(v) => v,
         Err(r) => return with_rid(r, &rid),
     };
+    let tool_schema =
+        req.tools.clone().filter(|_| !tool_choice_none && parser_enabled());
     let resp = dispatch(
         &st,
         Wire::Chat,
@@ -652,6 +798,7 @@ async fn chat_completions(
         prompt_tokens,
         p,
         req.stream.unwrap_or(false),
+        tool_schema,
     )
     .await;
     with_rid(resp, &rid)
@@ -729,6 +876,7 @@ async fn completions(
         prompt_tokens,
         p,
         req.stream.unwrap_or(false),
+        None,
     )
     .await;
     with_rid(resp, &rid)

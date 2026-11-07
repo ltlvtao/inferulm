@@ -40,7 +40,12 @@ impl Tokenizer for HfServing {
             t.render(
                 &messages
                     .iter()
-                    .map(|m| ChatMsg { role: m.role.clone(), content: m.content.clone() })
+                    .map(|m| ChatMsg {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_calls: m.tool_calls.clone(),
+                        reasoning_content: m.reasoning_content.clone(),
+                    })
                     .collect::<Vec<_>>(),
             )
             .map_err(|e| e.to_string())
@@ -133,7 +138,12 @@ async fn q12_chat_endpoint_template_end_to_end() {
     };
     // 期望值独立计算：模板渲染 → encode 的 token 数
     let rendered = tpl
-        .render(&[ChatMsg { role: "user".into(), content: "The capital of France is".into() }])
+        .render(&[ChatMsg {
+            role: "user".into(),
+            content: Some("The capital of France is".into()),
+            tool_calls: None,
+            reasoning_content: None,
+        }])
         .unwrap();
     let want = hf.encode(&rendered).len();
 
@@ -226,7 +236,9 @@ async fn q13_multi_turn_chat_prefix_reuse() {
 
     let mut msgs: Vec<ChatMsg> = vec![ChatMsg {
         role: "user".into(),
-        content: "Name the three primary colors of light.".into(),
+        content: Some("Name the three primary colors of light.".into()),
+        tool_calls: None,
+        reasoning_content: None,
     }];
     let mut prev_tokens = 0u64;
     for turn in 1..=3u32 {
@@ -257,10 +269,17 @@ async fn q13_multi_turn_chat_prefix_reuse() {
         eprintln!("q13 turn {turn}: prompt_tokens={got} content={content:?}");
         assert!(!content.is_empty(), "第 {turn} 轮续写必须非空");
         // 回灌：assistant 输出进 messages（下一轮前缀 = 本轮渲染串 + 输出 + 新问）
-        msgs.push(ChatMsg { role: "assistant".into(), content });
+        msgs.push(ChatMsg {
+            role: "assistant".into(),
+            content: Some(content),
+            tool_calls: None,
+            reasoning_content: None,
+        });
         msgs.push(ChatMsg {
             role: "user".into(),
-            content: format!("Turn {turn}: continue."),
+            content: Some(format!("Turn {turn}: continue.")),
+            tool_calls: None,
+            reasoning_content: None,
         });
     }
 }

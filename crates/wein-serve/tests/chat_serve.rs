@@ -33,7 +33,10 @@ impl Tokenizer for TplTok {
         if self.fail {
             return Some(Err("No user query found in messages.".into()));
         }
-        Some(Ok(m.iter().map(|m| format!("[{}]{}", m.role, m.content)).collect()))
+        Some(Ok(m
+            .iter()
+            .map(|m| format!("[{}]{}", m.role, m.content.as_deref().unwrap_or("")))
+            .collect()))
     }
     fn eos_id(&self) -> Option<u32> {
         self.eos

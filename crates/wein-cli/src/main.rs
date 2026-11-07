@@ -40,13 +40,26 @@ impl Tokenizer for HfServing {
         &self,
         messages: &[wein_serve::ChatMessage],
     ) -> Option<Result<String, String>> {
+        self.render_chat_template_with(messages, &[])
+    }
+    fn render_chat_template_with(
+        &self,
+        messages: &[wein_serve::ChatMessage],
+        extra: &[(String, serde_json::Value)],
+    ) -> Option<Result<String, String>> {
         // 模板在场即真身；模型目录无模板 → None（serve 回退占位）
         self.tpl.as_ref().map(|t| {
-            t.render(
+            t.render_with(
                 &messages
                     .iter()
-                    .map(|m| wein_model::ChatMsg { role: m.role.clone(), content: m.content.clone() })
+                    .map(|m| wein_model::ChatMsg {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_calls: m.tool_calls.clone(),
+                        reasoning_content: m.reasoning_content.clone(),
+                    })
                     .collect::<Vec<_>>(),
+                extra,
             )
             .map_err(|e| e.to_string())
         })

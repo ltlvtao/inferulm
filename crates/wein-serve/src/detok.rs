@@ -15,6 +15,16 @@ pub trait Tokenizer: Send + Sync {
     fn render_chat_template(&self, _messages: &[crate::openai::ChatMessage]) -> Option<Result<String, String>> {
         None
     }
+    /// 同上，外加模板顶层 kwargs（`tools` / `enable_thinking` 等 vLLM 语义）。
+    /// 默认忽略 kwargs 转调无参版——**只有真模板实现（cli 桥接）需要覆盖**；
+    /// 覆盖者必须把 `tools` 交给模板，否则工具描述静默丢失。
+    fn render_chat_template_with(
+        &self,
+        messages: &[crate::openai::ChatMessage],
+        _extra: &[(String, serde_json::Value)],
+    ) -> Option<Result<String, String>> {
+        self.render_chat_template(messages)
+    }
     /// eos token id（W5）：作为引擎 stop_token_ids——采样命中即停且不外吐。
     /// None = 无（行为与 W5 前全同）
     fn eos_id(&self) -> Option<u32> {

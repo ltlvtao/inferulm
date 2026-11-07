@@ -9,10 +9,23 @@ use serde_json::{json, Value};
 
 use wein_engine::FinishReason;
 
+/// chat 消息。**`content` 可空**（OpenAI 合同：带 `tool_calls` 的 assistant
+/// 消息 content 常为 null）；`tool_calls` / `tool_call_id` / `reasoning_content`
+/// 原样透传给 chat 模板（模板按 `message.tool_calls[i].function.{name,arguments}`
+/// 回放历史调用、按 `message.reasoning_content` 回放思维链）。
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +38,16 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f64>,
     /// OpenAI 语义：string 或 string[]（≤4 个）
     pub stop: Option<Value>,
+    /// 函数调用（OpenAI tools 数组，原样喂模板 `tools` 变量）。
+    /// `Some` ⇒ 本次响应启用工具调用解析（见 `tools.rs`）
+    #[serde(default)]
+    pub tools: Option<Value>,
+    /// "none"/"auto"/{"type":"function",...}——模板未消费，仅记录合法性
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    /// vLLM 扩展：模板顶层 kwarg（如 `enable_thinking: false`）
+    #[serde(default)]
+    pub chat_template_kwargs: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

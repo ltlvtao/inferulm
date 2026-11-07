@@ -10,10 +10,12 @@ mod detok;
 mod metrics;
 mod mw;
 mod openai;
+mod tools;
 
 pub use detok::{IncrementalDetok, MockTokenizer, Tokenizer};
 pub use metrics::{Inflight, Metrics};
 pub use openai::ChatMessage;
+pub use tools::{parser_enabled, Piece, ToolCall, ToolParser};
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
