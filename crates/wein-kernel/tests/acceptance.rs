@@ -132,11 +132,13 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry paged_attn_v5("), "paged_attn_v5 入口缺失/被改名");
     // attention v9 档（手写 PTX：LDSM + mma.sync + 99KB 动态 smem）
     assert!(ptx.contains(".entry paged_attn_v9("), "paged_attn_v9 入口缺失/被改名");
+    // 满载 skinny-m 自写 GEMM（默认关：`WEIN_SKINNY=1` 才接管 m∈[16,128]）
+    assert!(ptx.contains(".entry gemm_skinny("), "gemm_skinny 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        70,
-        "导出 kernel 数应为 70（68 + HEAD 02d8bae 的 norm 载入成组：rms_norm_zc / \
-         add_norm_zc——该提交加了入口但没抬此计数；已在上方逐个断言）"
+        71,
+        "导出 kernel 数应为 71（70 + gemm_skinny——默认关的满载 skinny-m 自写 GEMM；\
+         已在上方逐个断言）"
     );
 }
 

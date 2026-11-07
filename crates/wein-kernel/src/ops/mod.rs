@@ -270,7 +270,8 @@ impl OpTable<'_> {
                 reason: format!("libcublasLt 打不开：{e}"),
                 impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
             }])?,
-        ), gemv: Some(GemvCuda { gpu, f: m.func("gemv_bf16"), frow: m.func("gemv_bf16_row") }) };
+        ), gemv: Some(GemvCuda { gpu, f: m.func("gemv_bf16"), frow: m.func("gemv_bf16_row") }),
+             skinny: Some(SkinnyGemmCuda { gpu, f: m.func("gemm_skinny") }) };
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
             silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, zero_rows, gemv, rope_pt, sigmul, conv1d_dw, conv_state_roll,
             conv1d_dw_roll,
@@ -559,6 +560,45 @@ impl GemvOp for GemvCuda<'_> {
 
 /// block-per-row 档的 n 上限（实测分界：n≤256 时 warp-per-row 块数不足）
 pub const GEMV_ROW_N: u32 = 256;
+
+// ── 满载 skinny-m GEMM（`gemm_skinny`，见 kernels 注释）──
+/// 每块 n 片宽（列）——须与 kernel 的 SK_NT 一致
+pub const SKINNY_NT: u32 = 64;
+/// 每 chunk k 宽——须与 kernel 的 SK_KC 一致
+pub const SKINNY_KC: u32 = 64; // 必须与 kernel 的 SK_KC 同步（k 片宽）
+/// 接管区间（m<16：GEMV/heuristic 已贴顶；m>128：走大 m 的厂商路径）
+pub const SKINNY_M_MIN: u32 = 16;
+pub const SKINNY_M_MAX: u32 = 128;
+
+/// `WEIN_SKINNY` 门控（**默认关**：in-stream 实测与 cuBLASLt 同档，
+/// 11.82 vs 11.99ms/步，负结果留库不接线；`=1` 可复验）
+fn skinny_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WEIN_SKINNY").map(|v| v == "1").unwrap_or(false))
+}
+
+pub trait SkinnyGemmOp {
+    /// c[m,n] = a[m,k]·w[n,k]ᵀ（bf16 入出、f32 累加）
+    fn run(&self, w: &DevBuf, a: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct SkinnyGemmCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+}
+
+impl SkinnyGemmOp for SkinnyGemmCuda<'_> {
+    fn run(&self, w: &DevBuf, a: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        let args = crate::kernel_args![*a, *w, *c, m, n, k];
+        // bdim=128 只有 1 个 m-tile 组（m≤64）；256 时 2 组
+        let bdim = if m <= 64 { 128 } else { 256 };
+        self.gpu.launch(&self.f, n / SKINNY_NT, bdim, &args, stream);
+    }
+    fn name(&self) -> &'static str {
+        "gemm_skinny/cuda"
+    }
+}
 
 /// 批量行零化（`zero_rows`）：一次 launch 覆盖表里全部池的一行。
 /// 表项 16B = `ptr: u64` + `stride | len << 32`（宿主侧建表，见 exec）。
@@ -3345,6 +3385,12 @@ pub struct GemmLt<'a> {
     /// m=1 直路 GEMV（`WEIN_GEMV=1` 时接管 m==1 的 `run_wt`）：省掉
     /// cuBLASLt 的 split-K 归约发数与 kernel 固定代价
     pub(crate) gemv: Option<GemvCuda<'a>>,
+    /// 满载 skinny-m 自写 GEMM（`WEIN_SKINNY=1` 时接管 m∈[16,128] 的
+    /// `run_wt`）：块=64 列 n 片（8192 ⇒ 128 块填满 SM）、权重每字节只读
+    /// 一次。**默认关，负结果**——A 片必须每块各读一遍 ⇒ 总流量
+    /// (rows16/64)× 权重字节（m=100 ⇒ 1.75×W），实测 in-stream gemm 段
+    /// 23.36ms/步 vs cuBLASLt 11.67（2.0× 慢），见 kernel 头部判决注
+    pub(crate) skinny: Option<SkinnyGemmCuda<'a>>,
 }
 
 /// `WEIN_GEMV` 门控（默认开：m=1 与 cuBLASLt 逐位同，且省掉 split-K 归约发；
@@ -3361,6 +3407,11 @@ impl GemmLt<'_> {
     pub fn tune_report(&self) -> Vec<crate::cuda::GemmTuneRecord> {
         self.lt.tune_report()
     }
+    /// 验收直调（绕过 `WEIN_SKINNY` 门控）：自写 skinny-m kernel 的数值门禁
+    #[doc(hidden)]
+    pub fn run_skinny(&self, a: &DevBuf, w: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        self.skinny.as_ref().expect("skinny 入口已解析").run(w, a, c, m, n, k, stream);
+    }
 }
 
 impl GemmOp for GemmLt<'_> {
@@ -3373,6 +3424,16 @@ impl GemmOp for GemmLt<'_> {
             if let Some(gv) = &self.gemv {
                 if gemv_on() {
                     gv.run(w, a, c, n, k, stream);
+                    return;
+                }
+            }
+        }
+        // 满载 skinny-m（默认关）：块=64 列 n 片 ⇒ 8192 时 128 块填满 SM、
+        // 权重每字节只从 HBM 读一次；m<16 或形状不整除时仍走厂商库
+        if m >= SKINNY_M_MIN && m <= SKINNY_M_MAX && n % SKINNY_NT == 0 && k % SKINNY_KC == 0 {
+            if let Some(sk) = &self.skinny {
+                if skinny_on() {
+                    sk.run(w, a, c, m, n, k, stream);
                     return;
                 }
             }

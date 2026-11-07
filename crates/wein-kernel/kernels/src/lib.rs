@@ -8597,3 +8597,177 @@ pub unsafe extern "ptx-kernel" fn gemv_bf16_row(
         unsafe { *out.add(row) = f32_to_bf16(v) };
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// 满载 skinny-m GEMM：C[m][n] = A[m][k]·W[n][k]ᵀ（m ≤ 128）
+//
+// 病灶（2026-11-07 实测）：权重字节数与 m 无关（每步 8.41GB 各读一遍），
+// 但 cuBLASLt 在 m≥32 的候选族只有 n/128 个 block（m=100、n=8192 ⇒ 64 块，
+// 一半 SM 空转）⇒ 权重流 712 GB/s；而 m=1 的 warp-per-row GEMV（2048 块）
+// 已贴 HBM 读天花板 1022 GB/s。
+//
+// 几何：块 = 一个 64 列 n 片（grid = n/64 ⇒ 8192 时 128 块填满 SM，1 波）。
+//   · 权重 slab [64][k 片] 与 A 片 [rows16][k 片] 走 cp.async 单槽同步
+//     staging（一片载完才算），权重每字节从 HBM 读一次。
+//   · C = mtiles×4 个 16×16 片段摊到 8 个 warp（warp w = n 子片 w&3 ×
+//     m-tile 组 w>>2），bdim=128 时只有 1 个 m 组（m ≤ 64）。
+//
+// **判决（2026-11-07 收官，勿重复踩）**：本路打不过 cuBLASLt，默认关。
+// 根因是流量的代数，不是流水线/占用率：
+//   · 权重必须每块各读一遍（W 8.41GB/步）⇒ 对称地，A 片也必须每块各读
+//     一遍 ⇒ A 流量 = (n/64)·rows16·k·2 = (rows16/64)×权重字节
+//     （m=100 ⇒ rows16=112 ⇒ **1.75×W**）。合计 2.75×W ≈ 23.1GB/步。
+//   · 实测 in-stream gemm 段 23.36/23.37ms ⇒ 有效 989 GB/s = 已贴 HBM
+//     天花板（D2D 标定 848-920）。cuBLASLt 11.67/11.76ms 只跑 721 GB/s，
+//     但它只搬 1.00×W ⇒ 单位字节效率我们高 37%，净时间仍差 2.0×。
+//   · 要赢需总流量 ≤ 1.27×W（= 920/721）。而 n 片加宽到 128 列虽把 A 系数
+//     减半，块数随之掉到 n/128（n=8192 ⇒ 64 块，半 SM）⇒ 实测 31.6/64.5ms；
+//     再叠 split-K 换回块数，C 偏和往返（m·n·4·s·2）又抵掉收益（nt=256+
+//     spk=4 估算仍 2.06×W）。⇒ 缺 A 复读的结构性出路，本路封。
+// 已验证的配置（in-stream gemm 段，cuBLASLt 基准 11.7）：
+//   KC=32/单槽 29.73 · KC=32/三级 cp.async 25.01 · KC=64/单槽 **23.36**（本版）
+//
+// 数值合同：mma 的 k 累加序 = 每 16 元素一个 mma 串序（与 cuBLASLt 不同）
+// ⇒ 只能走容差档（o43：rel2 2.3-2.6e-6，峰值归一 ≤1.4e-3，门 3e-3）。
+// ══════════════════════════════════════════════════════════════════════════
+pub const SK_NT: usize = 64; // 每块 n 片宽（列）
+pub const SK_KC: usize = 64; // 每 chunk 的 k 宽
+const SK_NSLOT: usize = 1; // 单槽（同步 staging：一片载完才算）
+
+const SK_LD: usize = 72; // 行距 u16（64 + 8 = 144B ≡ +4 bank，16B 对齐）
+
+#[repr(align(16))]
+struct SkWt([u16; SK_NT * SK_LD]);
+#[repr(align(16))]
+struct SkAt([u16; 128 * SK_LD]);
+
+/// 写回暂存（每 warp 256 f32 片段舞台；8 warp ⇒ 2048 f32 = 8KB）
+#[repr(align(16))]
+struct SkOt([f32; 2048]);
+#[link_section = ".shared"]
+static mut SK_W: [SkWt; SK_NSLOT] = [SkWt([0; SK_NT * SK_LD])];
+#[link_section = ".shared"]
+static mut SK_A: [SkAt; SK_NSLOT] = [SkAt([0; 128 * SK_LD])];
+#[link_section = ".shared"]
+static mut SK_O: SkOt = SkOt([0.0; 2048]);
+
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn gemm_skinny(
+    a: *const u16, // [m,k]
+    w: *const u16, // [n,k]
+    c: *mut u16,   // [m,n]
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    unsafe {
+        let t = _thread_idx_x() as usize;
+        let bdim = _block_dim_x() as usize;
+        let nb = _block_idx_x() as usize;
+        let (warp, lane) = (t >> 5, t & 31);
+        let mt = m as usize;
+        let kk = k as usize;
+        let nn = n as usize;
+        let n0 = nb * SK_NT;
+        let mtiles = (mt + 15) >> 4; // ≤ 8
+        let rows16 = mtiles << 4;
+        let nkc = kk / SK_KC;
+        let nsub = warp & 3; // 本 warp 的 16 列子片
+        let mg = warp >> 2; // m-tile 组（bdim=256 时 0/1）
+        let mt0 = mg << 2; // 本 warp 首 m-tile
+        let segs = SK_KC / 8; // 每行 16B 段数
+
+        // ── 一个 chunk 的 staging（W 片 + A 片，纯位拷贝）──
+        macro_rules! skstage {
+            ($kc:expr, $s:expr) => {{
+                let wdst = core::ptr::addr_of_mut!(SK_W[$s]) as *mut u8;
+                let adst = core::ptr::addr_of_mut!(SK_A[$s]) as *mut u8;
+                let wbase = n0 * kk + ($kc) * SK_KC;
+                let mut q = t;
+                while q < SK_NT * segs {
+                    let row = q / segs;
+                    let off = (q % segs) * 16;
+                    cp_async_cg16(
+                        wdst.add(row * (SK_LD * 2) + off),
+                        (w.add(wbase + row * kk) as *const u8).add(off),
+                    );
+                    q += bdim;
+                }
+                let mut q = t;
+                while q < rows16 * segs {
+                    let row = q / segs;
+                    let off = (q % segs) * 16;
+                    // 尾行（rows16 > mt）钳到最后一行：读的是真数据，
+                    // 只用于不写回的 m 片
+                    let rr = if row < mt { row } else { mt - 1 };
+                    cp_async_cg16(
+                        adst.add(row * (SK_LD * 2) + off),
+                        (a.add(rr * kk + ($kc) * SK_KC) as *const u8).add(off),
+                    );
+                    q += bdim;
+                }
+            }};
+        }
+
+        let mut acc = [[0f32; 8]; 4];
+        let mut ch = 0usize;
+        while ch < nkc {
+            _syncthreads(); // 上一片读毕，槽可覆写
+            skstage!(ch, 0);
+            cp_async_commit(core::ptr::null_mut());
+            cp_async_wait_all(core::ptr::null_mut());
+            _syncthreads();
+            let cur = 0usize;
+            let wb = core::ptr::addr_of!(SK_W[cur]) as *const u32;
+            let ab = core::ptr::addr_of!(SK_A[cur]) as *const u32;
+            let ldm = SK_LD as i32;
+            let mut ks = 0usize;
+            while ks < SK_KC / 16 {
+                // B = W 片：源 (k,n) 列主序（n 行距 SK_LD）
+                let bf = wmma_load_b(wb.add((nsub * 16 * SK_LD + ks * 16) >> 1), ldm);
+                let mut r = 0usize;
+                while r < 4 {
+                    let ti = mt0 + r;
+                    if ti < mtiles {
+                        let af = wmma_load_a(ab.add(((ti * 16) * SK_LD + ks * 16) >> 1), ldm);
+                        let d = wmma_mma(
+                            af.0, af.1, af.2, af.3, bf.0, bf.1, bf.2, bf.3, acc[r][0], acc[r][1],
+                            acc[r][2], acc[r][3], acc[r][4], acc[r][5], acc[r][6], acc[r][7],
+                        );
+                        acc[r] = [d.0, d.1, d.2, d.3, d.4, d.5, d.6, d.7];
+                    }
+                    r += 1;
+                }
+                ks += 1;
+            }
+            ch += 1;
+        }
+
+        // ── 写回：每 warp 的 4 个片段经 smem 落 bf16（C 布局 [m][n] 行主序）──
+        _syncthreads();
+        let slot = (core::ptr::addr_of_mut!(SK_O) as *mut f32).add(warp << 8);
+        let mut r = 0usize;
+        while r < 4 {
+            let ti = mt0 + r;
+            if ti < mtiles {
+                let mrow = ti * 16;
+                wmma_store_c(
+                    slot, acc[r][0], acc[r][1], acc[r][2], acc[r][3], acc[r][4], acc[r][5],
+                    acc[r][6], acc[r][7], 16,
+                );
+                bar_warp_sync(0xffff_ffff);
+                let mut e = lane;
+                while e < 256 {
+                    let mr = mrow + (e >> 4);
+                    if mr < mt {
+                        *c.add(mr * nn + n0 + nsub * 16 + (e & 15)) =
+                            f32_to_bf16(*slot.add(e));
+                    }
+                    e += 32;
+                }
+                bar_warp_sync(0xffff_ffff);
+            }
+            r += 1;
+        }
+    }
+}

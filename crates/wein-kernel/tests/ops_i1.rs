@@ -668,6 +668,60 @@ fn o40_gemv_tolerance() {
     }
 }
 
+/// o43 · gemm_skinny（满载 skinny-m 自写 GEMM）容差验收：m∈[16,128] 覆盖
+/// 奇尾行（33/100 的尾行钳位）、双 bdim 档（m≤64 用 128 线程 / >64 用 256）、
+/// n 非 64 整倍（192 = 3×64）与真步面全形状（含 lm_head 的 n=248320 规模
+/// 用 8192 代表）。块=64 列 n 片、A 片从 L2 复读、wmma m16n16k16 累加树与
+/// cuBLASLt 不同 ⇒ 容差档（rel2 ≤ 3e-3 且峰值归一 ≤ 3e-3，o25 口径）。
+/// 另留一条 `run_wt` 回退锚：n 非 64 整倍时默认路（cuBLASLt）不受扰动，
+/// W=I 时逐位等于 A。
+#[test]
+fn o43_skinny_gemm_tolerance() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    for (m, n, k) in
+        [(33usize, 192usize, 128usize), (16, 256, 2560), (64, 1024, 2560), (100, 2560, 2560), (128, 8192, 2560)]
+    {
+        let a = vec_bf16(0xb311, m * k, 1.0);
+        let w = vec_bf16(0xb322, n * k, 1.0); // 存储 [n,k]
+        let ref64 = reference::gemm_wt(&a, &w, m, n, k);
+        let (da, dw) = (gpu.alloc_from_slice(&a), gpu.alloc_from_slice(&w));
+        let dc = gpu.alloc_bytes(m * n * 2);
+        t.gemm.run_skinny(&da, &dw, &dc, m as u32, n as u32, k as u32, &stream);
+        stream.sync();
+        let got: Vec<u16> = dc.read_to_vec();
+        let (mut num, mut den, mut peak) = (0f64, 0f64, 0f64);
+        for i in 0..m * n {
+            let (g, r) = (reference::bf16_to_f32(got[i]) as f64, ref64[i]);
+            let tol = (2f64.powi(-7) * r.abs()).max(2f64.powi(-11));
+            assert!(
+                (g - r).abs() <= tol,
+                "gemm_skinny[{i}]（{m}×{n}×{k}）got {g} vs ref {r}，超容差 {tol}"
+            );
+            num += (g - r) * (g - r);
+            den += r * r;
+            peak = peak.max(r.abs());
+        }
+        let (rel2, pn) = (num / den.max(1e-30), (num / (m * n) as f64).sqrt() / peak.max(1e-30));
+        eprintln!("gemm_skinny {m}×{n}×{k}：rel2 {rel2:.3e} 峰值归一 {pn:.3e}");
+        assert!(rel2 <= 3.0e-3 && pn <= 3.0e-3, "gemm_skinny 超容差（{m}×{n}×{k}）：rel2 {rel2:.3e}/{pn:.3e}");
+    }
+    // 回退锚：n=96 非 64 整倍 ⇒ 默认 `run_wt` 仍走 cuBLASLt，W=I 时逐位等于 A
+    let (m, d) = (17usize, 96usize);
+    let a = vec_bf16(0xb433, m * d, 1.0);
+    let mut w = vec![0u16; d * d];
+    for (i, x) in w.iter_mut().enumerate() {
+        *x = if i % (d + 1) == 0 { reference::f32_to_bf16(1.0) } else { reference::f32_to_bf16(0.0) };
+    }
+    let (da, dw) = (gpu.alloc_from_slice(&a), gpu.alloc_from_slice(&w));
+    let dc = gpu.alloc_bytes(m * d * 2);
+    t.gemm.run_wt(&da, &dw, &dc, m as u32, d as u32, d as u32, &stream);
+    stream.sync();
+    assert_bits("gemm_wt 回退锚 identity", &dc.read_to_vec(), &a);
+}
+
 /// o35 · deltanet chunked（BT 分块递推，FLA 同构）容差验收：随机形状 ×
 /// BT 档（32/64/128）× 双行非整块尾 vs reference::deltanet（bf16 池老递推，
 /// 每 token 落池收一次）。分块把"每 token 读写一遍状态"换成块间串行 +
