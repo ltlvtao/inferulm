@@ -81,6 +81,7 @@ pub struct OpTable<'a> {
     pub add_norm_zc: AddNormZcCuda<'a>,
     pub dn_split_qkv: DnSplitQkvCuda<'a>,
     pub zero_rows: ZeroRowsCuda<'a>,
+    pub gemv: GemvCuda<'a>,
     pub rope_pt: RopePtCuda<'a>,
     pub sigmul: SigmulCuda<'a>,
     pub conv1d_dw: Conv1dDwCuda<'a>,
@@ -229,6 +230,7 @@ impl OpTable<'_> {
         };
         let dn_split_qkv = DnSplitQkvCuda { gpu, f: m.func("dn_split_qkv") };
         let zero_rows = ZeroRowsCuda { gpu, f: m.func("zero_rows") };
+        let gemv = GemvCuda { gpu, f: m.func("gemv_bf16"), frow: m.func("gemv_bf16_row") };
         let rope_pt = RopePtCuda { gpu, f: m.func("rope_pt") };
         let sigmul = SigmulCuda { gpu, f: m.func("sigmul") };
         let conv1d_dw = Conv1dDwCuda { gpu, f: m.func("conv1d_dw") };
@@ -268,9 +270,9 @@ impl OpTable<'_> {
                 reason: format!("libcublasLt 打不开：{e}"),
                 impact: "GEMM 无法解析（标准算子走厂商库，M0 无回退实现）".into(),
             }])?,
-        )};
+        ), gemv: Some(GemvCuda { gpu, f: m.func("gemv_bf16"), frow: m.func("gemv_bf16_row") }) };
         Ok(OpTable { rms_norm, rope, silu, w8a8_quant, kv_scatter, paged_attn, gemm, embed, add, mul,
-            silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, zero_rows, rope_pt, sigmul, conv1d_dw, conv_state_roll,
+            silu_mul, rms_norm_zc, add_norm_zc, dn_split_qkv, zero_rows, gemv, rope_pt, sigmul, conv1d_dw, conv_state_roll,
             conv1d_dw_roll,
             deltanet, deltanet_chunked,
             rms_norm_gated, argmax_rows, sample_rows })
@@ -523,6 +525,40 @@ pub trait DnSplitQkvOp {
     );
     fn name(&self) -> &'static str;
 }
+
+/// m=1 GEMV（`gemv_bf16`）：out[n] = W[n,k]·x[k]，W bf16 `[n,k]` 行主序。
+///
+/// 替 cuBLASLt 在**窄 n** 上的固定代价：n=32 一发 8.6µs 只搬 160KB
+/// （19 GB/s），48 发/步 = 0.41ms。容差档（累加序不同，o39 对拍）。
+pub trait GemvOp {
+    fn run(&self, w: &DevBuf, x: &DevBuf, out: &DevBuf, n: u32, k: u32, stream: &Stream);
+    fn name(&self) -> &'static str;
+}
+
+pub struct GemvCuda<'a> {
+    gpu: &'a Gpu,
+    f: Func,
+    frow: Func,
+}
+
+impl GemvOp for GemvCuda<'_> {
+    fn run(&self, w: &DevBuf, x: &DevBuf, out: &DevBuf, n: u32, k: u32, stream: &Stream) {
+        let args = crate::kernel_args![*w, *x, *out, n, k];
+        // 窄 n（≤GEMV_ROW_N）：block-per-row（grid=n 才有并行度）；
+        // 宽 n：warp-per-row（每块 4 行，块数已够铺卡，寄存器更省）
+        if n <= GEMV_ROW_N {
+            self.gpu.launch(&self.frow, n, 256, &args, stream);
+        } else {
+            self.gpu.launch(&self.f, n.div_ceil(4), 128, &args, stream);
+        }
+    }
+    fn name(&self) -> &'static str {
+        "gemv_bf16/cuda"
+    }
+}
+
+/// block-per-row 档的 n 上限（实测分界：n≤256 时 warp-per-row 块数不足）
+pub const GEMV_ROW_N: u32 = 256;
 
 /// 批量行零化（`zero_rows`）：一次 launch 覆盖表里全部池的一行。
 /// 表项 16B = `ptr: u64` + `stride | len << 32`（宿主侧建表，见 exec）。
@@ -3294,6 +3330,18 @@ pub trait GemmOp {
 /// cuBLASLt 档（Box 持有：BlasLt 带工作区与符号库生命周期）
 pub struct GemmLt<'a> {
     pub(crate) lt: Box<crate::cuda::BlasLt<'a>>,
+    /// m=1 直路 GEMV（`WEIN_GEMV=1` 时接管 m==1 的 `run_wt`）：省掉
+    /// cuBLASLt 的 split-K 归约发数与 kernel 固定代价
+    pub(crate) gemv: Option<GemvCuda<'a>>,
+}
+
+/// `WEIN_GEMV` 门控（默认开：m=1 与 cuBLASLt 逐位同，且省掉 split-K 归约发；
+/// `WEIN_GEMV=0` 回退）
+fn gemv_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WEIN_GEMV").map(|v| v != "0").unwrap_or(true)
+    })
 }
 
 impl GemmLt<'_> {
@@ -3308,6 +3356,15 @@ impl GemmOp for GemmLt<'_> {
         self.lt.gemm(a, b, c, m, n, k, stream)
     }
     fn run_wt(&self, a: &DevBuf, w: &DevBuf, c: &DevBuf, m: u32, n: u32, k: u32, stream: &Stream) {
+        // m=1 是纯权重流：走自写 GEMV（发数少、无 split-K 归约发）
+        if m == 1 && k % 8 == 0 {
+            if let Some(gv) = &self.gemv {
+                if gemv_on() {
+                    gv.run(w, a, c, n, k, stream);
+                    return;
+                }
+            }
+        }
         self.lt.gemm_wt(a, w, c, m, n, k, stream)
     }
     fn name(&self) -> &'static str {

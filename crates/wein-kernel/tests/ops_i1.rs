@@ -22,7 +22,7 @@
 use wein_kernel::cuda::Gpu;
 use wein_kernel::ops::{
     AddNormZcOp, AddOp, ArgmaxRowsOp, Conv1dDwOp, Conv1dDwRollOp, ConvStateRollOp, DeltanetChunkedOp, DeltanetOp,
-    DnSplitQkvOp, EmbedOp, GemmOp, MulOp, OpTable, RmsNormGatedOp, RmsNormZcOp, RopePtOp,
+    DnSplitQkvOp, EmbedOp, GemmOp, GemvOp, MulOp, OpTable, RmsNormGatedOp, RmsNormZcOp, RopePtOp,
     SigmulOp, SiluMulOp, SiluOp, ZeroRowsOp,
 };
 use wein_kernel::reference;
@@ -615,6 +615,57 @@ fn g7_gemm_wt_tolerance() {
     t.gemm.run_wt(&da, &dw, &dc, m as u32, d as u32, d as u32, &stream);
     stream.sync();
     assert_bits("gemm_wt identity", &dc.read_to_vec(), &a);
+}
+
+/// o40 · gemv_bf16 / gemv_bf16_row（m=1 直路 GEMV）容差：out[n] = W[n,k]·x[k]。
+/// 双档几何（n≤GEMV_ROW_N 走 block-per-row，否则 warp-per-row）与齐尾/非齐尾
+/// k（2056 = 8·257，主循环 256 步 + 8 元素余尾）各覆盖；容差口径同 g7。
+#[test]
+fn o40_gemv_tolerance() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let stream = gpu.stream();
+    let t = table(&gpu);
+    for (n, k) in [(32usize, 2560usize), (1024, 2560), (2560, 4096), (9216, 2056)] {
+        let x = vec_bf16(0xad11, k, 1.0);
+        let w = vec_bf16(0xad22, n * k, 1.0); // 存储 [n,k]
+        let ref64 = reference::gemm_wt(&x, &w, 1, n, k);
+        let (dx, dw) = (gpu.alloc_from_slice(&x), gpu.alloc_from_slice(&w));
+        let dout = gpu.alloc_bytes(n * 2);
+        t.gemv.run(&dw, &dx, &dout, n as u32, k as u32, &stream);
+        stream.sync();
+        let got: Vec<u16> = dout.read_to_vec();
+        for i in 0..n {
+            let (g, r) = (reference::bf16_to_f32(got[i]) as f64, ref64[i]);
+            let tol = (2f64.powi(-7) * r.abs()).max(2f64.powi(-11));
+            assert!(
+                (g - r).abs() <= tol,
+                "gemv[{i}]（n={n} k={k}）got {g} vs ref {r}，超容差 {tol}"
+            );
+        }
+    }
+    // 与 cuBLASLt 同题面互拍（真步面：m=1 全形状）：报 rel2 / 峰值归一，
+    // 门 5e-3 = 一个 bf16 量子档（换累加树的固有扰动，非实现错）
+    for (n, k) in [(32usize, 2560usize), (1024, 2560), (2560, 4096), (4096, 2560), (9216, 2560), (8192, 2560)] {
+        let x = vec_bf16(0xaf11, k, 1.0);
+        let w = vec_bf16(0xaf22, n * k, 1.0);
+        let (dx, dw) = (gpu.alloc_from_slice(&x), gpu.alloc_from_slice(&w));
+        let (da, db) = (gpu.alloc_bytes(n * 2), gpu.alloc_bytes(n * 2));
+        t.gemm.run_wt(&dx, &dw, &da, 1, n as u32, k as u32, &stream);
+        t.gemv.run(&dw, &dx, &db, n as u32, k as u32, &stream);
+        stream.sync();
+        let (u, v) = (da.read_to_vec(), db.read_to_vec());
+        let (mut num, mut den, mut peak) = (0f64, 0f64, 0f64);
+        for (&a, &b) in u.iter().zip(&v) {
+            let (x, y) = (reference::bf16_to_f32(a) as f64, reference::bf16_to_f32(b) as f64);
+            num += (x - y) * (x - y);
+            den += x * x;
+            peak = peak.max(x.abs());
+        }
+        let (rel2, pn) = (num / den.max(1e-30), (num / u.len() as f64).sqrt() / peak.max(1e-30));
+        eprintln!("gemv vs lt n={n} k={k}：rel2 {rel2:.3e} 峰值归一 {pn:.3e}");
+        assert!(rel2 <= 5.0e-3 && pn <= 5.0e-3, "gemv ≢ lt（n={n} k={k}）：rel2 {rel2:.3e}/{pn:.3e}");
+    }
 }
 
 /// o35 · deltanet chunked（BT 分块递推，FLA 同构）容差验收：随机形状 ×

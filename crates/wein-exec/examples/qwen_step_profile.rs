@@ -67,6 +67,15 @@ fn main() {
     }
     // 调优审计：每形状 chosen/argmin/best_ms（布局 A/B 的选型判别——
     // gemm 段漂移须先排除跨进程择优翻转）。末尾打——记录在首次调用后才有。
+    if std::env::var("WEIN_GEMM_BYTES").is_ok() {
+        let r = ex.gemm_bytes_report();
+        let tot: u64 = r.iter().map(|x| x.4).sum();
+        let cnt: u64 = r.iter().map(|x| x.3).sum();
+        println!("\n--- gemm 字节普查（{cnt} 发，{:.3} GB）", tot as f64 / 1e9);
+        for (m, n, k, c, b) in r {
+            println!("  m={m} n={n:6} k={k:5}  {c:6} 发  {:7.1} MB", b as f64 / 1e6);
+        }
+    }
     if std::env::var("WEIN_TUNE_DUMP").is_ok() {
         for r in ex.gemm_tune_report() {
             if r.candidates > 0 {

@@ -8245,3 +8245,169 @@ pub unsafe extern "ptx-kernel" fn sample_rows(
     *out.add(blk) = smp_idx(*selp.add(pick));
 }
 
+
+/// warp 内 f32 全和（down 树；返回 lane 0 有效，其余 lane 为部分和——
+/// 调用方只在 lane 0 写回）。5 步，无 smem、无屏障。
+#[inline(always)]
+fn warp_sum_f32(mut v: f32) -> f32 {
+    let mut off = 16;
+    while off > 0 {
+        v += f32::from_bits(unsafe { shfl_down(0xffff_ffff, v.to_bits() as i32, off, 31) } as u32);
+        off /= 2;
+    }
+    v
+}
+
+/// **m=1 GEMV**：`out[n] = W[n,k] · x[k]`（W bf16 行主序 `[n,k]`，x bf16 `[k]`）。
+///
+/// 动机（`bench-reports/m1-gemv-20261107/`）：单流 decode 的 gemm 段里，
+/// cuBLASLt 对窄 n 的每发固定代价压倒一切——n=32 一发 8.6µs 只搬 160KB
+/// （19 GB/s），48 发/步 = 0.41ms/步（步时的 3.6%）。GEMV 的天然形态是
+/// **一行一个 warp、沿 k 连续读**（整行 5-18KB 全流式），没有 tile 转置
+/// 读的 256B 跨步，也没有 splitK 归约的往返。
+///
+/// 几何：`block = 128 线程 = 4 warp`，warp w 管行 `base + w`；lane l 每轮
+/// 吃该行 8 个 bf16（16B = 两个 u64）；warp 内 5 步 down 折叠；lane 0 写
+/// bf16。grid = `ceil(n/4)`。
+///
+/// 数值：f32 累加，lane 内按 k 升序、lane 间按 8 元素跨步树折叠——与
+/// cuBLASLt 的分块序不同，属**容差档**（o39 对拍 rel2 ≤ 3e-3；端到端以
+/// 贪心序列 + oracle 复验为准）。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn gemv_bf16(
+    w: *const u16, // [n,k]
+    x: *const u16, // [k]
+    out: *mut u16, // [n]
+    n: u32,
+    k: u32,
+) {
+    let t = unsafe { _thread_idx_x() } as usize;
+    let (lane, wid) = (t & 31, t >> 5);
+    let row = (unsafe { _block_idx_x() } as usize) * 4 + wid;
+    if row >= n as usize {
+        return;
+    }
+    let kk = k as usize;
+    let wrow = unsafe { w.add(row * kk) };
+    let mut acc = 0.0f32;
+    // 主体：每 lane 每轮 8 元素（16B），跨 warp 覆盖 256 元素
+    let mut j = lane * 8;
+    while j + 8 <= kk {
+        let w0 = unsafe { *(wrow.add(j) as *const u64) };
+        let w1 = unsafe { *(wrow.add(j + 4) as *const u64) };
+        let x0 = unsafe { *(x.add(j) as *const u64) };
+        let x1 = unsafe { *(x.add(j + 4) as *const u64) };
+        let wa = [
+            bf16_to_f32(w0 as u16),
+            bf16_to_f32((w0 >> 16) as u16),
+            bf16_to_f32((w0 >> 32) as u16),
+            bf16_to_f32((w0 >> 48) as u16),
+            bf16_to_f32(w1 as u16),
+            bf16_to_f32((w1 >> 16) as u16),
+            bf16_to_f32((w1 >> 32) as u16),
+            bf16_to_f32((w1 >> 48) as u16),
+        ];
+        let xa = [
+            bf16_to_f32(x0 as u16),
+            bf16_to_f32((x0 >> 16) as u16),
+            bf16_to_f32((x0 >> 32) as u16),
+            bf16_to_f32((x0 >> 48) as u16),
+            bf16_to_f32(x1 as u16),
+            bf16_to_f32((x1 >> 16) as u16),
+            bf16_to_f32((x1 >> 32) as u16),
+            bf16_to_f32((x1 >> 48) as u16),
+        ];
+        acc = fma(wa[0], xa[0], acc);
+        acc = fma(wa[1], xa[1], acc);
+        acc = fma(wa[2], xa[2], acc);
+        acc = fma(wa[3], xa[3], acc);
+        acc = fma(wa[4], xa[4], acc);
+        acc = fma(wa[5], xa[5], acc);
+        acc = fma(wa[6], xa[6], acc);
+        acc = fma(wa[7], xa[7], acc);
+        j += 32 * 8;
+    }
+    // 尾余（k 非 8 倍数）：仅剩 kk%8 个元素，lane 0 收
+    if lane == 0 {
+        let mut r = kk - kk % 8;
+        while r < kk {
+            acc = fma(bf16_to_f32(unsafe { *wrow.add(r) }), bf16_to_f32(unsafe { *x.add(r) }), acc);
+            r += 1;
+        }
+    }
+    let s = warp_sum_f32(acc);
+    if lane == 0 {
+        unsafe { *out.add(row) = f32_to_bf16(s) };
+    }
+}
+
+/// GEMV 跨 warp 归约槽（block-per-row 档；.shared 由 build.rs 改写）
+#[link_section = ".shared"]
+static mut GEMV_S: [f32; 8] = [0.0; 8];
+
+/// **m=1 GEMV（block-per-row 档）**：`block = 256 线程 = 8 warp` 全压同一行，
+/// 8 warp 沿 k 交错（每 warp 每轮 256 元素），smem 8 槽 + 一次屏障折叠。
+///
+/// 与 `gemv_bf16`（warp-per-row）分工：窄 n 时后者只有 `ceil(n/4)` 个 block
+/// （n=32 → 8 块 = 6% 的卡），并行度不足使 160KB 读要 6.7µs；本档 grid = n，
+/// 每块独占一行 → 32 行铺 32 块 × 8 warp。
+#[no_mangle]
+pub unsafe extern "ptx-kernel" fn gemv_bf16_row(
+    w: *const u16, // [n,k]
+    x: *const u16, // [k]
+    out: *mut u16, // [n]
+    n: u32,
+    k: u32,
+) {
+    let t = unsafe { _thread_idx_x() } as usize;
+    let (lane, wid) = (t & 31, t >> 5);
+    let row = unsafe { _block_idx_x() } as usize;
+    if row >= n as usize {
+        return;
+    }
+    let kk = k as usize;
+    let wrow = unsafe { w.add(row * kk) };
+    let mut acc = 0.0f32;
+    // warp 交错：本轮 8 warp × 32 lane × 8 元素 = 2048 元素跨度
+    let mut j = wid * 256 + lane * 8;
+    while j + 8 <= kk {
+        let w0 = unsafe { *(wrow.add(j) as *const u64) };
+        let w1 = unsafe { *(wrow.add(j + 4) as *const u64) };
+        let x0 = unsafe { *(x.add(j) as *const u64) };
+        let x1 = unsafe { *(x.add(j + 4) as *const u64) };
+        acc = fma(bf16_to_f32(w0 as u16), bf16_to_f32(x0 as u16), acc);
+        acc = fma(bf16_to_f32((w0 >> 16) as u16), bf16_to_f32((x0 >> 16) as u16), acc);
+        acc = fma(bf16_to_f32((w0 >> 32) as u16), bf16_to_f32((x0 >> 32) as u16), acc);
+        acc = fma(bf16_to_f32((w0 >> 48) as u16), bf16_to_f32((x0 >> 48) as u16), acc);
+        acc = fma(bf16_to_f32(w1 as u16), bf16_to_f32(x1 as u16), acc);
+        acc = fma(bf16_to_f32((w1 >> 16) as u16), bf16_to_f32((x1 >> 16) as u16), acc);
+        acc = fma(bf16_to_f32((w1 >> 32) as u16), bf16_to_f32((x1 >> 32) as u16), acc);
+        acc = fma(bf16_to_f32((w1 >> 48) as u16), bf16_to_f32((x1 >> 48) as u16), acc);
+        j += 8 * 256;
+    }
+    // 尾余（k 非 8 倍数）：仅剩 kk%8 个元素，warp 0 的 lane 收
+    if wid == 0 && lane < kk % 8 {
+        let r = kk - kk % 8 + lane;
+        acc = fma(bf16_to_f32(unsafe { *wrow.add(r) }), bf16_to_f32(unsafe { *x.add(r) }), acc);
+    }
+    let s = warp_sum_f32(acc);
+    if lane == 0 {
+        unsafe {
+            let base = core::ptr::addr_of_mut!(GEMV_S) as usize;
+            let p = core::ptr::with_exposed_provenance_mut::<f32>(base);
+            *p.add(wid) = s;
+        }
+    }
+    unsafe { _syncthreads() };
+    if t == 0 {
+        let base = core::ptr::addr_of!(GEMV_S) as usize;
+        let p = core::ptr::with_exposed_provenance::<f32>(base);
+        let mut v = 0.0f32;
+        let mut i = 0usize;
+        while i < 8 {
+            v = unsafe { *p.add(i) } + v;
+            i += 1;
+        }
+        unsafe { *out.add(row) = f32_to_bf16(v) };
+    }
+}

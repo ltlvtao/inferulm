@@ -82,6 +82,37 @@ fn pins() -> &'static Mutex<HashMap<(u32, u32, u32, bool), [u64; 8]>> {
     PINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 字节/发数普查（`WEIN_GEMM_BYTES=1`）：(m, n, k) → (发数, 搬运字节)。
+/// 单流（m=1）带宽归因用——权重布局 `[n,k]` 一发搬 n·k·2 字节，
+/// 两侧同口径可直算 GB/s（A/C 两片在 m=1 时可忽略）。
+static BYTES: OnceLock<Mutex<HashMap<(u32, u32, u32), (u64, u64)>>> = OnceLock::new();
+
+fn bytes_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WEIN_GEMM_BYTES").is_ok())
+}
+
+fn bytes_add(m: u32, n: u32, k: u32) {
+    if !bytes_enabled() {
+        return;
+    }
+    let t = BYTES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = t.lock().unwrap();
+    let e = g.entry((m, n, k)).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += (m * k + n * k + m * n) as u64 * 2;
+}
+
+/// 普查快照：按字节降序（诊断出口；不变量=总计应等于权重读量）
+pub fn gemm_bytes_report() -> Vec<(u32, u32, u32, u64, u64)> {
+    let t = BYTES.get_or_init(|| Mutex::new(HashMap::new()));
+    let g = t.lock().unwrap();
+    let mut v: Vec<(u32, u32, u32, u64, u64)> =
+        g.iter().map(|(&(m, n, k), &(c, b))| (m, n, k, c, b)).collect();
+    v.sort_by_key(|r| std::cmp::Reverse(r.4));
+    v
+}
+
 /// 解析产物全字段 Copy——命中路径值返回，免 RefCell 借用纠缠
 #[derive(Clone, Copy)]
 struct ShapePlan {
@@ -241,6 +272,7 @@ impl BlasLt<'_> {
     ) {
         let st = self.launch_algo(a, b, c, &plan, &plan.algo, stream);
         assert_eq!(st, 0, "cublasLtMatmul 失败：status {st}（{m}×{n}×{k}）");
+        bytes_add(m, n, k);
     }
 
     /// 单发 launch，status 返回不 panic——候选探测要在失败候选上继续

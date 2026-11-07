@@ -1044,6 +1044,11 @@ impl Qwen35Executor {
         self.session.table().gemm.tune_report()
     }
 
+    /// gemm 字节普查（诊断出口；`WEIN_GEMM_BYTES=1` 时才有内容）
+    pub fn gemm_bytes_report(&self) -> Vec<(u32, u32, u32, u64, u64)> {
+        wein_kernel::cuda::cublaslt::gemm_bytes_report()
+    }
+
     /// 长序列 attention 派发：单遍在线（默认）/ 两遍回退（`WEIN_ATTN_ONLINE=0`）。
     /// 两个调用点（eager 层循环、图档逐层）共用这一份参数表——几何、scratch、
     /// 出参对两条路径完全相同，只有 kernel 入口不同。
