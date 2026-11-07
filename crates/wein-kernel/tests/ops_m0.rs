@@ -1606,3 +1606,185 @@ fn o34_paged_attn_blk_bitwise_and_tolerance() {
         drop((dq, dkc, dvc, dbt, dsi, dpo, dout));
     }
 }
+
+/// o41 · 单遍档 **批形不变性**（kernel 合同"批形不改数值"）：
+/// 同一个 query 行（同 q、同 seq、同 pos）在 **单跑** 与 **与一个位置差
+/// 极大的邻居行同批** 两种批形下，输出须 **逐位相同**。
+///
+/// 历史病灶：j 轴分段长 `lspan` 曾由 **块内最大位置 pmax** 定（`ceil((pmax+1)/js)`）
+/// ⇒ 短 pos 行与长 pos 行同批时，分段边界与 `attn_combine` 归约序被邻居改写，
+/// 同一行在 t=1 与 t=2 批里走不同分片 ⇒ 位不同（破坏 batch invariance）。
+/// 现段长只依 **页表容量 bpr×bs**（≥ 全序列最大位置 +1，与批形无关）⇒ 两种
+/// 批形逐位同。本测试钉住这条契约（对旧式 pmax 分段必红）。
+#[test]
+fn o41_paged_attn_online_batch_invariant() {
+    use wein_kernel::ops::{AttnCfg, KvDtype};
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let (qh, kvh, hd, bs) = (16usize, 4usize, 256usize, 16usize);
+    let (pos_small, pos_big) = (40usize, 2000usize);
+    let bpr = (pos_big + 1).div_ceil(bs);
+    let nseq = 2usize;
+    let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+    let slots = nseq * bpr * bs;
+    let he = kvh * hd;
+    let q_scale = 1.0 / (hd as f32).sqrt();
+    // decode 形 cfg（与 exec 同档 nd=4/rpt=2）：**两种批形同 cfg**，公平比较
+    let cfg = AttnCfg { nd: 4, rpt: 2, ntok_max: 4, bdim_max: 512, kv: KvDtype::Bf16 };
+    let dbt = gpu.alloc_from_slice(&block_table);
+    let stream = gpu.stream();
+    let row_n = qh * hd;
+    // 敏感度：输出是 **bf16**（相对量化 2^-9），而归约序差异只有 ~1e-7 相对
+    // ⇒ 单次 4096 个输出值平均只有 ~0.2 个会翻位。故多 seed 采样累计：
+    // 旧式 pmax 分段下 64 seed 累计必红，新式下恒 0。
+    let mut flips = 0usize;
+    let (mut d_sb, mut d_bs) = (0usize, 0usize);
+    for seed in 0..64u64 {
+        let dkc = gpu.alloc_from_slice(&vec_bf16(0x51ab ^ seed, slots * he, 1.0));
+        let dvc = gpu.alloc_from_slice(&vec_bf16(0x62cd ^ seed, slots * he, 1.0));
+        let q_small = vec_bf16(0x1111 ^ seed, row_n, 2.0);
+        let q_big = vec_bf16(0x2222 ^ seed, row_n, 2.0);
+        let run = |q: &[u16], seq: &[u32], pos: &[u32]| -> Vec<u16> {
+            let tokens = (q.len() / row_n) as u32;
+            let dq = gpu.alloc_from_slice(q);
+            let dsi = gpu.alloc_from_slice(seq);
+            let dpo = gpu.alloc_from_slice(pos);
+            let dout = gpu.alloc_bytes(q.len() * 2);
+            let poison = vec![0x7f7fu16; q.len()];
+            dout.upload_on(&poison, &stream);
+            t.paged_attn.run_tile_online_cfg(
+                cfg, &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+                bs as u32, qh as u32, kvh as u32, hd as u32, tokens, &stream,
+            );
+            stream.sync();
+            let out: Vec<u16> = dout.read_to_vec();
+            assert_ne!(out, poison, "单遍档未写输出（seq={seq:?} pos={pos:?}）");
+            out
+        };
+        // 单跑：各一行（t=1，jsplit>1 的 decode 形）。**seq 与混批里该行一致**——
+        // 各 seq 映射到各自页表段（页 id 顺排），换 seq 就换了 KV，不是批形差异。
+        let solo_small = run(&q_small, &[0], &[pos_small as u32]);
+        let solo_big = run(&q_big, &[1], &[pos_big as u32]);
+        // 混批：短行 + 长行同批（seq 各异），两种次序各测一遍（行位/邻居位置都不该影响）
+        let mut q_sb = q_small.clone();
+        q_sb.extend_from_slice(&q_big);
+        let mix_sb = run(&q_sb, &[0, 1], &[pos_small as u32, pos_big as u32]);
+        let mut q_bs = q_big.clone();
+        q_bs.extend_from_slice(&q_small);
+        let mix_bs = run(&q_bs, &[1, 0], &[pos_big as u32, pos_small as u32]);
+        macro_rules! chk {
+            ($dst:ident, $a:expr, $b:expr) => {{
+                let n = bits_diff($a, $b);
+                $dst += n;
+                flips += n;
+            }};
+        }
+        chk!(d_sb, &solo_small, &mix_sb[..row_n]);
+        chk!(d_bs, &solo_small, &mix_bs[row_n..]);
+        chk!(d_sb, &solo_big, &mix_sb[row_n..]);
+        chk!(d_bs, &solo_big, &mix_bs[..row_n]);
+    }
+    assert_eq!(
+        flips, 0,
+        "o41 批形不变性：{flips} 个 bf16 位随批形改变（短在前 {d_sb} 位 / 长在前 {d_bs} 位，\
+         seed 0..64）——同一行的 j 归约序被邻居位置改写了"
+    );
+    eprintln!(
+        "o41 批形不变性：pos_small={pos_small} pos_big={pos_big} qh={qh} kvh={kvh} hd={hd} \
+         bpr={bpr} bs={bs} seed=64——短/长行在 t=1 与 t=2（两种次序）各 {row_n} 值逐位同"
+    );
+}
+
+/// 逐位比对，返回不同位（u16 元素）的个数——o41 用（弱点位差在 bf16 量化下
+/// 只有极少数会翻，故需计数累计而不是首差即断言）。
+fn bits_diff(a: &[u16], b: &[u16]) -> usize {
+    assert_eq!(a.len(), b.len(), "逐位比对的长度应相同");
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+/// o42 · 两遍分块档（`paged_attn_tile`）**批形不变性**：与 o41 同一合同——
+/// `tile_body` 的 j 分段长同样只依页表容量 `bpr×bs`，不依块内 pmax。短行
+/// 单跑 vs 与长行同批（两种次序）逐位同；本档 jsplit>1，两遍+`attn_combine`
+/// 分片合并路径一并覆盖（o31 只管"近似参考"的容差，不管批形）。
+#[test]
+fn o42_paged_attn_tile_batch_invariant() {
+    let _g = guard();
+    let Some(gpu) = gpu() else { return };
+    let t = table(&gpu);
+    let (qh, kvh, hd, bs) = (16usize, 4usize, 256usize, 16usize);
+    let (pos_small, pos_big) = (40usize, 2000usize);
+    let bpr = (pos_big + 1).div_ceil(bs);
+    let nseq = 2usize;
+    let block_table: Vec<u32> = (0..(nseq * bpr) as u32).collect();
+    let slots = nseq * bpr * bs;
+    let he = kvh * hd;
+    let q_scale = 1.0 / (hd as f32).sqrt();
+    let dbt = gpu.alloc_from_slice(&block_table);
+    let stream = gpu.stream();
+    let row_n = qh * hd;
+    // 钉住本测试确实落在 jsplit>1 的分片合并档（否则测不到分段长）
+    let g1 = PagedAttnCuda::tile_geom(qh as u32, kvh as u32, hd as u32, 1);
+    let g2 = PagedAttnCuda::tile_geom(qh as u32, kvh as u32, hd as u32, 2);
+    assert!(
+        g1.5 > 1 && g2.5 > 1,
+        "o42 须落 jsplit>1 档（t=1→{}, t=2→{}）",
+        g1.5,
+        g2.5
+    );
+    assert_eq!(g1.5, g2.5, "o42：jsplit 须与批内行数无关（{} vs {}）", g1.5, g2.5);
+    let mut flips = 0usize;
+    let (mut d_sb, mut d_bs) = (0usize, 0usize);
+    for seed in 0..64u64 {
+        let dkc = gpu.alloc_from_slice(&vec_bf16(0x51ab ^ seed, slots * he, 1.0));
+        let dvc = gpu.alloc_from_slice(&vec_bf16(0x62cd ^ seed, slots * he, 1.0));
+        let q_small = vec_bf16(0x1111 ^ seed, row_n, 2.0);
+        let q_big = vec_bf16(0x2222 ^ seed, row_n, 2.0);
+        let run = |q: &[u16], seq: &[u32], pos: &[u32]| -> Vec<u16> {
+            let tokens = (q.len() / row_n) as u32;
+            let dq = gpu.alloc_from_slice(q);
+            let dsi = gpu.alloc_from_slice(seq);
+            let dpo = gpu.alloc_from_slice(pos);
+            let dout = gpu.alloc_bytes(q.len() * 2);
+            let poison = vec![0x7f7fu16; q.len()];
+            dout.upload_on(&poison, &stream);
+            t.paged_attn.run_tile(
+                &dq, &dkc, &dvc, &dbt, &dsi, &dpo, &dout, q_scale, bpr as u32,
+                bs as u32, qh as u32, kvh as u32, hd as u32, tokens, &stream,
+            );
+            stream.sync();
+            let out: Vec<u16> = dout.read_to_vec();
+            assert_ne!(out, poison, "分块档未写输出（seq={seq:?} pos={pos:?}）");
+            out
+        };
+        let solo_small = run(&q_small, &[0], &[pos_small as u32]);
+        let solo_big = run(&q_big, &[1], &[pos_big as u32]);
+        let mut q_sb = q_small.clone();
+        q_sb.extend_from_slice(&q_big);
+        let mix_sb = run(&q_sb, &[0, 1], &[pos_small as u32, pos_big as u32]);
+        let mut q_bs = q_big.clone();
+        q_bs.extend_from_slice(&q_small);
+        let mix_bs = run(&q_bs, &[1, 0], &[pos_big as u32, pos_small as u32]);
+        macro_rules! chk {
+            ($dst:ident, $a:expr, $b:expr) => {{
+                let n = bits_diff($a, $b);
+                $dst += n;
+                flips += n;
+            }};
+        }
+        chk!(d_sb, &solo_small, &mix_sb[..row_n]);
+        chk!(d_bs, &solo_small, &mix_bs[row_n..]);
+        chk!(d_sb, &solo_big, &mix_sb[row_n..]);
+        chk!(d_bs, &solo_big, &mix_bs[..row_n]);
+    }
+    assert_eq!(
+        flips, 0,
+        "o42 批形不变性：{flips} 个 bf16 位随批形改变（短在前 {d_sb} 位 / 长在前 {d_bs} 位，\
+         seed 0..64）——两遍档的 j 归约序被邻居位置改写了"
+    );
+    eprintln!(
+        "o42 分块档批形不变性：pos_small={pos_small} pos_big={pos_big} qh={qh} kvh={kvh} \
+         hd={hd} bpr={bpr} bs={bs} jsplit={} seed=64——逐位同",
+        g1.5
+    );
+}

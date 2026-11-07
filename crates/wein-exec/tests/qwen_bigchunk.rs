@@ -69,6 +69,11 @@ fn b1_big_chunk_single_shot_matches_chunked() {
     std::env::set_var("WEIN_KV_PAGES", "512");
     std::env::set_var("WEIN_T_MAX", "8192");
     std::env::set_var("WEIN_RADIX", "0");
+    // gemm autotune 是**计时择优**：同进程选型钉死，但跨进程（每次 cargo test）
+    // 计时噪声会让同一 m 选到不同 algo ⇒ 逐位结果不保证可复现。本测试是
+    // 「批形不改语义」的数值对拍，须固定算法路径（与 b2 的 WEIN_ATTN_V4=0 同理）：
+    // 全 heuristic 钉。**只作用于本测试进程**，不动库默认 TUNE_M、不损满载 perf。
+    std::env::set_var("WEIN_TUNE_M", "");
     let Some(dir) = mdir() else { return };
     let Ok(mut ex) = Qwen35Executor::open(&dir) else {
         panic!("大档（t_max 8192）装配失败：显存不足或容量组合非法");
@@ -105,6 +110,11 @@ fn b2_chunked_mixed_batch_two_lane() {
     std::env::set_var("WEIN_KV_PAGES", "512");
     std::env::set_var("WEIN_T_MAX", "8192");
     std::env::set_var("WEIN_RADIX", "0");
+    // gemm autotune 是**计时择优**：同进程选型钉死，但跨进程（每次 cargo test）
+    // 计时噪声会让同一 m 选到不同 algo ⇒ 逐位结果不保证可复现。本测试是
+    // 「批形不改语义」的数值对拍，须固定算法路径（与 b2 的 WEIN_ATTN_V4=0 同理）：
+    // 全 heuristic 钉。**只作用于本测试进程**，不动库默认 TUNE_M、不损满载 perf。
+    std::env::set_var("WEIN_TUNE_M", "");
     // v4 是形状门控快路：混合步（含独立 decode 行）走 online 路、对照的
     // 单跑追平步（prefill+decode 融合成单 span）走 v4——两侧算术序不同
     //（v4 的 P 经 bf16 量化），贪心可偶发翻位。b2 合同是"批形不改语义"，
@@ -177,9 +187,12 @@ fn b2_chunked_mixed_batch_two_lane() {
             }
         }
     }
-    // v3 attention（WEIN_ATTN_V3 默认开）的混批 attn 引入 jsplit/跨 lane 加法
-    // 顺序变化 ⇒ 与单跑不再位级同，但贪心 token 序列应一致（容差档同 b1）。
-    // 量化证伪：若 v3 是病，3009/6009 贪心分叉数早已非零（实测 0/32 三档）。
+    // 合同（kernel 层）：批形不改 attention 数值——同一行的 j 分段/归约序只
+    // 依其自身 (seq,pos) 与页表容量 bpr×bs，与邻居行的位置/行数无关（见
+    // o41/o42 位级档）。故混批与
+    // 单跑的贪心 token 序列须**逐 token 同**。注意：全程 gemm 路径由测试钉成
+    // heuristic（见 open 前的 WEIN_TUNE_M=""）——autotune 的跨进程计时选型
+    // 差异会翻转末位，但那不是 attention 的批形依赖，不能混进这条对拍。
     let big_div = got_big.iter().zip(&alone_big).filter(|(a, b)| a != b).count();
     let small_div = got_small.iter().zip(&alone_small).filter(|(a, b)| a != b).count();
     if std::env::var("WEIN_ATTN_V3").map(|v| v != "0").unwrap_or(true) {

@@ -2221,6 +2221,9 @@ impl PagedAttnCuda<'_> {
 
     /// 分块档几何裁决（纯函数：测试与 exec 共用同一份算式，附图性质）
     /// 返回 (ntok, nv, rows_nom, bdim, ntile, jsplit)。
+    ///
+    /// **批形不改数值**（与 `online_geom` 同合同）：kernel 里 j 轴分段长只依
+    /// 页表容量 `bpr×bs`，不依块内 pmax ⇒ 同一行在任意批形下的归约序逐位同。
     pub fn tile_geom(q_heads: u32, kv_heads: u32, head_dim: u32, tokens: u32)
         -> (usize, usize, usize, usize, usize, usize)
     {
@@ -2404,6 +2407,15 @@ impl PagedAttnCuda<'_> {
     /// 选法：**先要 rpt 大**（流量 ÷rpt），再要 ntok 大（块少、屏障少），
     /// 夹在 `rows_nom ≤ ROWS_CAP`、`bdim ≤ min(cfg.bdim_max, 寄存器账)` 之内。
     /// rpt 还须整除 group（行组不跨 token）。
+    ///
+    /// **批形不改数值（kernel 合同）**：同一行的 attention 输出只由
+    /// (q 行, seq, pos, KV) 决定，与**批内其它行的位置/行数**无关。j 轴分段
+    /// 长在 kernel 里只依页表容量 `bpr×bs`（≥ 全序列最大位置 +1），不依块内
+    /// pmax——故混批/单跑逐位同。swizzle 形的 ntok/bdim 随 tokens 变，但只改
+    /// 线程映射、不改任一行的 j 归约序（nv = head_dim/nd 与 tokens 无关）；
+    /// jsplit 在纯 decode（t≤4：ntok=min(4,t)、ntile=1 ⇒ base=kv_heads）**与
+    /// tokens 无关**（本模型 4 kv 头 ⇒ 恒 16）。大 chunk（t×q_heads > PART_ROWS）
+    /// 落 jsplit=1，满载 c=100 走这档，几何不动 ⇒ 性能不退化。
     pub fn online_geom(
         cfg: AttnCfg,
         q_heads: u32,

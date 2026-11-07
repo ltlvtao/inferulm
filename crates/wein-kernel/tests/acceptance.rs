@@ -134,8 +134,9 @@ fn k1_ptx_artifact_structure() {
     assert!(ptx.contains(".entry paged_attn_v9("), "paged_attn_v9 入口缺失/被改名");
     assert_eq!(
         ptx.matches(".visible .entry").count(),
-        68,
-        "导出 kernel 数应为 68（67 + 批量行零化 zero_rows）"
+        70,
+        "导出 kernel 数应为 70（68 + HEAD 02d8bae 的 norm 载入成组：rms_norm_zc / \
+         add_norm_zc——该提交加了入口但没抬此计数；已在上方逐个断言）"
     );
 }
 

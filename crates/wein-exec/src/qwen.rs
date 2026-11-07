@@ -1076,6 +1076,12 @@ impl Qwen35Executor {
     ) {
         // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        if std::env::var("WEIN_ATTN_TRACE").is_ok() {
+            eprintln!(
+                "ATN t={t} hd={hd} qh={qh_n} kvh={kvh} dec={has_decode_row} single={single_span} maxpos={} v5t={} v3t={} online={}",
+                self.step_max_pos, self.attn_v5_min_t, self.attn_v3_min_t, self.attn_online
+            );
+        }
         // v5 档（4 warp × 64 行 CTA 共享 K/V smem）：v4 全部合同 + KV 流量
         // ÷4（每字节供 64 行消费）。tokens 64 对齐主段走 v5，余段（<64 行）
         // 的 16 对齐部分走 v4、尾行（<16 行）narrow 切给 online——行独立，

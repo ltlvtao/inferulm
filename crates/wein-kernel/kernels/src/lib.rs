@@ -949,6 +949,7 @@ unsafe fn attn_dot_g<const WIDE: bool>(qp: *const u16, kp: *const u8, hd: usize)
 /// 分块档槽位表填充：本 chunk 每个 j 的 paged KV 槽位只查一次，写进
 /// `sb[u·cc + (j−c0)]`（u = token 的片内序号）。块内所有 q 行/线程共享。
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn tile_fill_slots(
     sb: *mut f32,
     block_table: *const u32,
@@ -970,6 +971,29 @@ unsafe fn tile_fill_slots(
         let s = *seq_ids.add(t0 + u) as usize;
         *sb.add(e) = slot_of(block_table, s, j, bpr, bs) as f32;
         e += bdim;
+    }
+}
+
+/// 单行 j 段（**批形无关的唯一定义**，两遍档与单遍档共用）：
+/// `lspan = ceil((pos+1)/js)`、段号 sp ⇒ `[sp·lspan, (sp+1)·lspan)`，末段收在
+/// `pos+1`。段长只由**本行自己的 pos** 推出 ⇒ 同一行在任意批形（邻居位置、
+/// 行数、ntok 切法）下的分段边界与归约序逐位相同（o41/o42 合同）。
+///
+/// 空段（`j1 <= j0`，短行落在高段号）归一到 `[1,1)`，**不早退**：块内
+/// `__syncthreads()` 的次数必须与行组无关（各行的 pos 不同 ⇒ 早退会让部分
+/// 线程退场而其余线程继续屏障）。归一后 `j1-1 = 0 < c0 ≤ j0`，该行在所有
+/// chunk 上跳过算术（累加器/m/l 一律不动），末尾自然落 `(m=−inf, l=0)`，
+/// 由 `attn_combine` 的 `l>0` 判据跳过。
+#[inline(always)]
+fn row_band(p: usize, sp: usize, js: usize) -> (usize, usize) {
+    let lspan = udiv(p + js, js); // ceil((p+1)/js)
+    let lo = sp * lspan;
+    let hi = (sp + 1) * lspan;
+    let hi = if hi < p + 1 { hi } else { p + 1 };
+    if hi <= lo {
+        (1, 1)
+    } else {
+        (lo, hi)
     }
 }
 
@@ -1028,34 +1052,31 @@ unsafe fn tile_body<const WIDE: bool>(
     let vr = r < rows;
     let (bpr, bs) = (bpr as usize, block_size as usize);
     let he = kv_n * hd;
-    // 本块的 j 轴：片内 token 位置的最大值定分段长（末片 token 少但仍共享）
-    let mut pmax = 0usize;
+    let cap = chunk as usize;
+    // j 轴分段：段长只由**本行自己的 pos** 推出（`row_band`）⇒ 批形不改数值
+    //（o42 合同）。块级 chunk 循环取所有行组的**并集** `[min_r j0_r, max_r j1_r)`；
+    // 各行在超出自己 `[j0_r, j1_r)` 的 chunk 上跳过算术。chunk 边界锚在 `cap` 的
+    // **绝对倍数**上（两遍档的求和序是 j 升序单链，与 chunk 相位无关，但单遍档
+    // 的 rescale 在 chunk 边界上 ⇒ 两边统一用绝对相位，避免"并集下界"渗入数值）。
+    let mut jl = usize::MAX;
+    let mut jh = 0usize;
     let mut u = 0usize;
     while u < tn {
         let p = *positions.add(t0 + u) as usize;
-        pmax = if p > pmax { p } else { pmax };
+        jl = if p < jl { p } else { jl };
+        jh = if p > jh { p } else { jh };
         u += 1;
     }
-    let lspan = udiv(pmax + js, js); // ceil((pmax+1)/js)
-    let jmax = pmax + 1;
-    let j0 = sp * lspan;
-    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    // 并集 = [j0(pmin), j1(pmax))：`row_band` 两端都对 pos 单调 ⇒ 只扫位置极值
+    let (jlo, _) = row_band(if jl == usize::MAX { 0 } else { jl }, sp, js);
+    let (_, jhi) = row_band(jh, sp, js);
     let rglob = if vr { (t0 + udiv(r, ng)) * qh_n + kh * ng + urem(r, ng) } else { 0 };
-    // 空分片：落 l=0（combine 跳过），保证 part 表被完整覆盖
-    if j0 >= j1 {
-        if vr && lane == 0 {
-            *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
-            *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
-        }
-        return;
-    }
     // 块私有 scratch（与 host `ops::ATTN_TILE_SLOTS` 同式同值：max 归约
     // 1024 + p 暂存 chunk×rows + den 槽 rows + 槽位表 4×chunk）——块间并发，
     // 不偏移就是全体块共写同一片槽（o30 逮到的错形态）
     let scratch = scratch.add(blk * TILE_SLOT);
     let scm = scratch; // [bdim] 行内 max 归约
     let pb = scratch.add(bdim); // [chunk × rows_nom] p 暂存
-    let cap = chunk as usize;
     // 槽位表 [nt × chunk]：一 chunk 内每个 j 的 block_table 查表只做一次，块内
     // 全体行共享。否则 B2 里每个线程的每个 j 都要一次「bt → V」两级依赖载入，
     // 那是分块档实测的唯一瓶颈（读量已降到 1/8，却被延迟吃回去）。
@@ -1064,23 +1085,36 @@ unsafe fn tile_body<const WIDE: bool>(
     let gq = urem(r, ng);
     let sr = if vr { *seq_ids.add(t0 + tt) as usize } else { 0 };
     let pr = if vr { *positions.add(t0 + tt) as usize } else { 0 };
+    let (j0, j1) = row_band(pr, sp, js);
     let qbase = if vr { ((t0 + tt) * qh_n + kh * ng + gq) * hd } else { 0 };
     let qp = q.add(qbase);
     let esz = kv_esz::<WIDE>();
 
     // ① 遍 1：分值极值（纯比较——值与序无关）。按 chunk 走（步长 nv 与
     // chunk 宽同余 ⇒ chunk 升序 = 全局 j 升序），每 chunk 复用一次槽位表。
+    // 逐行剪枝：本行本 chunk 的 j 区间 = `[max(c0,j0), min(c1,j1−1)]`，空区间
+    // 整段跳过（不是靠 causal mask 兜——那样相邻分片会把同一批 j 算两遍）。
+    // 槽位表按整 chunk [c0,c1] 填充（列基址 = c0，与 pb 一致）：各行的有效 j 是它的子集。
     let mut m = f32::NEG_INFINITY;
-    let mut c0 = j0;
-    while c0 < j1 {
-        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+    // 首块左端 = 并集下界 jlo（本块最低的 j0，行内再剪到 j0），块末取 cap 的**绝对
+    // 倍数** ⇒ 内部 rescale 边界与批形无关；jlo 只决定"从哪一列开始填表"。
+    let mut c0 = jlo;
+    let mut pad = jlo - udiv(jlo, cap) * cap; // 首块左端不在网格上 ⇒ 块末前移
+    while c0 < jhi {
+        let mut c1 = c0 + cap - 1 - pad;
+        if c1 > jhi - 1 {
+            c1 = jhi - 1;
+        }
+        pad = 0; // 首块之后 c0 必是 cap 的绝对倍数
         let cc = c1 - c0 + 1;
+        let jr0 = if j0 > c0 { j0 } else { c0 };
+        let jr1 = if j1 - 1 < c1 { j1 - 1 } else { c1 };
         _syncthreads(); // 读侧屏障（表要重填）
         tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
         _syncthreads();
         if vr {
-            let mut j = c0 + lane;
-            while j <= c1 && j <= pr {
+            let mut j = jr0 + lane;
+            while j <= jr1 {
                 let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
                 let v = attn_dot_g::<WIDE>(qp, k_cache.add(kbase * esz), hd) * q_scale;
                 m = if v > m { v } else { m };
@@ -1110,18 +1144,26 @@ unsafe fn tile_body<const WIDE: bool>(
     let mut a2 = 0.0f32;
     let mut a3 = 0.0f32;
     let mut den = 0.0f32;
-    let mut c0 = j0;
-    while c0 < j1 {
-        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
-        let jr = if pr < c1 { pr } else { c1 }; // 本行该 chunk 的有效末位
+    // 首块左端 = 并集下界 jlo（本块最低的 j0，行内再剪到 j0），块末取 cap 的**绝对
+    // 倍数** ⇒ 内部 rescale 边界与批形无关；jlo 只决定"从哪一列开始填表"。
+    let mut c0 = jlo;
+    let mut pad = jlo - udiv(jlo, cap) * cap; // 首块左端不在网格上 ⇒ 块末前移
+    while c0 < jhi {
+        let mut c1 = c0 + cap - 1 - pad;
+        if c1 > jhi - 1 {
+            c1 = jhi - 1;
+        }
+        pad = 0; // 首块之后 c0 必是 cap 的绝对倍数
         let cc = c1 - c0 + 1;
+        let jr0 = if j0 > c0 { j0 } else { c0 };
+        let jr1 = if j1 - 1 < c1 { j1 - 1 } else { c1 };
         _syncthreads();
         tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
         _syncthreads();
         // B1：本 chunk 的 p → pb[(j−c0)·rows_nom + r]
         if vr {
-            let mut j = c0 + lane;
-            while j <= jr {
+            let mut j = jr0 + lane;
+            while j <= jr1 {
                 let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
                 let sc = attn_dot_g::<WIDE>(qp, k_cache.add(kbase * esz), hd) * q_scale;
                 *pb.add((j - c0) * rows_nom + r) = expf(sc - mm);
@@ -1131,8 +1173,8 @@ unsafe fn tile_body<const WIDE: bool>(
         _syncthreads();
         // B2：加权 V —— 线程认领 4 维（u64 载 4×bf16），j 升序；地址只查表
         if vr {
-            let mut j = c0;
-            while j <= jr {
+            let mut j = jr0;
+            while j <= jr1 {
                 let p = *pb.add((j - c0) * rows_nom + r);
                 let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
                 let vs = kv_ld::<4, WIDE>(v_cache, vbase);
@@ -1344,34 +1386,31 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     let vr = r0 < rows;
     let (bpr, bs) = (bpr as usize, block_size as usize);
     let he = kv_n * hd;
-    // j 轴分段（与两遍档同式：块内最大位置定段长，末片 token 少但仍共享）
-    let mut pmax = 0usize;
+    let cap = chunk as usize;
+    // j 轴分段：段长只由**本行自己的 pos** 推出（`row_band`）⇒ 同一行在任意批形
+    // （邻居位置/行数/ntok 切法）下分段边界与归约序逐位同（o41 合同）；decode 形
+    // 块内各行 pos 相近 ⇒ 段长小 ⇒ 分片重新铺满（并行度与旧 pmax 几何同）。
+    // 块级 chunk 循环取所有行组的**并集** `[min_r j0_r, max_r j1_r)`，各行在超出
+    // 自己 `[j0_r, j1_r)` 的 chunk 上跳过算术。chunk 边界锚在 `cap` 的**绝对倍数**
+    // 上：rescale（`echunk`/`scale`）落在 chunk 边界，若相位改由并集下界推出，
+    // 邻居行就会改写本行的归约序（实测 o41 翻 2/4096 个 bf16 位）。
+    let mut jl = usize::MAX;
+    let mut jh = 0usize;
     let mut u = 0usize;
     while u < tn {
         let p = *positions.add(t0 + u) as usize;
-        pmax = if p > pmax { p } else { pmax };
+        jl = if p < jl { p } else { jl };
+        jh = if p > jh { p } else { jh };
         u += 1;
     }
-    let lspan = udiv(pmax + js, js);
-    let jmax = pmax + 1;
-    let j0 = sp * lspan;
-    let j1 = if (sp + 1) * lspan < jmax { (sp + 1) * lspan } else { jmax };
+    // 并集 = [j0(pmin), j1(pmax))：`row_band` 两端都对 pos 单调 ⇒ 只扫位置极值
+    let (jlo, _) = row_band(if jl == usize::MAX { 0 } else { jl }, sp, js);
+    let (_, jhi) = row_band(jh, sp, js);
     // 行组基：组内 RPT 行同 token（ng % RPT == 0）⇒ tt/gq0 只算一次
     let tt = udiv(r0, ng);
     let gq0 = urem(r0, ng);
     let pr = if vr { *positions.add(t0 + tt) as usize } else { 0 };
-    if j0 >= j1 {
-        if vr && lane == 0 {
-            let mut k = 0usize;
-            while k < RPT {
-                let rglob = (t0 + tt) * qh_n + kh * ng + gq0 + k;
-                *part_ml.add((rglob * js + sp) * 2) = f32::NEG_INFINITY;
-                *part_ml.add((rglob * js + sp) * 2 + 1) = 0.0;
-                k += 1;
-            }
-        }
-        return;
-    }
+    let (j0, j1) = row_band(pr, sp, js);
     // scratch 布局与两遍档同（复用同一份分配，host 侧零改动）：
     // scm[bdim] 行内 max 归约 / pb[chunk×rows_nom] 分值→p 暂存 / sb[nt×chunk] 槽位表
     let scratch = scratch.add(blk * TILE_SLOT);
@@ -1381,7 +1420,6 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     let scm = scratch;
     let scm_len = rows_nom * nv;
     let pb = scratch.add(scm_len);
-    let cap = chunk as usize;
     let sb = pb.add(cap * rows_nom + rows_nom);
     let d0 = lane * ND; // 本线程的 ND 个输出维
     // 组内**首行**的 q/out 行基址：组内第 k 行 = qb0 + k·hd（行相邻）。
@@ -1399,19 +1437,27 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
     let mut mrun = [f32::NEG_INFINITY; RPT];
     let mut lrun = [0.0f32; RPT];
     let mut acc = [[0.0f32; ND]; RPT];
-    let mut c0 = j0;
-    while c0 < j1 {
-        let c1 = if c0 + cap - 1 < j1 - 1 { c0 + cap - 1 } else { j1 - 1 };
+    // 首块左端 = 并集下界 jlo（本块最低的 j0，行内再剪到 j0），块末取 cap 的**绝对
+    // 倍数** ⇒ 内部 rescale 边界与批形无关；jlo 只决定"从哪一列开始填表"。
+    let mut c0 = jlo;
+    let mut pad = jlo - udiv(jlo, cap) * cap; // 首块左端不在网格上 ⇒ 块末前移
+    while c0 < jhi {
+        let mut c1 = c0 + cap - 1 - pad;
+        if c1 > jhi - 1 {
+            c1 = jhi - 1;
+        }
+        pad = 0; // 首块之后 c0 必是 cap 的绝对倍数
         let cc = c1 - c0 + 1;
-        let jr = if pr < c1 { pr } else { c1 }; // 本组该 chunk 的有效末位
+        let jr0 = if j0 > c0 { j0 } else { c0 };
+        let jr1 = if j1 - 1 < c1 { j1 - 1 } else { c1 };
         _syncthreads(); // 读侧屏障（表要重填）
         tile_fill_slots(sb, block_table, seq_ids, t0, tn, c0, cc, bpr, bs, tau, bdim);
         _syncthreads();
         // B1a：分值（j 属主整条点积，K 整行载入一次供 RPT 行共享）→ pb 原值
         let mut mx = [f32::NEG_INFINITY; RPT];
         if vr {
-            let mut j = c0 + lane;
-            while j <= jr {
+            let mut j = jr0 + lane;
+            while j <= jr1 {
                 let kbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd;
                 let mut s = [0.0f32; RPT];
                 let mut d = 0usize;
@@ -1476,8 +1522,8 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
         }
         // B1b：p = exp(分值 − 本 chunk max) ∈ (0,1]（j 属主原地写）
         if vr {
-            let mut j = c0 + lane;
-            while j <= jr {
+            let mut j = jr0 + lane;
+            while j <= jr1 {
                 let mut k = 0usize;
                 while k < RPT {
                     let o = (j - c0) * rows_nom + r0 + k;
@@ -1493,8 +1539,8 @@ unsafe fn online_body<const ND: usize, const RPT: usize, const WIDE: bool>(
         if vr {
             let mut s = [[0.0f32; ND]; RPT];
             let mut dl = [0.0f32; RPT];
-            let mut j = c0;
-            while j <= jr {
+            let mut j = jr0;
+            while j <= jr1 {
                 let vbase = *sb.add(tt * cc + (j - c0)) as usize * he + kh * hd + d0;
                 let vs = kv_ld::<ND, WIDE>(v_cache, vbase);
                 let mut k = 0usize;
