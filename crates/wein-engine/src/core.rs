@@ -353,6 +353,13 @@ impl EngineCore {
         let lp = std::env::var_os("WEIN_LOOP_PROF").is_some();
         let mut lp_acc = [0f64; 4];
         let mut lp_n = 0u32;
+        // 步时分类直方图（WEIN_STEP_HIST=1）：exec 相位之外那 2.5ms/步 到底是
+        // 谁——按步的形态分类累计 [步数, 墙钟 ms, exec.step ms, prefill token, decode 行]
+        // 类：0 = 纯 decode（图档候选）、1 = 混批（decode+prefill）、
+        //     2 = 纯 prefill（新请求首步/radix 未命中重建）、3 = 空步
+        let hist = std::env::var_os("WEIN_STEP_HIST").is_some();
+        let mut hs = [[0f64; 5]; 4];
+        let mut hs_n = 0u32;
 
         while let Some(cmd) = cmd_rx.recv().await {
             Self::handle(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec, cmd);
@@ -369,11 +376,23 @@ impl EngineCore {
                 // 回收）→ 规划相位。命中必须在规划之前进账：晚一步本步预算
                 // 会按未命中的债切 chunk，执行器按真实游标少喂 → 两侧漂移
                 let tp0 = if lp { Some(Instant::now()) } else { None };
+                let h0 = if hist { Some(Instant::now()) } else { None };
                 sched.advance();
                 // 事件先于 exec.step：本步新准入者先建行（exec.admitted）
                 // 再进前向——否则 step 查不到行会静默空转
                 Self::pump(&mut sched, &mut senders, &mut stops, &mut prompts, &stats, &mut exec);
                 let plan = sched.plan();
+                let hcls = if !hist {
+                    0usize
+                } else if plan.prefill.is_empty() {
+                    if plan.decode.is_empty() { 3 } else { 0 }
+                } else if plan.decode.is_empty() {
+                    2
+                } else {
+                    1
+                };
+                let hpf: f64 = plan.prefill.iter().map(|&(_, n)| n as f64).sum();
+                let hdec = plan.decode.len() as f64;
                 stats.steps.fetch_add(1, Ordering::Relaxed);
                 // gauge：本步前向行数（prefill token 数 + decode 行数）
                 stats.batch_rows.store(
@@ -474,6 +493,39 @@ impl EngineCore {
                         );
                         lp_acc = [0f64; 4];
                         lp_n = 0;
+                    }
+                }
+                if let (true, Some(t0)) = (hist, h0) {
+                    let e = &mut hs[hcls];
+                    e[0] += 1.0;
+                    e[1] += (Instant::now() - t0).as_secs_f64() * 1e3;
+                    e[2] += (tp2 - tp1).as_secs_f64() * 1e3;
+                    e[3] += hpf;
+                    e[4] += hdec;
+                    hs_n += 1;
+                    if hs_n == 200 {
+                        let names = ["纯decode", "混批", "纯prefill", "空步"];
+                        let all: f64 = hs.iter().map(|e| e[1]).sum();
+                        for (i, e) in hs.iter().enumerate() {
+                            if e[0] == 0.0 {
+                                continue;
+                            }
+                            eprintln!(
+                                "[hist] {:9} {:4} 步 墙钟 {:6.1}ms({:4.1}%) 步均 {:6.2} 其中 exec {:6.2} 引擎 {:5.2} | pf/tok {:5.0} dec行 {:5.1}",
+                                names[i],
+                                e[0] as u64,
+                                e[1],
+                                100.0 * e[1] / all,
+                                e[1] / e[0],
+                                e[2] / e[0],
+                                (e[1] - e[2]) / e[0],
+                                e[3] / e[0],
+                                e[4] / e[0]
+                            );
+                        }
+                        eprintln!("[hist] 合计 {:6.2}ms/步（{} 步）", all / hs_n as f64, hs_n);
+                        hs = [[0f64; 5]; 4];
+                        hs_n = 0;
                     }
                 }
             }
