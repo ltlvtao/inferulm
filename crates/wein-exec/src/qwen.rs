@@ -233,7 +233,16 @@ const L2_EPS: f32 = 1e-6;
 /// 专用**容差路径**（kernel 侧 o35 口径 rel2 ≤ 3e-3——代数变形破位级合同），
 /// decode / 小 span / 投机链段仍走老 kernel 位级不动。`WEIN_DN_CHUNK=0`
 /// 总关（回退完整性：一切与 HEAD 位级同）
-const DN_CHUNK_MIN_SPAN: u32 = 256;
+/// 门槛 64 = BT 的最小单位。旧值 256 让 Agent 场景（每轮新增 span ≈190 token）
+/// 落在最差区间：走不了 chunked（10.8µs/token）只能走老路（2.36µs/token/层 ×
+/// 24 层 ≈ 10.8ms/步，实测 ITL 52ms 的大头）。`WEIN_DN_CHUNK_MIN` 可覆盖（A/B 用）
+fn dn_chunk_min_span() -> u32 {
+    std::env::var("WEIN_DN_CHUNK_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DN_CHUNK_MIN_SPAN)
+}
+const DN_CHUNK_MIN_SPAN: u32 = 64;
 /// BT=64/vsplit=8 是 dn_chunk_probe 的实测最优（6009 全段 24 层 102.35ms，
 /// 老路 332ms）
 const DN_CHUNK_BT: u32 = 64;
@@ -3386,7 +3395,7 @@ impl Qwen35Executor {
             let nch = cnt.div_ceil(DN_CHUNK_BT);
             let last = *snap_off.last().unwrap();
             if spec == 0
-                && cnt >= DN_CHUNK_MIN_SPAN
+                && cnt >= dn_chunk_min_span()
                 && c_start.len() < DN_CHUNK_ROWS
                 && (last + nch) as usize <= chunk_cap
             {
