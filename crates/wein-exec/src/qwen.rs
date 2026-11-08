@@ -218,6 +218,12 @@ fn attn_v3_from_env(var: &str) -> wein_kernel::ops::V3Cfg {
 /// radix 前缀缓存快照槽数（每槽 24 层 lin 1MB + conv 48KB ≈ 25.2MB；
 /// 槽挂 radix 块（snap_of_block）；请求活跃期逐边界各借一槽（前缀树上每块
 /// 都要有槽才可能被命中——单活跃槽只保末边界时祖先无槽、命中恒 0）。
+/// 槽预算策略的"浅层"界（块数）：≤ 该深度（768 token）的快照是
+/// system + 工具声明这段人人逐字相同的前缀，跨会话共享、常驻不淘汰。
+/// **不能取大**：agent 单轮 prompt 才 ~1800 token（112 块），界取 128 会让
+/// "深层每请求一张"形同虚设（16 会话 × 6 轮全算浅层，槽必然耗尽）
+const SNAP_SHALLOW_BLKS: usize = 48;
+
 /// 槽数随 `ctx::snap_slots()`（WEIN_SNAP_SLOTS / --snap-slots）——长上下文
 /// /多会话下槽压升高，池大时该抬（0 = 关快照池）
 /// linear 侧 q/k l2norm eps（FLA 对齐，modeling l2norm）
@@ -969,6 +975,19 @@ pub struct Qwen35Executor {
     /// decode 侧快照栅格（0 = 不落）。decode 边界快照只在"共享同一续写"
     /// 场景有用（多轮对话的下一轮 prompt 含前轮生成 token），故默认稀疏
     snap_grid_dec: usize,
+    /// 每槽承载的快照深度（块号）；0 = 空。槽预算策略判定用
+    snap_nb: Vec<usize>,
+    /// 每槽当前的 (块, 登记状态)——还槽时必须能摘掉 `snap_of_block` 里的
+    /// 反向记录，否则留下"指向已被覆盖槽"的悬空映射（命中处会读到别人的
+    /// 状态：静默数值污染，比 miss 危险得多）
+    snap_owner: Vec<Option<u32>>,
+    /// 每槽快照的相位（true = prompt 侧）。替换只发生在**同相位**之间：
+    /// decode 侧快照的位置往往比下一轮 prompt 还深（上一轮生成的内容未必
+    /// 被完整回灌），让它挤掉 prompt 端点会让命中退回到首个历史点
+    snap_phase: Vec<bool>,
+    /// 槽预算策略：浅层常驻去重 + 深层每请求只留最新一张。
+    /// `WEIN_SNAP_POLICY=legacy` 回退"来者不拒"（A/B 用）
+    snap_policy: bool,
     /// prompt 侧快照栅格（token）：默认 = block（逐块快照，旧行为）；
     /// 长上下文抬高它（`ctx::snap_stride`）换"槽够用"——命中粒度随之变粗
     snap_stride: usize,
@@ -1532,6 +1551,7 @@ impl Qwen35Executor {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or((4 * ctx::block() as usize).max(ctx::snap_stride()));
         let snap_grid_dec = dgrid.div_ceil(ctx::block() as usize) * ctx::block() as usize;
+        let snap_policy = std::env::var("WEIN_SNAP_POLICY").map_or(true, |v| v != "legacy");
         let (snap_lin, snap_conv, snap_free) = if radix_on {
             let slots = ctx::snap_slots();
             let mut sl = Vec::with_capacity(lin_state.len());
@@ -1656,6 +1676,10 @@ impl Qwen35Executor {
             radix_on,
             radix_dbg,
             snap_grid_dec,
+            snap_nb: vec![0; if radix_on { ctx::snap_slots() } else { 0 }],
+            snap_owner: vec![None; if radix_on { ctx::snap_slots() } else { 0 }],
+            snap_phase: vec![false; if radix_on { ctx::snap_slots() } else { 0 }],
+            snap_policy,
             snap_stride: ctx::snap_stride(),
             reqs: HashMap::new(),
             bt_host: vec![0u32; MAX_ROWS * bpr_of()],
@@ -2895,6 +2919,20 @@ impl Qwen35Executor {
             }
         }
         self.snap_free.pop()
+    }
+
+    /// 归还一张快照槽：**必须**同时摘掉 `snap_of_block` 里的反向记录
+    /// （否则槽被复用时旧块仍指向它 → 命中恢复读到别的序列的状态）
+    fn release_slot(&mut self, slot: u32) {
+        if let Some(b) = self.snap_owner.get_mut(slot as usize).and_then(|e| e.take()) {
+            if self.snap_of_block.get(&b) == Some(&slot) {
+                self.snap_of_block.remove(&b);
+            }
+        }
+        if let Some(e) = self.snap_nb.get_mut(slot as usize) {
+            *e = 0;
+        }
+        self.snap_free.push(slot);
     }
 
     /// 页分配（耗尽时 LRU 驱逐 radix 腾页——槽随块联动回收）。
@@ -4815,9 +4853,64 @@ impl Executor for Qwen35Executor {
                     Some(st) if st.blocks.len() >= nb => (st.state_row, st.blocks[nb - 1]),
                     _ => continue,
                 };
+                // ── 槽预算（W-Agent-2）──
+                // 病灶（2026-11-08 实测）：agent 每轮都要一张"prompt 端点"快照
+                // 才能命中上一轮，而端点位置逐轮前进 ⇒ 一个 6 轮会话要 6 张；
+                // 16 会话 = 96 张 > 64 槽 ⇒ 驱逐连带把块从树里摘掉，命中塌到
+                // 首个历史点（keep=26 块 = 416 token）。容量旋钮（页池/槽数）
+                // 单独加都没用——必须改"该扔谁"。
+                //
+                // 规则：① 浅层（≤ SNAP_SHALLOW_BLKS 块）是 system+tools 这段
+                // 人人逐字相同的前缀，跨会话共享且常驻（同一块只采一次）
+                // ② 深层每请求**只留最新一张**：上一张的使命是"让本轮的上一轮
+                // 命中"，本轮一旦采了更深的一张，它就再也用不到了
+                if self.snap_policy {
+                    // ① 该块已有快照（同路径的别的请求采过 / 本请求早先采过）
+                    //    ⇒ 不重复占槽。块级共享是 radix 的既有语义，快照跟着共享
+                    // ② 否则每请求**每相位**只留最新一张（旧槽让位）
+                    //
+                    // 为什么不再按"浅层/深层"分档：浅层按"每块一张"要 26 张
+                    // （system+tools 26 块），加 16 会话 × 2 相位 = 58 张，正好
+                    // 卡在 64 槽边缘——实测 c=16 仍有 46/96 个请求只命中首个
+                    // 历史点。改成"每相位一张 + 块级共享"后槽需求 = 会话×相位
+                    let dup = self.reqs.get(&id).is_some_and(|st| {
+                        st.snaps.iter().any(|(b, _)| *b == blk)
+                    });
+                    if dup || self.snap_of_block.contains_key(&blk) {
+                        continue;
+                    }
+                    {
+                        let nb_tab = &self.snap_nb;
+                        let ph_tab = &self.snap_phase;
+                        let mut give_back: Vec<u32> = Vec::new();
+                        if let Some(st) = self.reqs.get_mut(&id) {
+                            let mut kept: Vec<(u32, u32)> =
+                                Vec::with_capacity(st.snaps.len());
+                            for (b, sl) in st.snaps.drain(..) {
+                                // 同相位 → 让位（每个相位各留最新一张）
+                                let _ = nb_tab;
+                                if ph_tab.get(sl as usize).copied().unwrap_or(false) == pref {
+                                    give_back.push(sl);
+                                } else {
+                                    kept.push((b, sl));
+                                }
+                            }
+                            st.snaps = kept;
+                        }
+                        for sl in give_back {
+                            self.release_slot(sl);
+                        }
+                    }
+                }
                 let Some(slot) = self.acquire_slot() else {
                     continue; // 槽耗尽：降级无快照
                 };
+                if let Some(e) = self.snap_nb.get_mut(slot as usize) {
+                    *e = nb;
+                }
+                if let Some(e) = self.snap_phase.get_mut(slot as usize) {
+                    *e = pref;
+                }
                 if let Some(st) = self.reqs.get_mut(&id) {
                     st.snaps.push((blk, slot));
                 }
