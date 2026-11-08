@@ -5012,11 +5012,20 @@ impl Executor for Qwen35Executor {
                         self.radix.insert(&st.seq[..tok_end], &kept);
                     }
                 }
+                // 槽与块同命（W-Agent-3）：只要快照所在的块仍是本请求的完整块
+                // （索引 < full），它就还活着——要么在树已覆盖段里（别人早插入
+                // 了同一前缀，块由树持有），要么在本次新段 kept 里。旧规则只在
+                // `kept.contains` 时才留槽，把"树已覆盖"那一段的快照全还了池：
+                // 实测 agent 场景 `cover=198` 而 `shared=26`，快照深度落在 26..198
+                // 之间 ⇒ 每轮都被无谓丢弃，下一轮只能命中浅层 26 块。
+                // 槽的真实寿命由块决定：块被逐出时 `snap_owner` 会回收（见驱逐路径）。
+                let idx_of = |b: u32| st.blocks.iter().position(|x| *x == b);
                 for &(b, slot) in &st.snaps {
-                    if kept.contains(&b) {
-                        self.snap_of_block.insert(b, slot);
-                    } else {
-                        self.snap_free.push(slot);
+                    match idx_of(b) {
+                        Some(idx) if idx < full => {
+                            self.snap_of_block.insert(b, slot);
+                        }
+                        _ => self.snap_free.push(slot),
                     }
                 }
                 // 页记账：命中共享块 unpin（请求份释放）；已移交私有块保留
