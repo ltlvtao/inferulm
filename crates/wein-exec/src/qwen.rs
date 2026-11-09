@@ -1695,17 +1695,20 @@ impl Qwen35Executor {
         let snap_grid_dec = dgrid.div_ceil(ctx::block() as usize) * ctx::block() as usize;
         let snap_policy = std::env::var("WEIN_SNAP_POLICY").map_or(true, |v| v != "legacy");
         // DRAM 分层（W-Agent-5，WEIN_DRAM=1 开）：驱逐下沉 pinned host。
-        // 容量 = 块槽 2048×(16 段×seg) + 状态槽 64×25.4MB ≈ 2.6GB（env 可调）
+        // 容量 = 块槽 8192×(16 段×seg)=128K token + 状态槽 96×25.4MB ≈ 6.5GB host
+        // （c=8 会话×轮 ≈ 48 张状态锚 + 8×42K token 块需求；2048/64 时代块层
+        // 只能保住 1 个会话的副本，多会话 LRU 互逐后 admit 无块可补——
+        // bench-reports/agent-dram-cap-20261110）
         let kv_seg = ctx::block() as usize * (cfg.num_kv_heads * cfg.head_dim) as usize * kv_esz;
         let dram = if radix_on && env_flag("WEIN_DRAM") {
             let nb: usize = std::env::var("WEIN_DRAM_BLK")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2048);
+                .unwrap_or(8192);
             let ns: usize = std::env::var("WEIN_DRAM_ST")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64);
+                .unwrap_or(96);
             // 状态槽步长 = 全部层的一行（lin 24 层 + conv 24 层）——
             // spill_state 逐层连写 Σ lin_n×lin_row + conv_n×conv_row，
             // 只传 lin_row+conv_row（单层）会让槽互相踩
