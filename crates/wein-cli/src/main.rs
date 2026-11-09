@@ -182,6 +182,20 @@ fn main() {
                             std::process::exit(1)
                         });
                     }
+                    // --mix-budget-ms F：混合步时间预算（0=关；与 --mix-cap
+                    // 双闸门取更小——battery/Agent 调参用）
+                    if let Some(v) = arg_opt(&args, "--mix-budget-ms") {
+                        cfg.sched.mix_budget_ms = v.parse().unwrap_or_else(|_| {
+                            eprintln!("--mix-budget-ms 须为非负数：{v}");
+                            std::process::exit(1);
+                        });
+                    }
+                    if let Some(v) = arg_opt(&args, "--mix-budget-rows") {
+                        cfg.sched.mix_budget_rows = v.parse().unwrap_or_else(|_| {
+                            eprintln!("--mix-budget-rows 须为非负整数：{v}");
+                            std::process::exit(1);
+                        });
+                    }
                     // --chunk-size N：单请求单步 prefill 上限（同上，调参用）
                     if let Some(v) = arg_opt(&args, "--chunk-size") {
                         cfg.sched.chunk_size = v.parse().unwrap_or_else(|_| {

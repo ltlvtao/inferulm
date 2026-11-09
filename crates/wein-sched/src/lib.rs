@@ -53,6 +53,18 @@ pub struct SchedConfig {
     /// 稳定 decode（纯 prefill 波）不受限（TTFT/吞吐优先）；decode 行数占满
     /// cap 时至少留 [`PREFILL_MIN`] 给 prefill（进度保证）
     pub mix_cap: usize,
+    /// 混合步时间预算（毫秒，0 = 关闭）：与 `mix_cap`（token 数）双闸门——
+    /// 批内有稳定 decode 时，按步时长估计模型把 prefill 许可折算成 token 数，
+    /// 取两者更小。**仅高并发生效**（decode 行数 ≥ `mix_budget_rows`）：
+    /// 低并发（Agent 多会话 c≤16）实测（2026-11-09）该闸门全负——长上下文
+    /// prefill 边际 ~70µs/token 远超模型斜率 40µs（步长超标），且微切片把
+    /// chunk 尾挪出快照粗栅格（SNAP_KEEP_GRID 与 chunk_size 对齐）⇒ 深锚
+    /// 失火、命中 −17pt、turns −35%；高并发（c=100）满负荷 ITL p99 42→33
+    ///（26ms 档）/38.9（30ms 档）。0 = 关闭
+    pub mix_budget_ms: f64,
+    /// 时间预算闸门的最小 decode 行数（高并发判据）。0 = 有 decode 就生效
+    ///（不推荐，见上）
+    pub mix_budget_rows: usize,
     /// prefill chunk 尾对齐粒度（0/1 = 不对齐）。前缀缓存的递推状态检查点
     /// 只能落在"某次 forward 的最后一 token"上，而共享/恢复点必须是块边界
     /// ——非末块 chunk 尾圆到该粒度，chunk 尾即成为检查点（密度 = chunk，
@@ -73,9 +85,16 @@ impl Default for SchedConfig {
             // c=8 实测（2026-11-09，ctx32768/4096 页/graph，三发中位）192→4096
             // ⇒ turns/s 0.56→1.47、ITL 51→18ms、热 TTFT 5145→385ms、命中
             // 14%→36%（步数 1488→986，chunked deltanet 整段吃满）。满负荷
-            // battery 见 agent-mix-cap-20261109：ITL p99 不劣（稳态无 prefill，
-            // 大 cap 只作用在爬坡，反而少付碎片段 launch）
+            // battery 的 ITL p99 代价（25.9→42.5）由 mix_budget_ms 的时间
+            // 预算闸门兜住（见 agent-mixcap-20261109 与时间预算刀报告）
             mix_cap: 4096,
+            // 时间预算默认档（2026-11-09 定档）：26ms + 行数门 32。满负荷
+            // 交叉 A/B（各 2 发）：ITL p99 41.4→32.0（−23%，方向稳定；vs
+            // vLLM 38.5 领先 17%），TTFT p99 120→142（+18%，仍低于 vLLM 的
+            // TTFT p50 144），tps/ITL p50 漂移带内无差；Agent c=4/8 行数门
+            // 下不绑定（等价关闭档）。30ms 档收益减半（p99 −7%）
+            mix_budget_ms: 26.0,
+            mix_budget_rows: 32,
             snap_align: 1,
         }
     }
@@ -84,6 +103,18 @@ impl Default for SchedConfig {
 /// 混合步封顶的下限保护：decode 行占满 cap 时 prefill 每步至少推进的 token 数
 ///（~1ms 步时延的代价换等待 prefill 的有界推进）
 pub const PREFILL_MIN: usize = 8;
+
+/// 时间预算模型的系数（RTX 4090 / Qwen3.5-4B 标定，2026-11-09，图档口径）：
+/// est_ms(d, p) = MIX_BASE_MS + (MIX_TOK_MS)·(d+p) + MIX_ROW_MS·d
+/// - 基底 12.0ms：权重读地板（m=1 实测 8.23）+ 图回放/采样/尾段 ≈3.8；
+///   校验：c=100 纯 decode est 21.0 vs 实测 ITL p50 20.74 ✓
+/// - token 斜率 0.040ms：gemm 边际 25.7µs（m≤128 实测曲线）+ deltanet ~11µs
+///   + attn/logits ~3µs；m>1024 的算术受限段低估 ~30%——预算闸门在到达
+///   该区间前已绑定，方向安全
+/// - decode 行附加 0.050ms：每行递推状态读+写 ~50MB @900GB/s
+const MIX_BASE_MS: f64 = 12.0;
+const MIX_TOK_MS: f64 = 0.040;
+const MIX_ROW_MS: f64 = 0.050;
 
 pub struct ReqInput {
     pub id: ReqId,
@@ -476,6 +507,24 @@ impl Scheduler {
                 self.cap.on_sample(id);
             }
         }
+        // --- 时间预算闸门（与 mix_cap 双闸门，取更小）：相位一 decode 行已
+        //     落位（其 token 与状态成本都在模型里），剩余预算折算成 prefill
+        //     许可。预算 0 = 关闭。PREFILL_MIN 下限保护在下方原逻辑里 ---
+        if any_decoder
+            && self.cfg.mix_budget_ms > 0.0
+            && plan.decode.len() >= self.cfg.mix_budget_rows.max(1)
+        {
+            let d = plan.decode.len() as f64;
+            let rem = self.cfg.mix_budget_ms - MIX_BASE_MS - (MIX_TOK_MS + MIX_ROW_MS) * d;
+            // 许可为正时下限 PREFILL_MIN（进度保证，代价 ≤8 token ≈ 0.3ms
+            // 超预算）；为 0 交由下方既有 cap==0 下限逻辑
+            let allow = if rem > 0.0 {
+                ((rem / MIX_TOK_MS) as usize).max(PREFILL_MIN)
+            } else {
+                0
+            };
+            cap = cap.min(allow);
+        }
         // decode 占满 cap（slack 0）时给 prefill 留下限（等待中的 prefill 有界
         // 推进）。仅 slack==0 触发：decode 行数 < mix_cap 时 T ≤ mix_cap 是严格
         // 不变量。有 prefill 工作的请求 = 非 decode 态且未达标
@@ -598,6 +647,8 @@ mod tests {
             chunk_size: chunk,
             max_batch_tokens: 1 << 30,
             mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 1,
         }
     }
@@ -687,6 +738,8 @@ mod tests {
             chunk_size: 16,
             max_batch_tokens: 6,
             mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 1,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 2], max_tokens: 8 }); // A
@@ -809,6 +862,8 @@ mod tests {
             chunk_size: 16,
             max_batch_tokens: 1 << 30,
             mix_cap: 8,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 1,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 10 });
@@ -845,6 +900,8 @@ mod tests {
             chunk_size: 64,
             max_batch_tokens: 1 << 30,
             mix_cap: 2,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 1,
         });
         for id in 1..=4u64 {
@@ -855,6 +912,109 @@ mod tests {
         let p2 = s.step();
         let n5: usize = p2.prefill.iter().filter(|&&(id, _)| id == 5).map(|(_, n)| n).sum();
         assert!(n5 >= PREFILL_MIN, "decode 行占满 cap 时 prefill 至少推进 {PREFILL_MIN}（得 {n5}）");
+    }
+
+    /// s11 · 混合步时间预算（mix_budget_ms）：与 mix_cap 双闸门取更小——
+    ///      按步时长模型把 prefill 许可折算成 token；批内无稳定 decode 不受限；
+    ///      预算太紧（decode 部分已超）回落 PREFILL_MIN 进度保证
+    #[test]
+    fn s11_mix_time_budget_gate() {
+        // 预算 16ms：d=1 ⇒ rem = 16 − 12 − 0.09 = 3.91ms ⇒ 许可 97 token
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 512,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 16.0,
+            mix_budget_rows: 1,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 8 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 400], max_tokens: 4 });
+        let (plans, _) = run_to_idle(&mut s, 100);
+        // 步 1：无稳定 decode → 不受限（chunk 上限 512 内吃满 backlog 400）
+        assert_eq!(plans[0].prefill, vec![(1, 1), (2, 400)], "无 decode 在批 → 时间闸门不绑");
+        // 步 2：两者均已追平 → 纯 decode 步，无 prefill 可切（400 一步吃完）
+        assert!(plans[1].prefill.is_empty());
+        // 换更长的 prompt 验证混合步切片上界
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 256,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 16.0,
+            mix_budget_rows: 1,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 30 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 1000], max_tokens: 4 });
+        let (plans, _) = run_to_idle(&mut s, 200);
+        assert_eq!(plans[0].prefill, vec![(1, 1), (2, 256)], "首步无 decode 不受限");
+        // 步 2+：许可 97 与 chunk 256 取小 ⇒ 每步 ≤ 97（+decode 1）
+        let mut chunks = Vec::new();
+        for p in plans.iter().skip(1) {
+            if let Some(&(_, n)) = p.prefill.iter().find(|&&(id, _)| id == 2) {
+                assert!(n <= 97, "时间预算切片上界 97（d=1，得 {n}）");
+                chunks.push(n);
+            }
+            if p.prefill.iter().any(|&(id, _)| id == 2) {
+                assert!(p.decode.contains(&1), "decode 行每步在场");
+            }
+        }
+        assert_eq!(chunks.iter().sum::<usize>(), 744, "1000 = 256 + Σ 后续，不丢 token");
+        // 预算小于基底（decode 部分超预算）→ 许可 0 → PREFILL_MIN 下限
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 256,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 5.0,
+            mix_budget_rows: 1,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 30 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 1000], max_tokens: 4 });
+        s.step(); // 1 追平 + 2 推 256
+        let p2 = s.step();
+        let n2: usize = p2.prefill.iter().filter(|&&(id, _)| id == 2).map(|(_, n)| n).sum();
+        assert_eq!(n2, PREFILL_MIN, "预算不足基底 → 许可 0 → PREFILL_MIN 进度保证");
+        // budget 0 = 关闭：回到纯 token 封顶行为
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 256,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 2 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 1000], max_tokens: 4 });
+        s.step();
+        let p2 = s.step();
+        let n2: usize = p2.prefill.iter().filter(|&&(id, _)| id == 2).map(|(_, n)| n).sum();
+        assert!(n2 > 97, "budget 0 关闭闸门（得 {n2}，token 预算内自由）");
+        // 行数判据：d=1 < rows=32 → 闸门不生效（切片自由）
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 256,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 16.0,
+            mix_budget_rows: 32,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 30 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 1000], max_tokens: 4 });
+        s.step();
+        let p2 = s.step();
+        let n2: usize = p2.prefill.iter().filter(|&&(id, _)| id == 2).map(|(_, n)| n).sum();
+        assert_eq!(n2, 256, "低并发（d=1 < 32）闸门不生效，chunk 自由");
     }
 
     /// s9 · 容量钩子真实可插拔：准入与抢占由容量模型驱动，而非调度器内置聚合
@@ -956,6 +1116,8 @@ mod tests {
                 chunk_size: 16,
                 max_batch_tokens: 1 << 30,
                 mix_cap: 1 << 30,
+                mix_budget_ms: 0.0,
+                mix_budget_rows: 32,
                 snap_align: align,
             });
             s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 10], max_tokens: 2 });
@@ -974,6 +1136,8 @@ mod tests {
             chunk_size: 16,
             max_batch_tokens: 1 << 30,
             mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 4,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 8], max_tokens: 2 });
@@ -988,6 +1152,8 @@ mod tests {
             chunk_size: 6,
             max_batch_tokens: 1 << 30,
             mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 32,
             snap_align: 4,
         });
         s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 10], max_tokens: 2 });
