@@ -1120,12 +1120,14 @@ impl Qwen35Executor {
         // 池），主段由 v9 接管（6009 单层 2.7-2.8ms vs v5 7.0-8.0，×2.6-2.9；
         // o40 容差档 rel2≤1.24e-3）。余段（<64 行）仍走 v4/online。
         // WEIN_ATTN_V9=0 回退 v5（进程内 A/B）。
-        // `WEIN_ATTN_V5_MIX=1`：放松"纯 prefill 单 span"闸门，让混合批（decode 行 +
-        // 多请求 prefill 行）也走 v5/v9——kernel 的 bt/seqs/pos 都是按行寻址，
-        // 因果掩码按行 pos 判定，理论上与批形无关。默认关，须先过正确性对拍
-        let v5_mix = std::env::var("WEIN_ATTN_V5_MIX").map(|v| v != "0").unwrap_or(false);
+        // 混合批（decode 行 + 多请求 prefill 行）**禁 v5/v9**：attn_mix_probe 实测
+        // v9 对 seq_ids≠0 的行算错（spanB rel2=1.86e-1；seq 全 0 + pos 交错 + bt
+        // 行独立全对）——触发器是 seq≠0，不是多 span 或页表。逐段调用 + 段内
+        // seqs 归零（narrow bt 到段首行）已被同一探针验证全对（rel2=1.17e-3），
+        // 是混批提速的已验证路径，待接入（见 bench-reports/agent-attn-mix-20261109）。
         if self.attn_online
-            && (v5_mix || (!has_decode_row && single_span))
+            && !has_decode_row
+            && single_span
             && t >= self.attn_v5_min_t
             && self.step_max_pos < self.attn_v5_max_ctx
             && self.attn_cfg.kv == wein_kernel::ops::KvDtype::Bf16

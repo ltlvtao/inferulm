@@ -44,7 +44,7 @@ fn main() {
     let (bs, qh, kvh, hd) = (16usize, 16usize, 4usize, 256usize);
     let he = kvh * hd;
     let q_scale = 1.0 / (hd as f32).sqrt();
-    let (n0, n1) = (512usize, 448usize); // span A / span B（对齐 o40 的 512 档）
+    let (n0, n1) = (512usize, 448usize);
     let rows = n0 + n1;
     let bpr = 32usize; // 页表容量 = ceil(最长 span / bs)（对齐 o40 的 512/16）
     let npages = 256usize;
@@ -54,7 +54,7 @@ fn main() {
     let mut pos = vec![0u32; rows];
     let mut bt = vec![0u32; rows * bpr];
     for i in 0..n1 {
-        si[i] = 1;
+        si[i] = 1; // 恢复双 seq（触发态）
         pos[i] = i as u32;
     }
     for i in 0..n0 {
@@ -63,14 +63,8 @@ fn main() {
     }
     for r in 0..rows {
         let row_bt = &mut bt[r * bpr..(r + 1) * bpr];
-        if r >= n1 {
-            for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
-                *e = (bpr - 1 - j) as u32; // 倒序页表（spanA 也改）
-            }
-        } else {
-            for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
-                *e = (bpr - 1 - j) as u32; // 倒序页表：blk j → 页 bpr-1-j
-            }
+        for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
+            *e = j as u32; // 页 0..bpr-1（单 span 基线）
         }
     }
     let q = bf16_vec(0x7a11, rows * qh * hd, 2.0);
@@ -96,12 +90,15 @@ fn main() {
     stream.sync();
     let out_all: Vec<u16> = dout.read_to_vec::<u16>();
 
-    // ② 分两次 v9（单 span 各一次）
+    // ② 分两次 v9（单 span 各一次；si 视图一律归 0——v9 的 seq≠0 路径有问题）
     dout.zero_on(&stream);
+    let si0: Vec<u32> = vec![0u32; rows];
+    let dsi0 = gpu.alloc_from_slice(&si0);
     for (start, cnt) in [(0usize, n1), (n1, n0)] {
+        if cnt == 0 { continue; }
         let qv = dq.narrow(start * qbytes, cnt * qbytes);
         let btv = dbt.narrow(start * btbytes, cnt * btbytes);
-        let siv = dsi.narrow(start * 4, cnt * 4);
+        let siv = dsi0.narrow(start * 4, cnt * 4);
         let posv = dpos.narrow(start * 4, cnt * 4);
         let outv = dout.narrow(start * qbytes, cnt * qbytes);
         t.paged_attn.run_tile_v9(
