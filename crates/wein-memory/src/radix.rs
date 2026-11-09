@@ -187,6 +187,39 @@ impl RadixCache {
         Self::append_chain(child, &tokens[bs..], rest, bs, clock);
     }
 
+    /// 快照链保护：按块 id 找到树上节点并 lock_ref+1 + pool.retain
+    /// （驱逐免疫）。找不到（已逐/从未插入）返回 false。计数语义与
+    /// match_prefix 一致：多次挂快照可叠加，unpin_block 对称回零。
+    pub fn pin_block(&mut self, pool: &mut BlockPool, block: u32) -> bool {
+        if let Some(node) = Self::find_block_mut(&mut self.root, block) {
+            node.lock_ref += 1;
+            pool.retain(block);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// pin_block 的解除。不在树上时静默返回（块可能已被整体逐出）。
+    pub fn unpin_block(&mut self, pool: &mut BlockPool, block: u32) {
+        if let Some(node) = Self::find_block_mut(&mut self.root, block) {
+            node.lock_ref = node.lock_ref.saturating_sub(1);
+            pool.release(block);
+        }
+    }
+
+    fn find_block_mut(node: &mut Node, block: u32) -> Option<&mut Node> {
+        if node.block == Some(block) {
+            return Some(node);
+        }
+        for c in node.children.values_mut() {
+            if let Some(hit) = Self::find_block_mut(c, block) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
     /// LRU 驱逐：摘 need 块（只摘未 pin 叶子；父节点保留）。被逐块 pool.release
     /// （进 deferred——调用方在准入路径显式 recycle）。返回实际驱逐数。
     pub fn evict(&mut self, pool: &mut BlockPool, need: usize) -> usize {

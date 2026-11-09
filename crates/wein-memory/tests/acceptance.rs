@@ -490,6 +490,43 @@ mod m11_radix {
         pool.recycle();
     }
 
+    /// m11c · 快照链保护（pin_block/unpin_block）：挂快照的块驱逐免疫，
+    /// 驱逐只能摘链尾到快照点为止——多会话互逐场景下匹配深度保得住。
+    #[test]
+    fn pin_block_shields_chain_tail() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool();
+        let blocks: Vec<_> = (0..4).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[1, 1, 1, 1, 2, 2, 3, 3], &blocks);
+        // 中段（第 2 块）挂快照：链尾逐层回落到快照点，前 2 块保住
+        assert!(cache.pin_block(&mut pool, blocks[1]));
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 2, "尾 2 块可逐（逐后父变叶）");
+        let m = cache.match_prefix(&mut pool, &[1, 1, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(m.tokens, 4, "快照点之前的链完整");
+        cache.unpin(&mut pool, &[1, 1, 1, 1, 2, 2, 3, 3], m.blocks.len());
+        // 解除后整链可逐
+        cache.unpin_block(&mut pool, blocks[1]);
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 2, "解保护后全可逐");
+    }
+
+    /// m11d · pin_block 找不到块（已逐/从未插入）返回 false 不 panic；
+    /// 重复 pin 累加计数，unpin 对称回零。
+    #[test]
+    fn pin_block_missing_and_refcount() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool();
+        let a: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[1, 1, 1, 1], &a);
+        assert!(!cache.pin_block(&mut pool, 999), "未知块 false");
+        assert!(cache.pin_block(&mut pool, a[0]));
+        assert!(cache.pin_block(&mut pool, a[0]));
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 1, "头块保护，尾块可逐");
+        cache.unpin_block(&mut pool, a[0]);
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 0, "计数 1 仍保护");
+        cache.unpin_block(&mut pool, a[0]);
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 1, "归零后可逐");
+    }
+
     /// m11b · evict_blocks：返回被逐块列表（快照槽挂块的联动钩子）——
     /// 数量与 evict 一致、id 唯一、被逐块确已不在树上。
     #[test]

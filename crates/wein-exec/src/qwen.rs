@@ -3039,6 +3039,7 @@ impl Qwen35Executor {
     fn release_slot(&mut self, slot: u32) {
         if let Some(b) = self.snap_owner.get_mut(slot as usize).and_then(|e| e.take()) {
             if self.snap_of_block.get(&b) == Some(&slot) {
+                self.radix.unpin_block(&mut self.pool, b);
                 self.snap_of_block.remove(&b);
             }
         }
@@ -4529,6 +4530,11 @@ impl Executor for Qwen35Executor {
     /// 的（在飞请求的命中块天然保留，BlockPool rc 保页到请求离场），快照槽
     /// 随块联动回收，页立即回池。返回清出的 KV 块数
     fn clear_prefix_cache(&mut self) -> usize {
+        // 快照链保护的块先解保护（否则 evict 摘不动它们，树清不干净）
+        let protected: Vec<u32> = self.snap_of_block.keys().copied().collect();
+        for b in protected {
+            self.radix.unpin_block(&mut self.pool, b);
+        }
         let freed = self.radix.evict_blocks(&mut self.pool, usize::MAX);
         for b in &freed {
             if let Some(s) = self.snap_of_block.remove(b) {
@@ -5128,9 +5134,22 @@ impl Executor for Qwen35Executor {
                 for &(b, slot) in &st.snaps {
                     match idx_of(b) {
                         Some(idx) if idx < full => {
+                            // 快照链保护：挂表的块驱逐免疫（LRU 只能摘链尾到
+                            // 快照点为止）——多会话互逐下匹配深度保得住
+                            // （W-Agent-4）。重准入继承的槽已在表 ⇒ 幂等跳过
+                            if !self.snap_of_block.contains_key(&b) {
+                                self.radix.pin_block(&mut self.pool, b);
+                            }
                             self.snap_of_block.insert(b, slot);
                         }
-                        _ => self.snap_free.push(slot),
+                        _ => {
+                            // 还池的槽若仍挂表（重准入继承后块未进树）：解保护
+                            if self.snap_of_block.get(&b) == Some(&slot) {
+                                self.radix.unpin_block(&mut self.pool, b);
+                                self.snap_of_block.remove(&b);
+                            }
+                            self.snap_free.push(slot);
+                        }
                     }
                 }
                 // 页记账：命中共享块 unpin（请求份释放）；已移交私有块保留
