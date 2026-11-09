@@ -57,6 +57,7 @@ fn case(tokens: usize, pos0: usize, q_heads: usize, kv_heads: usize, hd: usize, 
 /// Br 只改"一块覆盖几个 q token"⇒ KV 前缀的块内重读次数 ∝ 1/Br。
 const TIERS: &[(&str, usize, usize, usize)] = &[
     ("r4 br4 (默认)", 4, 4, 4),
+    ("n4r2 br4 (decode 现默认)", 4, 2, 4),
     ("r4 br1", 4, 4, 1),
     ("r4 br2", 4, 4, 2),
     ("r4 br8", 4, 4, 8),

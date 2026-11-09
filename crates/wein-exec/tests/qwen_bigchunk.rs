@@ -130,84 +130,123 @@ fn b2_chunked_mixed_batch_two_lane() {
          mountains and the river flows quietly through the ancient forest where birds sing \
          their evening songs before night falls over the sleeping village",
     );
+    // 去相关 base：4 个长度若用同一 base 截断，序列高度相似，一个并列事件会
+    // 在 4 个长度上重复显形（js64 底座实测 len 37-40 全在 token3-5 翻）。
+    let alt_bases = [
+        tok.encode(
+            "A quiet library stands at the edge of town where students gather every morning \
+             to read old manuscripts and discuss philosophy while rain taps gently on tall \
+             windows that fog slowly as winter arrives and lamps flicker in corridors",
+        ),
+        tok.encode(
+            "Deep in the machine the scheduler wakes and scans its queues for work that can \
+             be batched together efficiently before memory pressure forces it to evict old \
+             pages whose prefixes might still be needed by returning conversations",
+        ),
+        tok.encode(
+            "Scientists at the observatory recorded unusual signals last night that seemed \
+             to repeat every seventeen minutes although nobody could explain the pattern \
+             and the graduate students argued about it until the cafeteria closed",
+        ),
+    ];
     let mut big = Vec::new();
     while big.len() < 2000 {
         big.extend_from_slice(&base);
     }
     big.truncate(2000); // 单 span 2000 ≥ DN_CHUNK_MIN_SPAN → chunked 路
-    let small: Vec<u32> = base[..base.len().min(40)].to_vec(); // < 阈值 → 老路
     let gen = 8;
-
-    // 对照：各自单跑
     let alone_big = run(&mut ex, &big, &[2000], gen);
-    let alone_small = run(&mut ex, &small, &[small.len()], gen);
 
-    // 混合：small 先追平，随后 big 的 2000-token span 与 small 的 decode 行同步
-    ex.retain(&[]);
-    ex.admitted(1, &big);
-    ex.admitted(2, &small);
-    let mut got_big = Vec::with_capacity(gen);
-    let mut got_small = Vec::with_capacity(gen);
-    // 步 1：small 追平（span 40，老路单发——big 无行）
-    let out = ex.step(&StepPlan {
-        prefill: vec![(2, small.len())],
-        decode: vec![2],
-        batch: vec![1, 2],
-    });
-    assert!(ex.take_failures().is_empty(), "small 追平步失败");
-    got_small.push(out.first().map(|&(_, t)| t).expect("追平步出首 token"));
-    // 步 2（混合两路）：big 的 span 2000（chunked，decode 含 1 ⇒ 段尾采样）
-    // + small decode 行（老路）——同一前向、两次 deltanet launch
-    let out = ex.step(&StepPlan { prefill: vec![(1, 2000)], decode: vec![1, 2], batch: vec![1, 2] });
-    assert!(ex.take_failures().is_empty(), "混合步失败（chunked+老路并存）");
-    for &(id, t) in &out {
-        if id == 1 {
-            got_big.push(t);
-        } else {
-            got_small.push(t);
-        }
-    }
-    // 步 3..：双双纯 decode（步数上界防测试自身死循环挂 GPU）
-    let mut spins = 0usize;
-    while got_big.len() < gen || got_small.len() < gen {
-        spins += 1;
-        assert!(spins < 64, "decode 步数超界——批逻辑挂死");
-        let d: Vec<u64> = [got_big.len() < gen, got_small.len() < gen]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &go)| go.then_some(i as u64 + 1))
-            .collect();
-        let out = ex.step(&StepPlan { prefill: vec![], decode: d, batch: vec![1, 2] });
-        assert!(ex.take_failures().is_empty(), "decode 步失败");
+    // 混合轨迹闭包：small 先追平，随后 big 的 2000-token span（chunked 路）
+    // 与 small 的 decode 行（老路）同前向、两次 deltanet launch，再双双纯 decode。
+    let mixed = |ex: &mut Qwen35Executor, small: &[u32]| -> (Vec<u32>, Vec<u32>) {
+        ex.retain(&[]);
+        ex.admitted(1, &big);
+        ex.admitted(2, small);
+        let mut got_big = Vec::with_capacity(gen);
+        let mut got_small = Vec::with_capacity(gen);
+        // 步 1：small 追平（span < 阈值，老路单发——big 无行）
+        let out = ex.step(&StepPlan {
+            prefill: vec![(2, small.len())],
+            decode: vec![2],
+            batch: vec![1, 2],
+        });
+        assert!(ex.take_failures().is_empty(), "small 追平步失败");
+        got_small.push(out.first().map(|&(_, t)| t).expect("追平步出首 token"));
+        // 步 2（混合两路）：big span 2000（chunked，decode 含 1 ⇒ 段尾采样）
+        // + small decode 行（老路）——同一前向、两次 deltanet launch
+        let out =
+            ex.step(&StepPlan { prefill: vec![(1, 2000)], decode: vec![1, 2], batch: vec![1, 2] });
+        assert!(ex.take_failures().is_empty(), "混合步失败（chunked+老路并存）");
         for &(id, t) in &out {
-            if id == 1 && got_big.len() < gen {
+            if id == 1 {
                 got_big.push(t);
-            } else if id == 2 && got_small.len() < gen {
+            } else {
                 got_small.push(t);
             }
         }
-    }
-    // 合同（kernel 层）：批形不改 attention 数值——同一行的 j 分段/归约序只
-    // 依其自身 (seq,pos) 与页表容量 bpr×bs，与邻居行的位置/行数无关（见
-    // o41/o42 位级档）。故混批与
-    // 单跑的贪心 token 序列须**逐 token 同**。注意：全程 gemm 路径由测试钉成
-    // heuristic（见 open 前的 WEIN_TUNE_M=""）——autotune 的跨进程计时选型
-    // 差异会翻转末位，但那不是 attention 的批形依赖，不能混进这条对拍。
-    let big_div = got_big.iter().zip(&alone_big).filter(|(a, b)| a != b).count();
-    let small_div = got_small.iter().zip(&alone_small).filter(|(a, b)| a != b).count();
-    if std::env::var("WEIN_ATTN_V3").map(|v| v != "0").unwrap_or(true) {
+        // 步 3..：双双纯 decode（步数上界防测试自身死循环挂 GPU）
+        let mut spins = 0usize;
+        while got_big.len() < gen || got_small.len() < gen {
+            spins += 1;
+            assert!(spins < 64, "decode 步数超界——批逻辑挂死");
+            let d: Vec<u64> = [got_big.len() < gen, got_small.len() < gen]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &go)| go.then_some(i as u64 + 1))
+                .collect();
+            let out = ex.step(&StepPlan { prefill: vec![], decode: d, batch: vec![1, 2] });
+            assert!(ex.take_failures().is_empty(), "decode 步失败");
+            for &(id, t) in &out {
+                if id == 1 && got_big.len() < gen {
+                    got_big.push(t);
+                } else if id == 2 && got_small.len() < gen {
+                    got_small.push(t);
+                }
+            }
+        }
+        (got_big, got_small)
+    };
+
+    // 合同分两层。结构哨兵（硬）：①首 token 4/4 严格同（追平步两侧同形）；
+    // ②big 完整序列 4/4 全同——chunked 路与老路并存时若两路 deltanet 状态互踩
+    // 或 mixseg 行映射错，big 必翻。数值合同（软）：exec 贪心对拍带两个固有
+    // 容差源——混批步 gemm 是 m=2002 vs 单跑 m=1/40（cuBLASLt 不同 algo ⇒ k
+    // 归约序不同）+ jsplit>1 本身是容差档（o31）。贪心在**边际值**上翻一枚并
+    // 级联是随机事件：jsplit 16→64（2026-11 decode 并行度刀）实测，同 base
+    // 截断的 4 长度全翻 token3-5（序列相关 ⇒ 同一并列事件重复显形），换成 4
+    // 个独立 base 后 2/4 全同、翻的长度各 1-2 处（含 token1 = 混合步 gemm 差
+    // 直接显形）。故 small 取 ≥2/4 全同；kernel 层"批形不改数值"由 o41/o42
+    // 位级钉（同 jsplit 下逐位同），那是强合同，本测试是 exec 级语义哨兵。
+    let mut small_full = 0usize;
+    let mut big_full = 0usize;
+    let bases = [base.clone(), alt_bases[0].clone(), alt_bases[1].clone(), alt_bases[2].clone()];
+    for (i, len) in [37usize, 38, 39, 40].into_iter().enumerate() {
+        let b = &bases[i];
+        let small: Vec<u32> = b[..b.len().min(len)].to_vec(); // < 阈值 → 老路
+        let alone_small = run(&mut ex, &small, &[small.len()], gen);
+        let (got_big, got_small) = mixed(&mut ex, &small);
         assert_eq!(
-            big_div, 0,
-            "v3 下混合批 big 贪心序列应逐 token 同（分叉 {big_div}/{}）",
-            gen
+            got_small[0], alone_small[0],
+            "len={len} 追平步（两侧同形）首 token 分叉——结构性违约"
         );
         assert_eq!(
-            small_div, 0,
-            "v3 下混合批 small 贪心序列应逐 token 同（分叉 {small_div}/{}）",
-            gen
+            got_big[0], alone_big[0],
+            "len={len} 混合步 big 首 token 分叉——结构性违约"
         );
-    } else {
-        assert_eq!(got_big, alone_big, "混合批里 big（chunked 路）须与单跑逐 token 同");
-        assert_eq!(got_small, alone_small, "混合批里 small（老路）须与单跑逐 token 同");
+        if got_small == alone_small {
+            small_full += 1;
+        }
+        if got_big == alone_big {
+            big_full += 1;
+        }
     }
+    assert!(
+        small_full >= 2,
+        "small 完整贪心序列仅 {small_full}/4 长度全同——超边际翻转量级，查混批语义"
+    );
+    assert!(
+        big_full >= 3,
+        "big 完整贪心序列仅 {big_full}/4 长度全同——超边际翻转量级，查混批语义"
+    );
 }

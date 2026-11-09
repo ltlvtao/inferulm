@@ -824,10 +824,12 @@ fn o30_paged_attn_tile_bitwise() {
     let Some(gpu) = gpu() else { return };
     let t = table(&gpu);
     let cases = [
-        (16usize, 4usize, 256usize, 64usize, 300usize),
-        (16, 4, 256, 64, 1000),
-        (32, 16, 128, 32, 1000),
-        (32, 16, 128, 32, 4000),
+        // 2026-11 jsplit 上限 16→64/目标块 128→512 后，t=64 形（rows=1024）
+        // 落容差分片档（o31 覆盖）；位级钉改用 rows>ATTN_TILE_PART_ROWS 的形
+        (16usize, 4usize, 256usize, 128usize, 300usize),
+        (16, 4, 256, 128, 1000),
+        (32, 16, 128, 64, 1000),
+        (32, 16, 128, 64, 4000),
     ];
     for (qh, kvh, hd, tokens, pos) in cases {
         let (expect, old, tile, _online, (ntok, nv, rows, bdim, ntile, jsplit)) =
@@ -855,6 +857,8 @@ fn o31_paged_attn_tile_split_tolerance() {
     let cases = [
         (16usize, 4usize, 256usize, 1usize, 3071usize),
         (16, 4, 256, 2, 1000),
+        // t=64：ntile>1 × jsplit>1 的组合档（2026-11 上限抬到 64 后新增形态）
+        (16, 4, 256, 64, 300),
         (32, 16, 128, 1, 4095),
         (32, 16, 128, 1, 8191),
     ];

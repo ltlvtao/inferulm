@@ -194,6 +194,10 @@ fn run_turn(ex: &mut Qwen35Executor, id: u64, prompt: &[u32], gen: usize, chunk:
             None => break,
         }
     }
+    // decode 段表（长上下文 decode 账定位：attn/delta/gemm 在 6k ctx 的单价）
+    let rep_d = ex.step_profile_report().unwrap_or_default();
+    println!("\n===== 请求 {id}：decode 段表（{} 步 @ ctx {}）=====", gen_ms.len(), prompt.len());
+    println!("{rep_d}");
     println!("\n===== 请求 {id}：n={} chunk={chunk} 命中 {hit}｜TTFT {:.1} ms（prefill {prefill_steps} 步）=====",
         prompt.len(), ttft);
     println!("{rep}");

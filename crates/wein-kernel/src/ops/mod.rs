@@ -1804,13 +1804,13 @@ const ATTN_TILE_SLOTS: usize = 2048
 /// 槽位表定尺 = ntok(BR) 上限 × chunk 上限（与 kernel 侧 `SLOT_TAB` 同值）
 const ATTN_TILE_SLOT_TAB: usize = 32 * 512;
 /// j 分片数上限（decode 形：批小、块不够用时按 j 切片换并行度）
-pub const ATTN_TILE_SPLIT_CAP: usize = 16;
+pub const ATTN_TILE_SPLIT_CAP: usize = 64;
 /// 分片档的 q 行容量（jsplit>1 只在小批发生：rows = tokens×q_heads ≤ 1024）
 const ATTN_TILE_PART_ROWS: usize = 1024;
 /// 分片档 head_dim 容量（偏结果表按它定尺）
 const ATTN_TILE_HD_CAP: usize = 256;
 /// 分块档最小并行目标：块数低于它就往上加 j 分片
-const ATTN_TILE_TARGET_BLOCKS: usize = 128;
+const ATTN_TILE_TARGET_BLOCKS: usize = 512;
 /// 分块档线程上限的**兜底**值：真正的夹子是寄存器账（`attn_bdim_cap` =
 /// 65536/regs 向下取 32 的整）。512 = tile(96 regs)/tile_f32(102 regs) 的
 /// 65536/regs 都不足 640（向上取到 1024 线程会撞 "too many resources"）。

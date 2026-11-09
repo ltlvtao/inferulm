@@ -75,7 +75,9 @@ def stream_once(conn_kw, model, prompt, max_tokens):
         if d.get("usage"):
             usage = d["usage"]
         for ch in d.get("choices") or []:
-            piece = (ch.get("delta") or {}).get("content") or ""
+            d0 = ch.get("delta") or {}
+            # reasoning 模型前段走 reasoning_content（同为逐 token 到达，ITL 口径一致）
+            piece = d0.get("content") or d0.get("reasoning_content") or ""
             # 每个 SSE 块一个 token（vLLM 默认）；非空文本才计到达时间
             if piece:
                 stamps.append(time.perf_counter() - t0)
