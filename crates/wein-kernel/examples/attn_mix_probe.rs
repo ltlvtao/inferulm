@@ -53,23 +53,23 @@ fn main() {
     let mut si = vec![0u32; rows];
     let mut pos = vec![0u32; rows];
     let mut bt = vec![0u32; rows * bpr];
-    for i in 0..n0 {
-        si[i] = 0;
+    for i in 0..n1 {
+        si[i] = 1;
         pos[i] = i as u32;
     }
-    for i in 0..n1 {
-        si[n0 + i] = 1;
-        pos[n0 + i] = i as u32;
+    for i in 0..n0 {
+        si[n1 + i] = 0;
+        pos[n1 + i] = i as u32;
     }
     for r in 0..rows {
         let row_bt = &mut bt[r * bpr..(r + 1) * bpr];
-        if r < n0 {
+        if r >= n1 {
             for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
-                *e = j as u32; // 页 0..bpr
+                *e = (bpr - 1 - j) as u32; // 倒序页表（spanA 也改）
             }
         } else {
             for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
-                *e = 128 + j as u32; // 页 128..（pos<=447 用前 28 页）
+                *e = (bpr - 1 - j) as u32; // 倒序页表：blk j → 页 bpr-1-j
             }
         }
     }
@@ -98,7 +98,7 @@ fn main() {
 
     // ② 分两次 v9（单 span 各一次）
     dout.zero_on(&stream);
-    for (start, cnt) in [(0usize, n0), (n0, n1)] {
+    for (start, cnt) in [(0usize, n1), (n1, n0)] {
         let qv = dq.narrow(start * qbytes, cnt * qbytes);
         let btv = dbt.narrow(start * btbytes, cnt * btbytes);
         let siv = dsi.narrow(start * 4, cnt * 4);
@@ -136,9 +136,9 @@ fn main() {
     // 分组比较：spanA 行（前 n0）与 spanB 行 —— 若 v9 只吃批级单一 block_table，
     // spanA（bt 前 bpr 项）应正确、spanB 应错
     let per = qh * hd;
-    let (ra_all, pa_all) = rel2(&a_all[..n0 * per], &rf[..n0 * per]);
-    let (rb_all, pb_all) = rel2(&a_all[n0 * per..], &rf[n0 * per..]);
-    println!("  分组：spanA rel2={ra_all:.3e} 峰值={pa_all:.3e}｜spanB rel2={rb_all:.3e} 峰值={pb_all:.3e}");
+    let (rb_all, pb_all) = rel2(&a_all[..n1 * per], &rf[..n1 * per]);
+    let (ra_all, pa_all) = rel2(&a_all[n1 * per..], &rf[n1 * per..]);
+    println!("  分组（spanB 在前）：spanB rel2={rb_all:.3e} 峰值={pb_all:.3e}｜spanA rel2={ra_all:.3e} 峰值={pa_all:.3e}");
     let (r_all, p_all) = rel2(&a_all, &rf);
     let (r_split, p_split) = rel2(&a_split, &rf);
     let (r_on, p_on) = rel2(&a_on, &rf);
