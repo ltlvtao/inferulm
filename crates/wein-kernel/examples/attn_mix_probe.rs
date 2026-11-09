@@ -35,54 +35,6 @@ fn rel2(a: &[f32], b: &[f32]) -> (f64, f64) {
     (if den > 0.0 { (num / den).sqrt() } else { 0.0 }, mx)
 }
 
-/// 参考实现：每行独立（seq/pos 按行），f32 累加，j ≤ pos 因果
-#[allow(clippy::too_many_arguments)]
-fn reference(
-    q: &[u16], k_pool: &[u16], v_pool: &[u16],
-    seq_rows: &[(usize, usize, usize)], // (seq, pos, bpr 起始下标)
-    bt: &[u32], bpr: usize, bs: usize,
-    qh: usize, kvh: usize, hd: usize, q_scale: f32,
-) -> Vec<f32> {
-    let group = qh / kvh;
-    let he = kvh * hd;
-    let mut out = vec![0f32; seq_rows.len() * qh * hd];
-    for (r, &(seq, pos, _)) in seq_rows.iter().enumerate() {
-        let row_bt = &bt[r * bpr..(r + 1) * bpr];
-        for h in 0..qh {
-            let kv_h = h / group;
-            let qv: Vec<f32> = (0..hd).map(|d| bf16_to_f32(q[(r * qh + h) * hd + d])).collect();
-            let mut acc = vec![0f32; hd];
-            let mut mx = f32::NEG_INFINITY;
-            let mut ps: Vec<f32> = Vec::with_capacity(pos + 1);
-            let mut kvals: Vec<Vec<f32>> = Vec::with_capacity(pos + 1);
-            for j in 0..=pos {
-                let (pg, off) = (row_bt[j / bs] as usize, j % bs);
-                let base = (pg * bs + off) * he + kv_h * hd;
-                let kv: Vec<f32> = (0..hd).map(|d| bf16_to_f32(k_pool[base + d])).collect();
-                let s: f32 = qv.iter().zip(kv.iter()).map(|(a, b)| a * b).sum::<f32>() * q_scale
-                    + if seq == 0 { 0.0 } else { 0.0 };
-                mx = mx.max(s);
-                ps.push(s);
-                kvals.push(kv);
-            }
-            let mut den = 0f32;
-            for (j, s) in ps.iter().enumerate() {
-                let e = (s - mx).exp();
-                den += e;
-                let (pg, off) = (row_bt[j / bs] as usize, j % bs);
-                let base = (pg * bs + off) * he + kv_h * hd;
-                for d in 0..hd {
-                    acc[d] += e * bf16_to_f32(v_pool[base + d]);
-                }
-            }
-            for d in 0..hd {
-                out[(r * qh + h) * hd + d] = acc[d] / den;
-            }
-        }
-    }
-    out
-}
-
 fn main() {
     let gpu = Gpu::probe().expect("须有 CUDA 设备");
     let profile = wein_platform::HardwareProfile::with_device(wein_platform::Device::Cuda)
@@ -92,9 +44,9 @@ fn main() {
     let (bs, qh, kvh, hd) = (16usize, 16usize, 4usize, 256usize);
     let he = kvh * hd;
     let q_scale = 1.0 / (hd as f32).sqrt();
-    let (n0, n1) = (128usize, 64usize); // span A / span B
+    let (n0, n1) = (512usize, 448usize); // span A / span B（对齐 o40 的 512 档）
     let rows = n0 + n1;
-    let bpr = 64usize; // 页表容量（> n0/bs）
+    let bpr = 32usize; // 页表容量 = ceil(最长 span / bs)（对齐 o40 的 512/16）
     let npages = 256usize;
 
     // 行表：前 n0 行 = seq0 pos 0..n0-1，后 n1 行 = seq1 pos 0..n1-1
@@ -117,7 +69,7 @@ fn main() {
             }
         } else {
             for (j, e) in row_bt.iter_mut().enumerate().take(bpr) {
-                *e = 128 + j as u32; // 页 128..
+                *e = 128 + j as u32; // 页 128..（pos<=447 用前 28 页）
             }
         }
     }
@@ -170,16 +122,23 @@ fn main() {
     stream.sync();
     let out_online: Vec<u16> = dout.read_to_vec::<u16>();
 
-    // ④ reference
-    let seq_rows: Vec<(usize, usize, usize)> =
-        (0..rows).map(|r| (si[r] as usize, pos[r] as usize, r)).collect();
-    let rf = reference(&q, &k_pool, &v_pool, &seq_rows, &bt, bpr, bs, qh, kvh, hd, q_scale);
+    // ④ 仓库 reference（`wein_kernel::reference::paged_attn`，支持多 seq ⇒ 多 span）
+    let rf16 = wein_kernel::reference::paged_attn(
+        &q, &k_pool, &v_pool, &bt, &si, &pos, q_scale, bpr, bs, qh, kvh, hd,
+    );
+    let rf: Vec<f32> = rf16.iter().map(|&x| bf16_to_f32(x)).collect();
 
     let to_f32 = |v: &[u16]| -> Vec<f32> { v.iter().map(|&x| bf16_to_f32(x)).collect() };
     let a_all = to_f32(&out_all);
     let a_split = to_f32(&out_split);
     let a_on = to_f32(&out_online);
 
+    // 分组比较：spanA 行（前 n0）与 spanB 行 —— 若 v9 只吃批级单一 block_table，
+    // spanA（bt 前 bpr 项）应正确、spanB 应错
+    let per = qh * hd;
+    let (ra_all, pa_all) = rel2(&a_all[..n0 * per], &rf[..n0 * per]);
+    let (rb_all, pb_all) = rel2(&a_all[n0 * per..], &rf[n0 * per..]);
+    println!("  分组：spanA rel2={ra_all:.3e} 峰值={pa_all:.3e}｜spanB rel2={rb_all:.3e} 峰值={pb_all:.3e}");
     let (r_all, p_all) = rel2(&a_all, &rf);
     let (r_split, p_split) = rel2(&a_split, &rf);
     let (r_on, p_on) = rel2(&a_on, &rf);
