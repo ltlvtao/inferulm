@@ -527,6 +527,33 @@ mod m11_radix {
         assert_eq!(cache.evict(&mut pool, usize::MAX), 1, "归零后可逐");
     }
 
+    /// m11e · lock_block：DRAM 挂载段按块 id 持"活请求份"（lock_ref）——
+    /// 挂载块在请求在飞期间驱逐不可及（否则 bt_host 里的页会被复用，
+    /// 活请求读到别人的 KV，retain 的 coverage 合同随之炸裂）。退还走
+    /// `unpin`（沿 token 路径，与 match_prefix 的加锁对称）。
+    #[test]
+    fn lock_block_shields_mounted_blocks() {
+        let mut cache = RadixCache::new();
+        let mut pool = bs2_pool();
+        let blocks: Vec<_> = (0..3).map(|_| pool.alloc().unwrap()).collect();
+        cache.insert(&[1, 1, 1, 1, 2, 2, 3, 3], &blocks);
+
+        for &b in &blocks {
+            assert!(cache.lock_block(&mut pool, b), "在树块加锁成功");
+        }
+        for &b in &blocks {
+            assert_eq!(pool.rc_of(b), 2, "树份 + 活请求份");
+        }
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 0, "全锁：一块也逐不动");
+        assert!(!cache.lock_block(&mut pool, 999), "未知块 false");
+
+        cache.unpin(&mut pool, &[1, 1, 1, 1, 2, 2, 3, 3], 3);
+        for &b in &blocks {
+            assert_eq!(pool.rc_of(b), 1, "退还活请求份，树份保留");
+        }
+        assert_eq!(cache.evict(&mut pool, usize::MAX), 3, "退还后整链可逐");
+    }
+
     /// m11b · evict_blocks：返回被逐块列表（快照槽挂块的联动钩子）——
     /// 数量与 evict 一致、id 唯一、被逐块确已不在树上。
     #[test]

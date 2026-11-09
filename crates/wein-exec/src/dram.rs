@@ -169,6 +169,17 @@ impl<'g> DramTier<'g> {
     pub fn has_block(&self, hash: u64) -> bool {
         self.blk_map.contains_key(&hash)
     }
+    /// (块副本数, 状态副本数)：诊断用
+    pub fn stats(&self) -> (usize, usize) {
+        (self.blk_map.len(), self.st_map.len())
+    }
+    /// 诊断：状态层现有恢复点 `(覆盖 token 数, tick)`，按深度降序——
+    /// "为什么接力不触发"要能与请求侧 `tree_len` 直接对表
+    pub fn state_points(&self) -> Vec<(usize, u64)> {
+        let mut v: Vec<(usize, u64)> = self.st_map.values().map(|e| (e.n_tokens, e.tick)).collect();
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        v
+    }
     pub fn has_state(&self, hash: u64) -> bool {
         self.st_map.contains_key(&hash)
     }

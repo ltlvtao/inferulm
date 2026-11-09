@@ -307,7 +307,14 @@ impl GraphExec<'_> {
 
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
-        self.drv.graph_exec_destroy(self.handle).expect("cuGraphExecDestroy");
+        if let Err(e) = self.drv.graph_exec_destroy(self.handle) {
+            // 进程退出序：Driver 上下文先拆 ⇒ destroy 拿到 DEINITIALIZED，
+            // 句柄已随上下文一起消失。这里再 panic 只会把正常退出变成噪声
+            // （tokio worker 上 panic 还会在日志里冒充"引擎崩溃"）。debug
+            // 构建仍然炸——真泄漏要在测试里看见。
+            debug_assert!(false, "cuGraphExecDestroy: {e:?}");
+            eprintln!("[cuda] cuGraphExecDestroy 失败（上下文已拆？）：{e:?}");
+        }
     }
 }
 

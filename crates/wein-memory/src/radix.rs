@@ -196,6 +196,21 @@ impl RadixCache {
         Self::append_chain(child, &tokens[bs..], rest, bs, clock);
     }
 
+    /// 活请求份加锁（按块 id）：`lock_ref+1 + pool.retain`。用于 DRAM 挂载
+    /// 段——那些块在准入时就被 insert 进树（树份已转移），但请求在飞期间
+    /// 仍要读它们，必须与 `match_prefix` 的命中链同款保护；否则池压一上来
+    /// LRU 就把它们逐出并复用，`bt_host` 指向别人的 KV（retain 的 coverage
+    /// 合同随之炸裂）。退还走 [`Self::unpin`]（沿 token 路径，对称）。
+    pub fn lock_block(&mut self, pool: &mut BlockPool, block: u32) -> bool {
+        if let Some(node) = Self::find_block_mut(&mut self.root, block) {
+            node.lock_ref += 1;
+            pool.retain(block);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 快照链保护：按块 id 找到树上节点并 hold+1 + pool.retain（驱逐
     /// 免疫）。找不到（已逐/从未插入）返回 false。计数语义与 match_prefix
     /// 的 lock_ref **分账**：hold 属于挂表保护（可 force_unhold 强解），

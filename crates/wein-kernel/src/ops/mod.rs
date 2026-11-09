@@ -434,8 +434,12 @@ const DN_CHUNK_BT_MAX: usize = 128;
 const DN_CHUNK_VHEADS_CAP: usize = 32;
 /// kd=vd=128（chunked 只支持 E2 形状；host 侧 assert）
 const DN_CHUNK_DIM: usize = 128;
-/// 行容量（fwd_h 的块私有 scratch2：rows × vh × vsplit 块）
-const DN_CHUNK_ROWS_CAP: usize = 4;
+/// 行容量（fwd_h 的块私有 scratch2：rows × vh × vsplit 块）。
+/// **等于同时可走 chunked 的 span 数上限**：超出的 span 回落老路（每 token
+/// 3.7× 慢）。Agent 场景 c=8 prefill 同批 8 span ⇒ 4 只剩一半加速（实测聚
+/// 合 prefill 7.5k tok/s，单请求 11.9k），抬到 16 覆盖 c≤16 的批。
+/// 代价 = scratch2 每行 3.1MB（16 行 50MB，t_max=8192 档）。
+const DN_CHUNK_ROWS_CAP: usize = 16;
 /// vsplit 上限（fwd_h 的 v 行切分——补块级并行度，链长 chunk 数不变）
 const DN_CHUNK_VSPLIT_MAX: usize = 8;
 /// fwd_h ① 两相部分和区（f32/块；2 任务 × 16 输出 × 32 lane × 8 warp——须与

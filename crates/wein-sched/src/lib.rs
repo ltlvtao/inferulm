@@ -68,9 +68,14 @@ impl Default for SchedConfig {
             max_running: 256,
             chunk_size: 256,
             max_batch_tokens: 65536,
-            // T≈192 的混合步 ≈ 纯 decode 步的 1.4×（qwen_mixed_probe 曲线），
-            // p99 与 TTFT 的平衡点——battery 仲裁
-            mix_cap: 192,
+            // Agent 场景（多会话 × 多轮）里批内几乎总有 decode 行，旧值 192
+            // 让每轮新增的 ~190-token prefill span 被拆成 8+ 步微 chunk：
+            // c=8 实测（2026-11-09，ctx32768/4096 页/graph，三发中位）192→4096
+            // ⇒ turns/s 0.56→1.47、ITL 51→18ms、热 TTFT 5145→385ms、命中
+            // 14%→36%（步数 1488→986，chunked deltanet 整段吃满）。满负荷
+            // battery 见 agent-mix-cap-20261109：ITL p99 不劣（稳态无 prefill，
+            // 大 cap 只作用在爬坡，反而少付碎片段 launch）
+            mix_cap: 4096,
             snap_align: 1,
         }
     }
