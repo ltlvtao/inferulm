@@ -10,6 +10,7 @@
 //! M0 边界：贪心采样在 host（采样位置的开放问题 02 §13，倾向 exec 图尾）；
 //! 图捕获 NONE 档起步（W2）。
 pub mod ctx;
+pub mod dram;
 pub mod device;
 pub mod qwen;
 pub mod qwen_ref;

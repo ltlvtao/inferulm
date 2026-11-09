@@ -418,21 +418,53 @@ impl HostPinned<'_> {
     pub fn as_slice(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
     }
+    /// 异步 D2H：设备区间 → 本缓冲 `host_off` 偏移段（流上排队）
+    pub fn download_seg_on(
+        &self,
+        host_off: usize,
+        src: &DevBuf,
+        src_start: usize,
+        len: usize,
+        stream: &Stream,
+    ) {
+        assert!(src_start + len <= src.bytes, "download 源区间越界");
+        assert!(host_off + len <= self.bytes, "download 目标区间越界");
+        self.drv
+            .memcpy_dtoh_async_pinned(
+                unsafe { self.ptr.add(host_off) },
+                src.ptr + src_start as u64,
+                len,
+                stream.handle,
+            )
+            .expect("cuMemcpyDtoHAsync(pinned)");
+    }
+    /// 异步 H2D：本缓冲 `host_off` 偏移段 → 设备区间（流上排队）
+    pub fn upload_seg_on(
+        &self,
+        host_off: usize,
+        dst: &DevBuf,
+        dst_start: usize,
+        len: usize,
+        stream: &Stream,
+    ) {
+        assert!(dst_start + len <= dst.bytes, "upload 目标区间越界");
+        assert!(host_off + len <= self.bytes, "upload 源区间越界");
+        self.drv
+            .memcpy_htod_async(
+                dst.ptr + dst_start as u64,
+                unsafe { self.ptr.add(host_off) }.cast::<core::ffi::c_void>(),
+                len,
+                stream.handle,
+            )
+            .expect("cuMemcpyHtoDAsync(pinned)");
+    }
     /// 异步 D2H：设备区间 → 本缓冲开头（流上排队）
     pub fn download_on(&self, src: &DevBuf, src_start: usize, len: usize, stream: &Stream) {
-        assert!(src_start + len <= src.bytes, "download_on 源区间越界");
-        assert!(len <= self.bytes, "download_on 目标容量不足");
-        self.drv
-            .memcpy_dtoh_async_pinned(self.ptr, src.ptr + src_start as u64, len, stream.handle)
-            .expect("cuMemcpyDtoHAsync(pinned)");
+        self.download_seg_on(0, src, src_start, len, stream)
     }
     /// 异步 H2D：本缓冲 → 设备区间（流上排队）
     pub fn upload_to_on(&self, dst: &DevBuf, dst_start: usize, len: usize, stream: &Stream) {
-        assert!(dst_start + len <= dst.bytes, "upload_to_on 目标区间越界");
-        assert!(len <= self.bytes, "upload_to_on 源容量不足");
-        self.drv
-            .memcpy_htod_async(dst.ptr + dst_start as u64, self.ptr.cast(), len, stream.handle)
-            .expect("cuMemcpyHtoDAsync(pinned)");
+        self.upload_seg_on(0, dst, dst_start, len, stream)
     }
 }
 

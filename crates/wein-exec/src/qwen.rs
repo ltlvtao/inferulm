@@ -44,6 +44,8 @@ use wein_kernel::ops::{
     RmsNormZcOp, RopePtOp, SampleRowsOp, SigmulOp, SiluMulOp, SiluOp, ZeroRowsOp,
 };
 use wein_kernel::reference;
+use crate::dram::{block_hash, DramTier};
+use crate::dram;
 use wein_memory::pool::BlockPool;
 use wein_memory::radix::RadixCache;
 use wein_model::{LayerType, Qwen35Config, WeightStore};
@@ -223,6 +225,12 @@ fn attn_v3_from_env(var: &str) -> wein_kernel::ops::V3Cfg {
 /// **不能取大**：agent 单轮 prompt 才 ~1800 token（112 块），界取 128 会让
 /// "深层每请求一张"形同虚设（16 会话 × 6 轮全算浅层，槽必然耗尽）
 const SNAP_SHALLOW_BLKS: usize = 48;
+// 粗栅格锚间距（块）：同相位让位时，落在粗栅格上的锚（2048 token 一
+// 档）不让位。实测 agent 多轮的分叉点恒在上一轮 prompt 末块——模板
+// 生成位注入 `<think>`(248068) 而历史位渲染 `<tool_call>`(248058)，
+// 单 token 差把"只留最新"的尾锚（恰好贴着分叉点）变成永远够不着，
+// 命中塌回浅层 26 块。粗栅格锚保证回退深度 ≥ 分叉块往回一档
+const SNAP_KEEP_GRID: usize = 128;
 
 /// 槽数随 `ctx::snap_slots()`（WEIN_SNAP_SLOTS / --snap-slots）——长上下文
 /// /多会话下槽压升高，池大时该抬（0 = 关快照池）
@@ -978,6 +986,18 @@ pub struct Qwen35Executor {
     snap_free: Vec<u32>,
     /// 块 → 槽（快照挂块：命中截断到有槽祖先；驱逐联动回收）
     snap_of_block: HashMap<u32, u32>,
+    /// 单层单片 KV 段字节（块×kv头×hd×esz；DRAM 分层搬运粒度）
+    kv_seg: usize,
+    /// DRAM 分层池（WEIN_DRAM=1 开）：驱逐块/快照下沉 pinned host，
+    /// admit 按块哈希接力搬回（W-Agent-5）
+    dram: Option<dram::DramTier<'static>>,
+    /// 活块 → 块哈希（内容寻址身份；换出/换入两侧共用，驱逐时清）
+    blk_hash: HashMap<u32, u64>,
+    /// 槽挂表时钟（强制逐槽的 LRU 依据：链保护下 evict 摘不动 pinned
+    /// 块，槽竞争须按最老槽下沉-解 pin-再逐）
+    snap_mark: Vec<u64>,
+    /// 上述时钟的 tick 源
+    clock: u64,
     /// 前缀缓存总开关（WEIN_RADIX=0 关——A/B 对比用）
     radix_on: bool,
     /// 命中/移交诊断打印（WEIN_RADIX_DEBUG=1）
@@ -1665,6 +1685,26 @@ impl Qwen35Executor {
             .unwrap_or((4 * ctx::block() as usize).max(ctx::snap_stride()));
         let snap_grid_dec = dgrid.div_ceil(ctx::block() as usize) * ctx::block() as usize;
         let snap_policy = std::env::var("WEIN_SNAP_POLICY").map_or(true, |v| v != "legacy");
+        // DRAM 分层（W-Agent-5，WEIN_DRAM=1 开）：驱逐下沉 pinned host。
+        // 容量 = 块槽 2048×(16 段×seg) + 状态槽 64×25.4MB ≈ 2.6GB（env 可调）
+        let kv_seg = ctx::block() as usize * (cfg.num_kv_heads * cfg.head_dim) as usize * kv_esz;
+        let dram = if radix_on && std::env::var("WEIN_DRAM").is_ok() {
+            let nb: usize = std::env::var("WEIN_DRAM_BLK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            let ns: usize = std::env::var("WEIN_DRAM_ST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            // 状态槽步长 = 全部层的一行（lin 24 层 + conv 24 层）——
+            // spill_state 逐层连写 Σ lin_n×lin_row + conv_n×conv_row，
+            // 只传 lin_row+conv_row（单层）会让槽互相踩
+            let st_stride = lin_state.len() * lin_row + conv_state.len() * conv_row;
+            Some(pin!(DramTier::new(gpu, kv_seg, nb, ns, st_stride)))
+        } else {
+            None
+        };
         let (snap_lin, snap_conv, snap_free) = if radix_on {
             let slots = ctx::snap_slots();
             let mut sl = Vec::with_capacity(lin_state.len());
@@ -1786,6 +1826,11 @@ impl Qwen35Executor {
             snap_conv,
             snap_free,
             snap_of_block: HashMap::new(),
+            dram,
+            blk_hash: HashMap::new(),
+            snap_mark: vec![0; if radix_on { ctx::snap_slots() } else { 0 }],
+            clock: 0,
+            kv_seg,
             radix_on,
             radix_dbg,
             snap_grid_dec,
@@ -2909,6 +2954,14 @@ impl Qwen35Executor {
     }
 
     /// 测试/诊断：conv 层状态行（48KB/行）
+    /// DRAM 分层计数（测试/诊断）：(spilled_blocks, spilled_states,
+    /// fetched_blocks, fetched_states)
+    pub fn dram_stats(&self) -> (u64, u64, u64, u64) {
+        self.dram.as_ref().map_or((0, 0, 0, 0), |d| {
+            (d.spilled_blocks, d.spilled_states, d.fetched_blocks, d.fetched_states)
+        })
+    }
+
     pub fn conv_state_row_bits(&self, layer: usize, row: u32) -> Vec<u16> {
         self.state_row_bits(&self.conv_state[layer], row, self.conv_row)
     }
@@ -3018,20 +3071,184 @@ impl Qwen35Executor {
         self.session.stream().memcpy_batch(&ops);
     }
 
+    /// evict_blocks 返回后的补下沉：frontier 预览看不到的块（摘叶后
+    /// 父变叶的级联逐出）此时已出树——页内容在 deferred 未被复用，
+    /// 按 blk_hash 补 KV 下沉（spill_block 幂等：已在 DRAM 的跳过）
+    fn spill_freed(&mut self, freed: &[u32]) {
+        if self.dram.is_none() || freed.is_empty() {
+            return;
+        }
+        let n_full = self.k_pool.len().min(8);
+        let seg = self.kv_seg;
+        for &b in freed {
+            let Some(h) = self.blk_hash.get(&b).copied() else { continue };
+            if self.dram.as_ref().is_some_and(|d| d.has_block(h)) {
+                continue;
+            }
+            let mut segs: Vec<(&DevBuf, usize)> = Vec::with_capacity(2 * n_full);
+            for l in 0..n_full {
+                segs.push((&self.k_pool[l], b as usize * seg));
+            }
+            for l in 0..n_full {
+                segs.push((&self.v_pool[l], b as usize * seg));
+            }
+            let stream = self.session.stream();
+            self.dram.as_mut().unwrap().spill_block(h, &segs, stream);
+            self.blk_hash.remove(&b);
+        }
+        self.session.stream().sync();
+    }
+
+    /// 真正驱逐前把 frontier 块的 KV 与挂载快照下沉 DRAM（内容寻址：
+    /// 前缀哈希链）。低频慢路径：逐块 O(前缀) 滚动哈希可接受。
+    /// 借用注意：dram/池/槽表全是字段级借用（方法体 disjoint borrow）
+    fn spill_frontier(&mut self, need: usize) {
+        if self.dram.is_none() || need == 0 {
+            return;
+        }
+        let fr = self.radix.evict_frontier(need);
+        let bs = ctx::block() as usize;
+        let n_full = self.k_pool.len().min(8); // draft 层（MTP）不在缓存体系
+        let seg = self.kv_seg;
+        for (b, prefix) in fr {
+            // 哈希链：逐块滚动到该块
+            let mut h = 0u64;
+            for chunk in prefix.chunks(bs) {
+                h = block_hash(h, chunk);
+            }
+            let slot = self.snap_of_block.get(&b).copied();
+            let mut segs: Vec<(&DevBuf, usize)> = Vec::with_capacity(2 * n_full);
+            for i in 0..n_full {
+                segs.push((&self.k_pool[i], b as usize * seg));
+            }
+            for i in 0..n_full {
+                segs.push((&self.v_pool[i], b as usize * seg));
+            }
+            let mut ssegs: Vec<(&DevBuf, usize)> = Vec::new();
+            let mut sbytes: Vec<usize> = Vec::new();
+            if let Some(sl) = slot {
+                for d in &self.snap_lin {
+                    ssegs.push((d, sl as usize * self.lin_row));
+                    sbytes.push(self.lin_row);
+                }
+                for d in &self.snap_conv {
+                    ssegs.push((d, sl as usize * self.conv_row));
+                    sbytes.push(self.conv_row);
+                }
+            }
+            let n_tok = prefix.len();
+            let stream = self.session.stream();
+            let Some(dram) = self.dram.as_mut() else { unreachable!() };
+            dram.spill_block(h, &segs, stream);
+            if !ssegs.is_empty() {
+                dram.spill_state(h, n_tok, &ssegs, &sbytes, stream);
+            }
+            self.blk_hash.remove(&b);
+        }
+        self.session.stream().sync();
+    }
+
     /// 借槽（耗尽时 LRU 驱逐 radix 腾槽；无可驱逐返回 None——本请求降级无快照）
     fn acquire_slot(&mut self) -> Option<u32> {
         while self.snap_free.is_empty() {
+            self.spill_frontier(1);
             let freed = self.radix.evict_blocks(&mut self.pool, 1);
             if freed.is_empty() {
-                return None;
+                // 链保护死锁出口（W-Agent-5）：全树被挂快照的块 pin 时，
+                // 按槽 LRU 强制下沉-解 pin-再逐。无 DRAM 时退化为"解 pin
+                // 丢弃"——比死锁好（旧语义在此永久拿不到槽）
+                if !self.force_release_oldest_slot() {
+                    return None;
+                }
+                continue;
             }
-            for b in freed {
-                if let Some(s) = self.snap_of_block.remove(&b) {
+            // freed 非空但不含挂槽块（摘的是无槽叶）：本循环目标是腾槽，
+            // 继续压——直到某次驱逐联动回收了槽
+            if self.snap_free.is_empty() {
+                continue;
+            }
+            for b in &freed {
+                if let Some(s) = self.snap_of_block.remove(b) {
                     self.snap_free.push(s);
                 }
             }
+            self.spill_freed(&freed);
         }
         self.snap_free.pop()
+    }
+
+    /// 强制逐出最老槽：块 KV/状态下沉 DRAM → 解挂表保护（force_unhold，
+    /// 永不动活请求的 lock_ref）→ 槽回收。**在飞槽跳过**——`reqs` 里活
+    /// 请求的 `snaps` 槽是其快照挂表的合法主人，强解会让该请求的块表页
+    /// 失去驱逐免疫。返回 false = 没有可逐的槽
+    fn force_release_oldest_slot(&mut self) -> bool {
+        // 在飞槽集合（活请求的 snaps）：这些槽的块表页还在被读写
+        let inflight: HashSet<u32> = self
+            .reqs
+            .values()
+            .flat_map(|st| st.snaps.iter().map(|&(_, s)| s))
+            .collect();
+        let cand = self
+            .snap_of_block
+            .iter()
+            .filter(|(_, &sl)| {
+                !inflight.contains(&sl)
+                    && self.snap_mark.get(sl as usize).copied().unwrap_or(0) > 0
+            })
+            .min_by_key(|(_, &sl)| self.snap_mark[sl as usize])
+            .map(|(&b, &sl)| (b, sl));
+        let Some((b, slot)) = cand else { return false };
+        if self.radix_dbg {
+            eprintln!("[dram] force_release slot={slot} blk={b}（下沉后解 hold）");
+        }
+        self.snap_owner[slot as usize] = None;
+        if self.snap_of_block.get(&b) == Some(&slot) {
+            // 下沉（哈希在；DRAM 关时 spill 为 no-op 直接丢）
+            if self.radix_dbg {
+                eprintln!(
+                    "[dram] mount-death(force) blk={b} hash={:?} nb={}",
+                    self.blk_hash.get(&b).copied(),
+                    self.snap_nb.get(slot as usize).copied().unwrap_or(0)
+                );
+            }
+            if let Some(h) = self.blk_hash.get(&b).copied() {
+                let nb = self.snap_nb.get(slot as usize).copied().unwrap_or(0);
+                let n_tok = nb * ctx::block() as usize;
+                if self.dram.is_some() {
+                    let n_full = self.k_pool.len().min(8);
+                    let seg = self.kv_seg;
+                    let mut segs: Vec<(&DevBuf, usize)> = Vec::with_capacity(2 * n_full);
+                    for l in 0..n_full {
+                        segs.push((&self.k_pool[l], b as usize * seg));
+                    }
+                    for l in 0..n_full {
+                        segs.push((&self.v_pool[l], b as usize * seg));
+                    }
+                    let mut ssegs: Vec<(&DevBuf, usize)> = Vec::new();
+                    let mut sbytes: Vec<usize> = Vec::new();
+                    for d in &self.snap_lin {
+                        ssegs.push((d, slot as usize * self.lin_row));
+                        sbytes.push(self.lin_row);
+                    }
+                    for d in &self.snap_conv {
+                        ssegs.push((d, slot as usize * self.conv_row));
+                        sbytes.push(self.conv_row);
+                    }
+                    let stream = self.session.stream();
+                    let dram = self.dram.as_mut().unwrap();
+                    dram.spill_block(h, &segs, stream);
+                    let _ = dram.spill_state(h, n_tok, &ssegs, &sbytes, stream);
+                    stream.sync();
+                }
+            }
+            self.radix.force_unhold(&mut self.pool, b);
+            self.snap_of_block.remove(&b);
+        }
+        if let Some(e) = self.snap_nb.get_mut(slot as usize) {
+            *e = 0;
+        }
+        self.snap_free.push(slot);
+        true
     }
 
     /// 归还一张快照槽：**必须**同时摘掉 `snap_of_block` 里的反向记录
@@ -3039,6 +3256,36 @@ impl Qwen35Executor {
     fn release_slot(&mut self, slot: u32) {
         if let Some(b) = self.snap_owner.get_mut(slot as usize).and_then(|e| e.take()) {
             if self.snap_of_block.get(&b) == Some(&slot) {
+                if self.radix_dbg {
+                    let h = self.blk_hash.get(&b).copied();
+                    eprintln!(
+                        "[dram] mount-death(slot) blk={b} hash={h:?} nb={} dram={}",
+                        self.snap_nb.get(slot as usize).copied().unwrap_or(0),
+                        self.dram.is_some()
+                    );
+                }
+                // DRAM 存档（W-Agent-5）：槽还池前把状态下沉——该块日后被
+                // 逐时 spill_frontier 只剩 KV 副本路径，状态副本要靠这里
+                if let (Some(h), true) = (self.blk_hash.get(&b).copied(), self.dram.is_some()) {
+                    let nb = self.snap_nb.get(slot as usize).copied().unwrap_or(0);
+                    let n_tok = nb * ctx::block() as usize;
+                    let mut ssegs: Vec<(&DevBuf, usize)> = Vec::new();
+                    let mut sbytes: Vec<usize> = Vec::new();
+                    for d in &self.snap_lin {
+                        ssegs.push((d, slot as usize * self.lin_row));
+                        sbytes.push(self.lin_row);
+                    }
+                    for d in &self.snap_conv {
+                        ssegs.push((d, slot as usize * self.conv_row));
+                        sbytes.push(self.conv_row);
+                    }
+                    let stream = self.session.stream();
+                    let _ = self
+                        .dram
+                        .as_mut()
+                        .unwrap()
+                        .spill_state(h, n_tok, &ssegs, &sbytes, stream);
+                }
                 self.radix.unpin_block(&mut self.pool, b);
                 self.snap_of_block.remove(&b);
             }
@@ -3053,12 +3300,25 @@ impl Qwen35Executor {
     /// 仍无页 → `None`（调用方转成 `StepError::Capacity`，**不 panic**）
     fn alloc_page(&mut self) -> Option<u32> {
         if self.pool.free_now() == 0 {
-            let freed = self.radix.evict_blocks(&mut self.pool, 8);
-            for b in freed {
-                if let Some(s) = self.snap_of_block.remove(&b) {
+            if self.radix_dbg {
+                eprintln!("[dram] alloc_page 压力：free=0 可逐块={}", self.radix.evictable_blocks());
+            }
+            self.spill_frontier(8);
+            let mut freed = self.radix.evict_blocks(&mut self.pool, 8);
+            while freed.is_empty() {
+                // 链保护死锁出口：全树被挂快照块 pin ⇒ 按槽 LRU 逐个强制
+                // 下沉+解 hold 再逐（共享链上多个挂表 pin 钉死整树——一次不够）
+                if !self.force_release_oldest_slot() {
+                    break;
+                }
+                freed = self.radix.evict_blocks(&mut self.pool, 8);
+            }
+            for b in &freed {
+                if let Some(s) = self.snap_of_block.remove(b) {
                     self.snap_free.push(s);
                 }
             }
+            self.spill_freed(&freed);
             self.pool.recycle();
         }
         self.pool.alloc()
@@ -4618,6 +4878,9 @@ impl Executor for Qwen35Executor {
         // （vLLM 同款"末 token 重算"规则——精确块对齐 prompt 不命中）
         let mut blocks = Vec::new();
         let mut shared = 0usize;
+        // 树命中全量（含超出快照锚的尾部）：DRAM 接力把尾部常驻段当
+        // 零搬运覆盖用，match 锁持有到接力规划完成后再退未用部分
+        let mut matched: Vec<u32> = Vec::new();
         if self.radix_on {
             let m = self.radix.match_prefix(&mut self.pool, &seq);
             if self.radix_dbg {
@@ -4629,26 +4892,212 @@ impl Executor for Qwen35Executor {
                     self.snap_of_block.keys().take(8).collect::<Vec<_>>()
                 );
             }
-            if !m.blocks.is_empty() {
-                let keep = (0..m.blocks.len())
+            matched = m.blocks;
+            if self.radix_dbg && !matched.is_empty() {
+                // 分叉窗口：match 深度处 incoming 的 16 token——与 retain 侧
+                // 快照锚窗口离线 diff，定位重渲染断点
+                let m0 = matched.len();
+                let bs0 = ctx::block() as usize;
+                let lo = m0.saturating_sub(1) * bs0;
+                let hi = (lo + 32).min(seq.len());
+                eprintln!("[radix] 分叉窗口 blk={} toks={:?}", m0, &seq[lo..hi]);
+            }
+            if !matched.is_empty() {
+                let keep = (0..matched.len())
                     .rev()
                     .find(|&i| {
                         ((i + 1) * ctx::block() as usize) < seq.len()
-                            && self.snap_of_block.contains_key(&m.blocks[i])
+                            && self.snap_of_block.contains_key(&matched[i])
                     })
                     .map_or(0, |i| i + 1);
-                if keep < m.blocks.len() {
-                    self.radix.unpin_range(&mut self.pool, &seq, keep, m.blocks.len());
-                }
                 if keep > 0 {
-                    let slot = self.snap_of_block[&m.blocks[keep - 1]];
+                    let slot = self.snap_of_block[&matched[keep - 1]];
                     self.restore_row_snapshot(row, slot);
                     let base = row as usize * self.bpr;
-                    for (j, &b) in m.blocks[..keep].iter().enumerate() {
+                    for (j, &b) in matched[..keep].iter().enumerate() {
                         self.bt_host[base + j] = b;
                     }
-                    blocks = m.blocks[..keep].to_vec();
+                    blocks = matched[..keep].to_vec();
                     shared = keep;
+                }
+            }
+        }
+        // ── DRAM 分层接力（W-Agent-5）：树命中段之后从 DRAM 找更长恢复
+        // 点 e。块可用性 = 树内常驻 **或** DRAM 副本：(tree_len..e] 须全
+        // 在 DRAM，(shared..tree_len] 直接用树——热系统 prompt 常驻树、
+        // 从未下沉，若要求全链在 DRAM 则多会话场景接力永不触发（本刀
+        // 修复的缺口）。恢复点之前的 KV 必须全部在（树命中段 + 树内
+        // 常驻段 + DRAM 补齐段）——混合架构的物理约束：恢复点的
+        // full-attn 层要 attend 全部历史
+        let tree_len = matched.len();
+        let bs = ctx::block() as usize;
+        let mut best_e = 0usize;
+        let mut hs: Vec<u64> = Vec::new();
+        if self.dram.is_some() {
+            let nb = seq.len() / bs;
+            // prompt 全链哈希（规划用，纯只读）
+            let mut hh = 0u64;
+            hs.reserve(nb);
+            for i in 0..nb {
+                hh = block_hash(hh, &seq[i * bs..(i + 1) * bs]);
+                hs.push(hh);
+            }
+            {
+                let dram = self.dram.as_ref().unwrap();
+                if self.radix_dbg {
+                    let cand = (shared + 1..=nb).rev().find(|&e| {
+                        dram.has_state(hs[e - 1]) && dram.state_tokens(hs[e - 1]) == Some(e * bs)
+                    });
+                    let miss = cand.map(|e| {
+                        (tree_len + 1..=e).filter(|&i| !dram.has_block(hs[i - 1])).count()
+                    });
+                    eprintln!(
+                        "[dram] 接力规划：nb={} shared={} tree_len={} has_state(last)={:?} cand={cand:?} miss={miss:?}",
+                        nb,
+                        shared,
+                        tree_len,
+                        (1..=nb).rev().find(|&e| dram.has_state(hs[e - 1])),
+                    );
+                }
+                for e in (shared + 1..=nb).rev() {
+                    // 末 token 重算规则（与树命中截断同款）：恢复到 prompt
+                    // 末尾 = 无 token 可喂 = 无采样位
+                    if e * bs < seq.len()
+                        && dram.has_state(hs[e - 1])
+                        && dram.state_tokens(hs[e - 1]) == Some(e * bs)
+                        && (tree_len + 1..=e).all(|i| dram.has_block(hs[i - 1]))
+                    {
+                        best_e = e;
+                        break;
+                    }
+                }
+            }
+        }
+        // 尾段退锁：接力成功时 (0..used_tree] 继续持锁作覆盖（驱逐不可
+        // 及），只退未用段；无接力时退 (keep..tree_len]（旧行为）
+        let used_tree = if best_e > shared {
+            best_e.min(tree_len)
+        } else {
+            shared
+        };
+        if used_tree < tree_len {
+            self.radix.unpin_range(&mut self.pool, &seq, used_tree, tree_len);
+        }
+        if best_e > shared {
+            // KV 换入仅树外段 (tree_len..best_e]——树内常驻段零搬运直接
+            // 继承 matched 页 id。池尽/换入失败整体放弃（状态锚在 best_e，
+            // 部分换入与恢复点对不上）
+            let mut new_blocks = Vec::new();
+            let mut ok = true;
+            for i in tree_len + 1..=best_e {
+                match self.alloc_page() {
+                    Some(b) => {
+                        new_blocks.push(b);
+                        self.blk_hash.insert(b, hs[i - 1]);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                // KV H2D：每块 16 段
+                let n_full = self.k_pool.len().min(8);
+                let seg = self.kv_seg;
+                let stream = self.session.stream();
+                let dram = self.dram.as_mut().unwrap();
+                for (i, &b) in new_blocks.iter().enumerate() {
+                    let h = hs[tree_len + i];
+                    let mut segs: Vec<(&DevBuf, usize)> = Vec::with_capacity(2 * n_full);
+                    for l in 0..n_full {
+                        segs.push((&self.k_pool[l], b as usize * seg));
+                    }
+                    for l in 0..n_full {
+                        segs.push((&self.v_pool[l], b as usize * seg));
+                    }
+                    if !dram.fetch_block(h, &segs, stream) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let slot = if ok { self.acquire_slot() } else { None };
+            if let Some(slot) = slot {
+                let stream = self.session.stream();
+                let mut ssegs: Vec<(&DevBuf, usize)> = Vec::new();
+                let mut sbytes: Vec<usize> = Vec::new();
+                for d in &self.snap_lin {
+                    ssegs.push((d, slot as usize * self.lin_row));
+                    sbytes.push(self.lin_row);
+                }
+                for d in &self.snap_conv {
+                    ssegs.push((d, slot as usize * self.conv_row));
+                    sbytes.push(self.conv_row);
+                }
+                let fetched = self
+                    .dram
+                    .as_mut()
+                    .unwrap()
+                    .fetch_state(hs[best_e - 1], &ssegs, &sbytes, stream);
+                if fetched {
+                    stream.sync();
+                    let e_actual = best_e;
+                    // 挂树：insert 契约 = 分叉点对齐——(0..used_tree] 树
+                    // 已覆盖且持锁（驱逐不可及），只挂树外新页
+                    if !new_blocks.is_empty() {
+                        self.radix.insert(&seq[..e_actual * bs], &new_blocks);
+                    }
+                    let last = if used_tree == e_actual {
+                        matched[used_tree - 1]
+                    } else {
+                        *new_blocks.last().unwrap()
+                    };
+                    self.radix.pin_block(&mut self.pool, last);
+                    self.snap_of_block.insert(last, slot);
+                    self.snap_owner[slot as usize] = Some(last);
+                    // 槽让位下沉时 n_tok 靠它——漏写 = 下沉 0 token 状态
+                    self.snap_nb[slot as usize] = e_actual;
+                    self.clock += 1;
+                    self.snap_mark[slot as usize] = self.clock;
+                    self.restore_row_snapshot(row, slot);
+                    // 块表 + 哈希登记：覆盖段全量（树内继承段同样要
+                    // 登记——块被逐时 spill 靠它找到链哈希）
+                    let base = row as usize * self.bpr;
+                    let cover = |i: usize| {
+                        if i <= used_tree {
+                            matched[i - 1]
+                        } else {
+                            new_blocks[i - used_tree - 1]
+                        }
+                    };
+                    for i in shared + 1..=e_actual {
+                        let b = cover(i);
+                        self.bt_host[base + i - 1] = b;
+                        self.blk_hash.insert(b, hs[i - 1]);
+                    }
+                    for (i, &b) in blocks.iter().enumerate() {
+                        self.blk_hash.insert(b, hs[i]);
+                    }
+                    blocks.extend((shared + 1..=e_actual).map(cover));
+                    shared = e_actual;
+                } else {
+                    stream.sync();
+                    ok = false;
+                }
+            } else {
+                ok = false;
+            }
+            if !ok {
+                // 降级：归还已分页（无主页；deferred 语义不破坏），
+                // 未用成的树内继承段退锁（回到纯 keep 覆盖）
+                for &b in &new_blocks {
+                    self.blk_hash.remove(&b);
+                    self.pool.release(b);
+                }
+                self.pool.recycle();
+                if used_tree > shared {
+                    self.radix.unpin_range(&mut self.pool, &seq, shared, used_tree);
                 }
             }
         }
@@ -5004,20 +5453,55 @@ impl Executor for Qwen35Executor {
                         let ph_tab = &self.snap_phase;
                         let mut give_back: Vec<u32> = Vec::new();
                         if let Some(st) = self.reqs.get_mut(&id) {
+                            // 先取全量 (块, 槽, nb, 相位)：同相位按 nb 排序后
+                            // 取最新两张——第二张是关键（chase 模式下发在
+                            // 分叉块的上一块，恰好可达），且不依赖 chunk 划分
+                            // 运气（大 chunk 时两张 = 最后两个块尾，等效粗栅格）
+                            let drained: Vec<(u32, u32, usize, bool)> = st
+                                .snaps
+                                .drain(..)
+                                .map(|(b, sl)| {
+                                    (
+                                        b,
+                                        sl,
+                                        nb_tab.get(sl as usize).copied().unwrap_or(0),
+                                        ph_tab.get(sl as usize).copied().unwrap_or(false),
+                                    )
+                                })
+                                .collect();
+                            let mut top = |pref: bool| -> [usize; 2] {
+                                let mut v: Vec<usize> = drained
+                                    .iter()
+                                    .filter(|d| d.3 == pref)
+                                    .map(|d| d.2)
+                                    .collect();
+                                v.sort_unstable();
+                                let n = v.len();
+                                [n.checked_sub(1).and_then(|i| v.get(i).copied()).unwrap_or(0),
+                                 n.checked_sub(2).and_then(|i| v.get(i).copied()).unwrap_or(0)]
+                            };
+                            let top_pref = top(true);
+                            let top_dec = top(false);
                             let mut kept: Vec<(u32, u32)> =
-                                Vec::with_capacity(st.snaps.len());
-                            for (b, sl) in st.snaps.drain(..) {
-                                // 同相位 → 让位（每个相位各留最新一张）
-                                let _ = nb_tab;
-                                if ph_tab.get(sl as usize).copied().unwrap_or(false) == pref {
-                                    give_back.push(sl);
-                                } else {
+                                Vec::with_capacity(drained.len());
+                            for (b, sl, nb, ph) in drained {
+                                let t2 = if ph { top_pref } else { top_dec };
+                                if nb <= SNAP_SHALLOW_BLKS
+                                    || nb % SNAP_KEEP_GRID == 0
+                                    || nb == t2[0]
+                                    || nb == t2[1]
+                                {
                                     kept.push((b, sl));
+                                } else {
+                                    give_back.push(sl);
                                 }
                             }
                             st.snaps = kept;
                         }
                         for sl in give_back {
+                            if self.radix_dbg {
+                                eprintln!("[dram] snap-giveback slot={}", sl);
+                            }
                             self.release_slot(sl);
                         }
                     }
@@ -5031,7 +5515,19 @@ impl Executor for Qwen35Executor {
                 if let Some(e) = self.snap_phase.get_mut(slot as usize) {
                     *e = pref;
                 }
+                self.snap_owner[slot as usize] = Some(blk);
+                self.clock += 1;
+                self.snap_mark[slot as usize] = self.clock;
                 if let Some(st) = self.reqs.get_mut(&id) {
+                    if self.radix_dbg {
+                        eprintln!(
+                            "[dram] snap-fire seq前缀nb={} slot={} phase={} snaps_len={}",
+                            nb,
+                            slot,
+                            pref,
+                            st.snaps.len()
+                        );
+                    }
                     st.snaps.push((blk, slot));
                 }
                 snaps.push((srow, slot));
@@ -5097,12 +5593,14 @@ impl Executor for Qwen35Executor {
                 // 逐块移交：块进树则槽随块（snap_of_block），未进树/冗余段的
                 // 槽回池。多槽是常态——prompt 侧每个 chunk 尾各一份
                 let mut kept: Vec<u32> = Vec::new();
+                let mut cover_d = 0usize;
                 if self.radix_on && full > shared {
                     let tok_end = full * ctx::block() as usize;
                     // 树既有覆盖深度（>= shared：命中段被 pin 不可逐）。
                     // [shared..d) 私有块与树重叠 = 冗余页，释放；只把分叉
                     // 后新段 [d..full) 交 insert（blocks 契约 = 分叉点对齐）
                     let d = self.radix.coverage(&st.seq[..tok_end]);
+                    cover_d = d;
                     debug_assert!(d >= shared, "命中段被 pin，覆盖不可能更浅");
                     for &b in &st.blocks[shared..d] {
                         self.pool.release(b);
@@ -5121,6 +5619,17 @@ impl Executor for Qwen35Executor {
                     if d < full {
                         kept = st.blocks[d..full].to_vec();
                         self.radix.insert(&st.seq[..tok_end], &kept);
+                        // 哈希登记：日后驱逐下沉/退场存档的身份来源
+                        let bs = ctx::block() as usize;
+                        let mut hh = 0u64;
+                        for i in 0..full {
+                            hh = block_hash(hh, &st.seq[i * bs..(i + 1) * bs]);
+                            if i >= d {
+                                if let Some(&b) = kept.get(i - d) {
+                                    self.blk_hash.insert(b, hh);
+                                }
+                            }
+                        }
                     }
                 }
                 // 槽与块同命（W-Agent-3）：只要快照所在的块仍是本请求的完整块
@@ -5131,6 +5640,32 @@ impl Executor for Qwen35Executor {
                 // 之间 ⇒ 每轮都被无谓丢弃，下一轮只能命中浅层 26 块。
                 // 槽的真实寿命由块决定：块被逐出时 `snap_owner` 会回收（见驱逐路径）。
                 let idx_of = |b: u32| st.blocks.iter().position(|x| *x == b);
+                if self.radix_dbg {
+                    for &(b, _sl) in &st.snaps {
+                        if let Some(i) = idx_of(b) {
+                            let w0 = (i * ctx::block() as usize).saturating_sub(16);
+                            let w1 = (w0 + 48).min(st.seq.len());
+                            eprintln!(
+                                "[radix] retain 锚窗口 blk_idx={} toks={:?}",
+                                i,
+                                &st.seq[w0..w1]
+                            );
+                        }
+                    }
+                    eprintln!(
+                        "[dram] retain-mount seq={} full={} shared={} cover={} snaps={:?} mounted={:?}",
+                        st.seq.len(),
+                        full,
+                        shared,
+                        cover_d,
+                        st.snaps,
+                        st.snaps
+                            .iter()
+                            .filter(|&(b, _)| idx_of(*b).is_some_and(|i| i < full))
+                            .map(|&(b, _)| b)
+                            .collect::<Vec<_>>()
+                    );
+                }
                 for &(b, slot) in &st.snaps {
                     match idx_of(b) {
                         Some(idx) if idx < full => {
@@ -5141,6 +5676,9 @@ impl Executor for Qwen35Executor {
                                 self.radix.pin_block(&mut self.pool, b);
                             }
                             self.snap_of_block.insert(b, slot);
+                            self.snap_owner[slot as usize] = Some(b);
+                            self.clock += 1;
+                            self.snap_mark[slot as usize] = self.clock;
                         }
                         _ => {
                             // 还池的槽若仍挂表（重准入继承后块未进树）：解保护

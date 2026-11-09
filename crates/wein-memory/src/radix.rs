@@ -3,8 +3,10 @@
 //! - **索引与数据分离**：节点只持 BlockId，不持 KV 数据（数据在设备显存）
 //! - **块对齐**：节点边 = 整块（block_size 个 token）；匹配/插入都只处理整块，
 //!   部分尾不属于缓存（m5）
-//! - **pin**：match_prefix 对命中块 lock_ref+1 + pool.retain——运行中请求的
-//!   上下文驱逐免疫；unpin 成对释放（m6）
+//! - **pin（双计数分账）**：`lock_ref` = 运行中请求持有（match_prefix
+//!   加、unpin 减）；`hold` = 挂表/快照链保护（pin_block 加）。两者都
+//!   构成驱逐免疫，但只有 hold 可被 DRAM 下沉后强解（force_unhold）——
+//!   lock_ref 是活请求的块表页依赖，动了就是正确性事故
 //! - **驱逐**：只摘未 pin 的叶子，按 LRU；父节点有子嗣则保留（索引职责）。
 //!   M0 无节点分裂：一次 insert 的新块串成一条链（子节点按键整块内容索引
 //!   ⇒ 同首 token 的不同块并存——首 token 单键会让后插覆盖先插）
@@ -19,8 +21,14 @@ struct Node {
     /// 子节点按下一块的整块 token 内容索引（键即该块的 token，root 恒空）。
     /// 块对齐 ⇒ 键长恒 bs，同首 token 的不同块因此并存
     children: HashMap<Vec<u32>, Node>,
-    /// 运行中请求持有数（>0 = 驱逐免疫）
+    /// 运行中请求持有数（match_prefix 加、unpin 减）。**只属于活请求**——
+    /// 它是块表页的读写依赖，驱逐/强解都会让活请求读到复用后的脏页。
+    /// 挂表/快照链保护走独立的 `hold`，两者共同构成驱逐免疫
     lock_ref: u32,
+    /// 挂表（快照链）保护数：pin_block 加、unpin_block 减。与 lock_ref
+    /// 分账是 DRAM 分层的前提——强解（force_unhold）只清它，永不动
+    /// 活请求的 lock_ref
+    hold: u32,
     last_access: u64,
 }
 
@@ -181,18 +189,20 @@ impl RadixCache {
             block: Some(b),
             children: HashMap::new(),
             lock_ref: 0,
+            hold: 0,
             last_access: *clock,
         });
         child.last_access = *clock;
         Self::append_chain(child, &tokens[bs..], rest, bs, clock);
     }
 
-    /// 快照链保护：按块 id 找到树上节点并 lock_ref+1 + pool.retain
-    /// （驱逐免疫）。找不到（已逐/从未插入）返回 false。计数语义与
-    /// match_prefix 一致：多次挂快照可叠加，unpin_block 对称回零。
+    /// 快照链保护：按块 id 找到树上节点并 hold+1 + pool.retain（驱逐
+    /// 免疫）。找不到（已逐/从未插入）返回 false。计数语义与 match_prefix
+    /// 的 lock_ref **分账**：hold 属于挂表保护（可 force_unhold 强解），
+    /// lock_ref 属于活请求（永不强解）。
     pub fn pin_block(&mut self, pool: &mut BlockPool, block: u32) -> bool {
         if let Some(node) = Self::find_block_mut(&mut self.root, block) {
-            node.lock_ref += 1;
+            node.hold += 1;
             pool.retain(block);
             true
         } else {
@@ -203,8 +213,21 @@ impl RadixCache {
     /// pin_block 的解除。不在树上时静默返回（块可能已被整体逐出）。
     pub fn unpin_block(&mut self, pool: &mut BlockPool, block: u32) {
         if let Some(node) = Self::find_block_mut(&mut self.root, block) {
-            node.lock_ref = node.lock_ref.saturating_sub(1);
+            node.hold = node.hold.saturating_sub(1);
             pool.release(block);
+        }
+    }
+
+    /// 强解挂表保护：把块的 hold 清零并按次数 release。DRAM 下沉后块
+    /// 内容可弃，挂表保护随之让位。**永不动 lock_ref**——那是运行中
+    /// 请求的块表页依赖（清了 = 共享页被逐+复用 = 活请求读到别人的 KV，
+    /// retain 的 coverage 合同随之炸裂）
+    pub fn force_unhold(&mut self, pool: &mut BlockPool, block: u32) {
+        if let Some(node) = Self::find_block_mut(&mut self.root, block) {
+            for _ in 0..node.hold {
+                pool.release(block);
+            }
+            node.hold = 0;
         }
     }
 
@@ -251,6 +274,45 @@ impl RadixCache {
         freed
     }
 
+    /// 驱逐预览：返回接下来 `evict_blocks(need)` 将摘除的块及其**全前缀
+    /// tokens**（root→该块），不执行。DRAM 分层在真正驱逐前用它把块 KV
+    /// 与挂载快照下沉（前缀 = 块哈希链的身份来源）。
+    ///
+    /// 模拟等价性：逐出循环每轮摘全局最旧可逐叶（摘叶后父变叶继续可逐），
+    /// = 按 last_access 升序取「子树无 pin」节点。与 `evictable_blocks`
+    /// 同语义：含 pin 的子树整体不可逐（摘 pin 的祖先会孤立它）。
+    pub fn evict_frontier(&self, need: usize) -> Vec<(BlockId, Vec<u32>)> {
+        // 键在父的 children 表里（Node 自身不存键）——递归时携带
+        fn collect(
+            node: &Node,
+            key: &[u32],
+            prefix: &mut Vec<u32>,
+            out: &mut Vec<(u64, BlockId, Vec<u32>)>,
+        ) -> bool {
+            if node.lock_ref > 0 || node.hold > 0 {
+                return false;
+            }
+            for (k, c) in &node.children {
+                if !collect(c, k, prefix, out) {
+                    return false; // 某子方向有 pin：本节点作为其祖先也不可逐
+                }
+            }
+            prefix.extend_from_slice(key);
+            if let Some(b) = node.block {
+                out.push((node.last_access, b, prefix.clone()));
+            }
+            prefix.truncate(prefix.len() - key.len());
+            true
+        }
+        let mut all = Vec::new();
+        for (k, c) in &self.root.children {
+            let mut p = Vec::new();
+            collect(c, k, &mut p, &mut all);
+        }
+        all.sort_by_key(|(age, _, _)| *age);
+        all.into_iter().take(need).map(|(_, b, pfx)| (b, pfx)).collect()
+    }
+
     /// 可驱逐块数——MemState 悲观准入的组成部分。
     /// 与 evict() 的级联语义一致：摘掉叶子后父节点变叶子可继续摘，
     /// 所以计数 = 子树内无 pin 依赖的节点总数（而非仅当前叶子——
@@ -266,9 +328,10 @@ impl RadixCache {
         total
     }
 
-    /// Some(n)：子树全部无 pin，共 n 节点；None：子树内含 pin（整体不可逐）
+    /// Some(n)：子树全部无 pin（lock_ref 与 hold 双清），共 n 节点；
+    /// None：子树内含 pin（整体不可逐）
     fn subtree_evictable(node: &Node) -> Option<usize> {
-        if node.lock_ref > 0 {
+        if node.lock_ref > 0 || node.hold > 0 {
             return None;
         }
         let mut n = 1;
@@ -285,7 +348,7 @@ impl RadixCache {
     ) -> Option<(u64, BlockId, Vec<Vec<u32>>)> {
         let mut best: Option<(u64, BlockId, Vec<Vec<u32>>)> = None;
         for (k, c) in &node.children {
-            if c.children.is_empty() && c.lock_ref == 0 {
+            if c.children.is_empty() && c.lock_ref == 0 && c.hold == 0 {
                 let mut p = prefix.clone();
                 p.push(k.clone());
                 let cand = (c.last_access, c.block.expect("叶子必有块"), p);
