@@ -408,6 +408,7 @@ fn qg_split_ids(t: usize, nqh: usize) -> (Vec<u32>, Vec<u32>) {
 
 /// 前向 scratch（按 T_MAX 一次分配；下标/块表等小数组每步上传）
 struct ScrDev {
+    seqs_zero: DevBuf<'static>, // [T] 全 0 seq_ids：混批逐段路径的段内视图（v9 对 seq≠0 算错）
     x: DevBuf<'static>,      // [T,2560] 主路（embed → 层间传递 → final norm）
     n1: DevBuf<'static>,     // [T,2560]
     qg: DevBuf<'static>,     // [T,8192] full q‖gate
@@ -1098,12 +1099,109 @@ impl Qwen35Executor {
         kvh: u32,
         hd: u32,
         t: u32,
+        spans: Option<(&[u32], &[u32])>, // (count, rid)：段行数与请求 id（bt 行 = rid）
         has_decode_row: bool,
         single_span: bool,
         stream: &Stream,
     ) {
-        // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档
+        // 形状分档：t≤4 的小批（decode/草稿链）走 decode 档，其余走 prefill 档。
+        // cfg 只看**整批 t**：同批所有 online 调用（混批 run / 尾行）同档，
+        // online 行独立（o41 批形无关）⇒ 与现状整批一遍位级同
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        // 混批/多段逐段路径（attn_mix_probe ② 已验证）：≥64 行段的 64 对齐主段
+        // 走 v9/v5、16 对齐余段走 v4——段内 seqs 一律取全 0 缓冲切片 + bt narrow
+        // 到段首行（v9 对 seq≠0 的行算错，见 bench-reports/agent-attn-mix-20261109）；
+        // 段尾 <16 行与 decode 段按连续区间合并（run）走 online 老路（真 seqs，
+        // online 按行寻址行独立）。全 decode 稳态 = 单 run 整批 online = 现状零退化。
+        // WEIN_ATTN_MIXSEG=0 回退整批 online（进程内 A/B）。
+        if let Some((sp, rid)) = spans {
+            let big = sp.iter().any(|&c| c as usize & !63 >= 64);
+            if self.attn_online
+                && (has_decode_row || sp.len() > 1)
+                && big
+                && self.step_max_pos < self.attn_v5_max_ctx
+                && self.attn_cfg.kv == wein_kernel::ops::KvDtype::Bf16
+                && hd == 256
+                && qh_n == 16
+                && kvh == 4
+                && std::env::var("WEIN_ATTN_MIXSEG").map(|v| v != "0").unwrap_or(true)
+            {
+                let v9 =
+                    std::env::var("WEIN_ATTN_V9").map(|v| v != "0").unwrap_or(true);
+                let row = (qh_n * hd) as usize * 2;
+                let bt_row = bpr as usize * 4;
+                self.scr.seqs_zero.zero_on(stream);
+                let sz = &self.scr.seqs_zero;
+                let mut pend: Option<(usize, usize)> = None; // 待走 online 的连续区间
+                let mut cur = 0usize;
+                for (&c0, &r) in sp.iter().zip(rid.iter()) {
+                    let c = c0 as usize;
+                    let t64 = c & !63;
+                    let t4 = (c - t64) & !15;
+                    // 段的页表视图：bt 布局是 [128 请求, bpr 页]，行 = rid
+                    let bt1 = bt.narrow(r as usize * bt_row, bt_row);
+                    if t64 >= 64 || t4 >= 16 {
+                        if let Some((ps, pe)) = pend.take() {
+                            a.run_tile_online_cfg(
+                                cfg, &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
+                                &seqs.narrow(ps * 4, (pe - ps) * 4),
+                                &pos.narrow(ps * 4, (pe - ps) * 4),
+                                &out.narrow(ps * row, (pe - ps) * row), q_scale, bpr,
+                                block_size, qh_n, kvh, hd, (pe - ps) as u32, stream,
+                            );
+                        }
+                        if t64 >= 64 {
+                            let qv = q.narrow(cur * row, t64 * row);
+                            let btv = &bt1;
+                            let szv = sz.narrow(cur * 4, t64 * 4);
+                            let pv = pos.narrow(cur * 4, t64 * 4);
+                            let ov = out.narrow(cur * row, t64 * row);
+                            if v9 {
+                                a.run_tile_v9(
+                                    &qv, k, v, &btv, &szv, &pv, &ov, q_scale, bpr,
+                                    block_size, qh_n, kvh, hd, t64 as u32, stream,
+                                );
+                            } else {
+                                a.run_tile_v5(
+                                    &qv, k, v, &btv, &szv, &pv, &ov, q_scale, bpr,
+                                    block_size, qh_n, kvh, hd, t64 as u32, stream,
+                                );
+                            }
+                        }
+                        if t4 > 0 {
+                            let s4 = cur + t64;
+                            a.run_tile_v4(
+                                &q.narrow(s4 * row, t4 * row), k, v,
+                                &bt1,
+                                &sz.narrow(s4 * 4, t4 * 4),
+                                &pos.narrow(s4 * 4, t4 * 4),
+                                &out.narrow(s4 * row, t4 * row), q_scale, bpr,
+                                block_size, qh_n, kvh, hd, t4 as u32, stream,
+                            );
+                        }
+                        let tail_s = cur + t64 + t4;
+                        if tail_s < cur + c {
+                            pend = Some((tail_s, cur + c));
+                        }
+                    } else if let Some((_, ref mut pe)) = pend {
+                        *pe = cur + c;
+                    } else if c > 0 {
+                        pend = Some((cur, cur + c));
+                    }
+                    cur += c;
+                }
+                if let Some((ps, pe)) = pend {
+                    a.run_tile_online_cfg(
+                        cfg, &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
+                        &seqs.narrow(ps * 4, (pe - ps) * 4),
+                        &pos.narrow(ps * 4, (pe - ps) * 4),
+                        &out.narrow(ps * row, (pe - ps) * row), q_scale, bpr,
+                        block_size, qh_n, kvh, hd, (pe - ps) as u32, stream,
+                    );
+                }
+                return;
+            }
+        }
         if std::env::var("WEIN_ATTN_TRACE").is_ok() {
             eprintln!(
                 "ATN t={t} hd={hd} qh={qh_n} kvh={kvh} dec={has_decode_row} single={single_span} maxpos={} v5t={} v3t={} online={}",
@@ -1454,6 +1552,7 @@ impl Qwen35Executor {
             (cfg.hidden_size as usize, cfg.inter_size as usize, cfg.vocab_size as usize);
         let bf = |n: usize| n * 2;
         let scr = ScrDev {
+            seqs_zero: pin!(gpu.alloc_bytes(t_max * 4)),
             x: pin!(gpu.alloc_bytes(bf(t_max * h))),
             n1: pin!(gpu.alloc_bytes(bf(t_max * h))),
             qg: pin!(gpu.alloc_bytes(bf(t_max * 8192))),
@@ -3536,7 +3635,8 @@ impl Qwen35Executor {
                         self.attn_long(
                             &tb.paged_attn, &self.scr.qh, &self.k_pool[full_i],
                             &self.v_pool[full_i], inp.bt, inp.seqs, inp.pos, &self.scr.attn,
-                            self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd, t32,
+                            self.q_scale, self.bpr as u32, ctx::block(), qh_n, kvh, hd,
+                            t32, Some((&spans.count, &spans.rid)),
                             spans.count.iter().any(|&c| c == 1),
                             spans.count.len() == 1,
                             stream,
@@ -4090,7 +4190,7 @@ impl Qwen35Executor {
             self.attn_long(
                 &tb.paged_attn, &self.scr.qh, &self.k_pool[w.kv], &self.v_pool[w.kv], inp.bt,
                 inp.seqs, inp.pos, &self.scr.attn, self.q_scale, self.bpr as u32, ctx::block(),
-                qh_n, kvh, hd, t32, true, false, stream,
+                qh_n, kvh, hd, t32, None, true, false, stream,
             );
         } else {
             tb.paged_attn.run(
