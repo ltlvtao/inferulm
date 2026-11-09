@@ -143,7 +143,7 @@ say "终验开始 → $OUT"
   echo "vllm: $("$PY" -c 'import vllm;print(vllm.__version__)' 2>/dev/null)"
   echo "torch: $("$PY" -c 'import torch;print(torch.__version__, torch.version.cuda)' 2>/dev/null)"
   echo "gpu: $("$SMINT" --query-gpu=name,driver_version,clocks.max.sm --format=csv,noheader 2>/dev/null)"
-  echo "wein cfg: --graph --ctx-len 8192 --kv-pages 512 --chunk-size 2048 (mix_cap 192 默认)"
+  echo "wein cfg: --graph --ctx-len 8192 --kv-pages 512 --chunk-size 2048 (mix_cap 4096 + mix_budget 26ms/rows32 默认)"
   echo "vllm cfg: maxlen 8192 mem 0.85 mbt 2048 maxseqs 256"
 } | tee "$OUT/env.txt"
 
