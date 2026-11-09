@@ -118,6 +118,16 @@ impl Gpu {
             owned: true,
         }
     }
+
+    /// 页锁定 host 缓冲（DRAM 分层换出/换入）：async 拷贝可达满 PCIe 带宽，
+    /// 与 pageable Vec（D2H 实测仅 ~3GB/s）不同量级。
+    pub fn alloc_host_bytes(&self, bytes: usize) -> HostPinned<'_> {
+        HostPinned {
+            drv: &self.drv,
+            ptr: self.drv.mem_host_alloc(bytes).expect("cuMemHostAlloc"),
+            bytes,
+        }
+    }
     pub fn alloc_from_slice<T: Copy>(&self, slice: &[T]) -> DevBuf<'_> {
         capture_guard();
         let buf = self.alloc_bytes(slice.len() * std::mem::size_of::<T>());
@@ -393,6 +403,43 @@ impl DevBuf<'_> {
         self.drv
             .memcpy_htod_async(self.ptr, slice.as_ptr().cast(), n, stream.handle)
             .expect("cuMemcpyHtoDAsync");
+    }
+}
+
+/// 页锁定 host 缓冲（DRAM 分层）：持有期间物理页锁定，Drop 释放。
+/// 安全合同：调用方在 Drop 前保证流上引用它的拷贝已完成（sync 或保序）。
+pub struct HostPinned<'g> {
+    pub(crate) drv: &'g Driver,
+    pub ptr: *mut u8,
+    pub bytes: usize,
+}
+
+impl HostPinned<'_> {
+    pub fn as_slice(&self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
+    }
+    /// 异步 D2H：设备区间 → 本缓冲开头（流上排队）
+    pub fn download_on(&self, src: &DevBuf, src_start: usize, len: usize, stream: &Stream) {
+        assert!(src_start + len <= src.bytes, "download_on 源区间越界");
+        assert!(len <= self.bytes, "download_on 目标容量不足");
+        self.drv
+            .memcpy_dtoh_async_pinned(self.ptr, src.ptr + src_start as u64, len, stream.handle)
+            .expect("cuMemcpyDtoHAsync(pinned)");
+    }
+    /// 异步 H2D：本缓冲 → 设备区间（流上排队）
+    pub fn upload_to_on(&self, dst: &DevBuf, dst_start: usize, len: usize, stream: &Stream) {
+        assert!(dst_start + len <= dst.bytes, "upload_to_on 目标区间越界");
+        assert!(len <= self.bytes, "upload_to_on 源容量不足");
+        self.drv
+            .memcpy_htod_async(dst.ptr + dst_start as u64, self.ptr.cast(), len, stream.handle)
+            .expect("cuMemcpyHtoDAsync(pinned)");
+    }
+}
+
+impl Drop for HostPinned<'_> {
+    fn drop(&mut self) {
+        // 与 DevBuf 同理：进程终止路径上下文已销毁，失败是预期
+        let _ = self.drv.mem_free_host(self.ptr);
     }
 }
 

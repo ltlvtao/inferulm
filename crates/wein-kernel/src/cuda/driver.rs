@@ -87,6 +87,12 @@ pub struct Driver {
     cu_mem_free: unsafe extern "C" fn(u64) -> CuResult,
     cu_memcpy_htod: unsafe extern "C" fn(u64, *const c_void, usize) -> CuResult,
     cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> CuResult,
+    /// 页锁定 host 内存（DRAM 分层换出/换入路径）：分配/释放 + 异步 D2H
+    cu_mem_host_alloc:
+        unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CuResult,
+    cu_mem_free_host: unsafe extern "C" fn(*mut c_void) -> CuResult,
+    cu_memcpy_dtoh_async:
+        unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> CuResult,
     cu_memset_d8: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResult,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> CuResult,
     cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResult,
@@ -165,6 +171,9 @@ impl Driver {
                 cu_mem_free: try_get(&lib, &["cuMemFree_v2", "cuMemFree"])?,
                 cu_memcpy_htod: try_get(&lib, &["cuMemcpyHtoD_v2", "cuMemcpyHtoD"])?,
                 cu_memcpy_dtoh: try_get(&lib, &["cuMemcpyDtoH_v2", "cuMemcpyDtoH"])?,
+                cu_mem_host_alloc: try_get(&lib, &["cuMemHostAlloc_v2", "cuMemHostAlloc"])?,
+                cu_mem_free_host: try_get(&lib, &["cuMemFreeHost"])?,
+                cu_memcpy_dtoh_async: try_get(&lib, &["cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync"])?,
                 cu_memset_d8: try_get(&lib, &["cuMemsetD8Async"])?,
                 cu_stream_create: try_get(&lib, &["cuStreamCreate"])?,
                 cu_stream_synchronize: try_get(&lib, &["cuStreamSynchronize"])?,
@@ -326,6 +335,29 @@ impl Driver {
     }
     pub(crate) fn mem_free(&self, ptr: u64) -> Result<(), CuError> {
         self.check(unsafe { (self.cu_mem_free)(ptr) }, "cuMemFree")
+    }
+    /// 页锁定 host 内存分配（DRAM 分层）：返回可写裸指针，释放用 [`Self::mem_free_host`]。
+    /// flags=0（读写锁定，可被 async 拷贝双向使用）。
+    pub(crate) fn mem_host_alloc(&self, bytes: usize) -> Result<*mut u8, CuError> {
+        let mut p = std::ptr::null_mut();
+        self.check(unsafe { (self.cu_mem_host_alloc)(&mut p, bytes, 0) }, "cuMemHostAlloc")?;
+        Ok(p.cast())
+    }
+    pub(crate) fn mem_free_host(&self, p: *mut u8) -> Result<(), CuError> {
+        self.check(unsafe { (self.cu_mem_free_host)(p.cast()) }, "cuMemFreeHost")
+    }
+    /// 异步 D2H 到页锁定缓冲（流上排队——与 kernel/上传保序）
+    pub(crate) fn memcpy_dtoh_async_pinned(
+        &self,
+        dst: *mut u8,
+        src: u64,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> Result<(), CuError> {
+        self.check(
+            unsafe { (self.cu_memcpy_dtoh_async)(dst.cast(), src, bytes, stream) },
+            "cuMemcpyDtoHAsync",
+        )
     }
     pub(crate) fn memcpy_htod(&self, dst: u64, src: &[u8]) -> Result<(), CuError> {
         self.check(
