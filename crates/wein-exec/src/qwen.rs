@@ -924,6 +924,12 @@ pub struct Qwen35Executor {
     /// 小批时 RPT=4 会把 bdim 压到 1 warp、块数不够 ⇒ 单独选。dtype 须与
     /// `attn_cfg` 一致（KV 池只分配一次）
     attn_cfg_dec: wein_kernel::ops::AttnCfg,
+    /// **单组档**（ntok=1 ⇒ 每 block 单行组，K/V 每行只载一次）：online 档
+    /// 的读放大 = 每 block 行组数（rows_nom/rpt，各组重复载同一批 K/V）——
+    /// 现役几何 ntok=4/rpt=4 放大 8×，L2 去重后仍是带宽墙。行数 ∈[4,
+    /// PART_ROWS/qh] 的 online 段批换此档（`cfg_rows`；探针矩阵 R≥4 全形
+    /// −23~34%，R=8@5K −32%；<4 行绝对值小且单组反慢，> 上限 jsplit 落不下）
+    attn_cfg_sgl: wein_kernel::ops::AttnCfg,
     /// 块档（`paged_attn_blk`：O/P 落块私有 scratch、Br 参数化）：
     /// **只在 prefill 且 t ≥ `attn_blk_min_t`** 时启用（`WEIN_ATTN_BLK`；
     /// 缺省 = 关）。decode 形（t≤4）与两遍位级档（`WEIN_ATTN_ONLINE=0`）
@@ -1137,6 +1143,14 @@ impl Qwen35Executor {
         // cfg 只看**整批 t**：同批所有 online 调用（混批 run / 尾行）同档，
         // online 行独立（o41 批形无关）⇒ 与现状整批一遍位级同
         let cfg = if t <= 4 { self.attn_cfg_dec } else { self.attn_cfg };
+        // 单组档选档（attn_cfg_sgl 字段注释）：行数 ∈[4, PART_ROWS/qh] 才换。
+        // 上下界外保持原 cfg——<4 行绝对值小且单组反慢（R=1@短 ctx +5-19%），
+        // > PART_ROWS/qh 行 jsplit 落不下（js=1 块数骤减，c=100 满载风险）。
+        let sgl = self.attn_cfg_sgl;
+        let part_rows = wein_kernel::ops::ATTN_TILE_PART_ROWS as u32;
+        let cfg_rows = |rows: u32| {
+            if rows >= 4 && rows * qh_n <= part_rows { sgl } else { cfg }
+        };
         // 混批/多段逐段路径（attn_mix_probe ② 已验证）：≥64 行段的 64 对齐主段
         // 走 v9/v5、16 对齐余段走 v4——段内 seqs 一律取全 0 缓冲切片 + bt narrow
         // 到段首行（v9 对 seq≠0 的行算错，见 bench-reports/agent-attn-mix-20261109）；
@@ -1172,7 +1186,7 @@ impl Qwen35Executor {
                     if t64 >= 64 || t4 >= 16 {
                         if let Some((ps, pe)) = pend.take() {
                             a.run_tile_online_cfg(
-                                cfg, &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
+                                cfg_rows((pe - ps) as u32), &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
                                 &seqs.narrow(ps * 4, (pe - ps) * 4),
                                 &pos.narrow(ps * 4, (pe - ps) * 4),
                                 &out.narrow(ps * row, (pe - ps) * row), q_scale, bpr,
@@ -1212,7 +1226,7 @@ impl Qwen35Executor {
                 }
                 if let Some((ps, pe)) = pend {
                     a.run_tile_online_cfg(
-                        cfg, &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
+                        cfg_rows((pe - ps) as u32), &q.narrow(ps * row, (pe - ps) * row), k, v, bt,
                         &seqs.narrow(ps * 4, (pe - ps) * 4),
                         &pos.narrow(ps * 4, (pe - ps) * 4),
                         &out.narrow(ps * row, (pe - ps) * row), q_scale, bpr,
@@ -1279,7 +1293,7 @@ impl Qwen35Executor {
                 let row = (qh_n * hd) as usize * 2;
                 let s = t64 as usize;
                 a.run_tile_online_cfg(
-                    cfg,
+                    cfg_rows(rem),
                     &q.narrow(s * row, rem as usize * row),
                     k,
                     v,
@@ -1327,7 +1341,7 @@ impl Qwen35Executor {
                 let row = (qh_n * hd) as usize * 2;
                 let s = t4 as usize;
                 a.run_tile_online_cfg(
-                    cfg,
+                    cfg_rows(tail),
                     &q.narrow(s * row, tail as usize * row),
                     k,
                     v,
@@ -1378,7 +1392,7 @@ impl Qwen35Executor {
         }
         if self.attn_online {
             a.run_tile_online_cfg(
-                cfg, q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t,
+                cfg_rows(t), q, k, v, bt, seqs, pos, out, q_scale, bpr, block_size, qh_n, kvh, hd, t,
                 stream,
             );
         } else if cfg.kv == wein_kernel::ops::KvDtype::F32 {
@@ -1417,9 +1431,20 @@ impl Qwen35Executor {
             "WEIN_ATTN_CFG_DEC",
             wein_kernel::ops::AttnCfg { rpt: 2, ..wein_kernel::ops::AttnCfg::baseline() },
         );
+        let attn_cfg_sgl = attn_cfg_from_env(
+            "WEIN_ATTN_CFG_SGL",
+            wein_kernel::ops::AttnCfg {
+                nd: 8, rpt: 4, ntok_max: 1,
+                ..wein_kernel::ops::AttnCfg::baseline()
+            },
+        );
         assert_eq!(
             attn_cfg.kv, attn_cfg_dec.kv,
             "WEIN_ATTN_CFG 与 WEIN_ATTN_CFG_DEC 的池 dtype 须一致（KV 池只分配一次）"
+        );
+        assert_eq!(
+            attn_cfg.kv, attn_cfg_sgl.kv,
+            "WEIN_ATTN_CFG 与 WEIN_ATTN_CFG_SGL 的池 dtype 须一致（KV 池只分配一次）"
         );
         let kv_esz = if attn_cfg.kv == wein_kernel::ops::KvDtype::F32 { 4 } else { 2 };
 
@@ -1760,6 +1785,7 @@ impl Qwen35Executor {
             attn_online: std::env::var("WEIN_ATTN_ONLINE").map(|v| v != "0").unwrap_or(true),
             attn_cfg,
             attn_cfg_dec,
+            attn_cfg_sgl,
             attn_blk: attn_blk_from_env("WEIN_ATTN_BLK", attn_cfg.kv),
             attn_blk_min_t: std::env::var("WEIN_ATTN_BLK_T")
                 .ok()

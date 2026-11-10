@@ -19,8 +19,9 @@ fn bf16_vec(seed_hi: u64, n: usize, scale: f32) -> Vec<u16> {
         .collect()
 }
 
-/// R 行 × 每行 ~ctx token；页表每行独立分配（页离散：行 r 的页基 = r 偏移交错）
-fn case(rows: usize, ctx: usize, q_heads: usize, kv_heads: usize, hd: usize, bs: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
+/// R 行 × 每行 ~ctx token；页表每行独立分配。interleave=true 时行间物理交错
+/// （行 r 的页基 = r 偏移交错，模拟真实 BlockPool 并发分配），false 时连续铺。
+fn case(rows: usize, ctx: usize, q_heads: usize, kv_heads: usize, hd: usize, bs: usize, interleave: bool) -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
     let he = kv_heads * hd;
     let pages_per_row = ctx.div_ceil(bs);
     let npages = pages_per_row * rows;
@@ -30,7 +31,7 @@ fn case(rows: usize, ctx: usize, q_heads: usize, kv_heads: usize, hd: usize, bs:
     let mut used = vec![false; npages];
     for r in 0..rows {
         for p in 0..pages_per_row {
-            let page = (r + p * rows) % npages;
+            let page = if interleave { (r + p * rows) % npages } else { r * pages_per_row + p };
             assert!(!used[page]);
             used[page] = true;
             bt[r * pages_per_row + p] = page as u32;
@@ -72,12 +73,37 @@ fn main() {
     let ms: f64 = e1.elapsed_ms(&e0) as f64 / 10.0;
     println!("  {:.0} GB/s", 2.0 * n as f64 / 1e9 / (ms / 1e3));
 
+    // 对照矩阵：行数 × 页布局 × ctx——分离"页交错损失"与"行数/批形损失"
+    println!("\n对照矩阵（现役 prefill cfg n4r4/ntok4 vs 单组档 n8r4/ntok1）：");
+    println!("| rows | ctx | KV MB | 现役 ms | 现役 GB/s | 单组 ms | 单组 GB/s |");
+    println!("|---|---|---|---|---|---|---|");
+    let cur = AttnCfg { rpt: 4, ..AttnCfg::baseline() };          // t>4 生产档
+    let cur_dec = AttnCfg { rpt: 2, ..AttnCfg::baseline() };      // t≤4 生产档
+    let single = AttnCfg { nd: 8, rpt: 4, ntok_max: 1, ..AttnCfg::baseline() }; // 单组 1×
+    for rows in [1usize, 2, 4, 8, 16, 32, 64] {
+        for ctx in [1280usize, 2560, 5120, 10240] {
+            let (ms_a, kv_mb) = bench(&t, &gpu, &stream, if rows <= 4 { cur_dec } else { cur },
+                rows, ctx, q_heads, kv_heads, hd, bs, q_scale, true);
+            let (ms_b, _) = bench(&t, &gpu, &stream, single,
+                rows, ctx, q_heads, kv_heads, hd, bs, q_scale, true);
+            let f = |ms: f64| kv_mb as f64 * 1.048576 / ms;
+            println!("| {rows} | {ctx} | {kv_mb} | {ms_a:.4} | {:.0} | {ms_b:.4} | {:.0} |", f(ms_a), f(ms_b));
+        }
+    }
+
     // 档位扫描：R=8@5120（agent c=8 稳态形）固定，扫 (nd, rpt, ntok_max, bdim_max)
-    println!("\n档位扫描 R=8 ctx=5120（KV 160MB，D2D {}/s 为顶）：", "917GB");
+    println!("\n档位扫描 R=8 ctx=5120（KV 160MB，D2D 为顶）：");
     println!("| nd | rpt | ntok_max | bdim_max | nt | ntile | js | 块数 | bdim | ms | GB/s |");
     println!("|---|---|---|---|---|---|---|---|---|---|---|");
-    for (nd, rpt) in [(4usize, 2usize), (4, 4), (8, 2), (8, 4), (16, 2), (16, 4)] {
-        for (ntok_max, bdim_max) in [(8usize, 512usize), (16, 1024), (32, 1024), (8, 1024)] {
+    // 杀放大档：ntok=1+rpt=group ⇒ 每 block 单行组，K/V 每行只载一次
+    for (nd, rpt, ntok_max) in [
+        (4usize, 2usize, 8usize),   // 现役生产档（放大 8×）
+        (4usize, 4usize, 1usize),   // 单组 1×（bdim=64）
+        (8usize, 4usize, 1usize),   // 单组 1×（bdim=32）
+        (4usize, 4usize, 2usize),   // 放大 2×（bdim=128）
+        (4usize, 4usize, 4usize),   // 放大 4×（bdim=256）
+    ] {
+        for bdim_max in [512usize, 1024] {
             let cfg = AttnCfg {
                 nd, rpt, ntok_max, bdim_max,
                 ..AttnCfg::baseline()
@@ -90,8 +116,9 @@ fn main() {
             };
             let (ms, kv_mb) = bench(&t, &gpu, &stream, cfg, 8, 5120, q_heads, kv_heads, hd, bs, q_scale, true);
             let blocks = g.jsplit * kv_heads as usize * g.ntile;
-            println!("| {nd} | {rpt} | {ntok_max} | {bdim_max} | {} | {} | {} | {blocks} | {} | {ms:.4} | {:.0} |",
-                g.ntok, g.ntile, g.jsplit, g.bdim, kv_mb as f64 / 1024.0 / ms as f64);
+            let gbs = kv_mb as f64 * 1.048576 / ms;
+            println!("| {nd} | {rpt} | {ntok_max} | {bdim_max} | {} | {} | {} | {blocks} | {} | {ms:.4} | {gbs:.0} |",
+                g.ntok, g.ntile, g.jsplit, g.bdim);
         }
     }
 }
@@ -108,9 +135,9 @@ fn bench(
     hd: usize,
     bs: usize,
     q_scale: f32,
-    print: bool,
+    interleave: bool,
 ) -> (f64, usize) {
-    let (q, k, v, bt, si, pos, bpr, _slots) = case(rows, ctx, q_heads, kv_heads, hd, bs);
+    let (q, k, v, bt, si, pos, bpr, _slots) = case(rows, ctx, q_heads, kv_heads, hd, bs, interleave);
     let dq = gpu.alloc_from_slice(&q);
     let dk = gpu.alloc_from_slice(&k);
     let dv = gpu.alloc_from_slice(&v);
@@ -138,9 +165,6 @@ fn bench(
     stream.sync();
     let ms = e1.elapsed_ms(&e0) as f64 / 20.0;
     let kv_mb = rows * ctx * kv_heads * hd * 2 * 2 / 1024 / 1024;
-    if print {
-        println!("| {rows} | {ctx} | {kv_mb} | {ms:.4} | {:.0} | nt×js |",
-            kv_mb as f64 / 1024.0 / ms as f64);
-    }
+    let _ = interleave;
     (ms, kv_mb)
 }

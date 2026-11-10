@@ -1806,7 +1806,7 @@ const ATTN_TILE_SLOT_TAB: usize = 32 * 512;
 /// j 分片数上限（decode 形：批小、块不够用时按 j 切片换并行度）
 pub const ATTN_TILE_SPLIT_CAP: usize = 64;
 /// 分片档的 q 行容量（jsplit>1 只在小批发生：rows = tokens×q_heads ≤ 1024）
-const ATTN_TILE_PART_ROWS: usize = 1024;
+pub const ATTN_TILE_PART_ROWS: usize = 1024;
 /// 分片档 head_dim 容量（偏结果表按它定尺）
 const ATTN_TILE_HD_CAP: usize = 256;
 /// 分块档最小并行目标：块数低于它就往上加 j 分片
