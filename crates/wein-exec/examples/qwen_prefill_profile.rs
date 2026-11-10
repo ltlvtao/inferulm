@@ -58,6 +58,9 @@ fn main() {
             let t0 = Instant::now();
             let out = ex.step(&plan);
             let wall = t0.elapsed().as_secs_f64() * 1e3;
+            if out.len() != 1 {
+                eprintln!("n={n} rep{r}：out.len()={}，failures={:?}", out.len(), ex.take_failures());
+            }
             assert_eq!(out.len(), 1, "prefill 步每请求出一个 token");
             walls.push(wall);
             ex.retain(&[]);

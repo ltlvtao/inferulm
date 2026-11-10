@@ -726,6 +726,8 @@ struct StepProf {
     cal_ms: f64,
     /// 本步校准突发的 (首, 末) 事件 idx（finalize 时查时距）
     cal_pair: Option<(usize, usize)>,
+    /// 本步行数（t, n_rows）——per/full 档打印（定位批形状）
+    note_t: (u32, u32),
     truncated: bool,
 }
 
@@ -749,6 +751,7 @@ impl StepProf {
             readback_ms: 0.0,
             cal_ms: 0.0,
             cal_pair: None,
+            note_t: (0, 0),
             truncated: false,
         }
     }
@@ -797,8 +800,11 @@ impl StepProf {
     /// 440 边界 +37ms）——步尾同点校准突发量出单价，报告按段内边界数扣除
     fn finalize(&mut self, wall: f64) {
         // WEIN_STEP_PROFILE=per：逐步一行（长上下文多步 prefill 的步间形态——
-        // 轮均值会把尾步慢段摊平，看不出单步结构）
-        if std::env::var("WEIN_STEP_PROFILE").as_deref() == Ok("per") {
+        // 轮均值会把尾步慢段摊平，看不出单步结构）；=full 再加全段列表与
+        // 段和（wall − 段和 = 事件窗外的发射/上传/选型等主机侧时间）
+        let mode = std::env::var("WEIN_STEP_PROFILE").unwrap_or_default();
+        let per = mode == "per" || mode == "full";
+        if per {
             let mut prev = 0usize;
             let mut segs: Vec<(&str, f64)> = Vec::new();
             for &(sect, e) in &self.ends {
@@ -814,13 +820,21 @@ impl StepProf {
                 }
                 prev = e;
             }
+            let sum: f64 = segs.iter().map(|s| s.1).sum();
             segs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let n = if mode == "full" { segs.len() } else { 6 };
             let top: Vec<String> = segs
                 .iter()
-                .take(6)
+                .take(n)
                 .map(|(s, ms)| format!("{s}={ms:.1}"))
                 .collect();
-            eprintln!("step {} wall={wall:.1} | {}", self.steps + 1, top.join(" "));
+            eprintln!(
+                "step {} t={} rows={} wall={wall:.1} segsum={sum:.1} | {}",
+                self.steps + 1,
+                self.note_t.0,
+                self.note_t.1,
+                top.join(" ")
+            );
         }
         let mut prev = 0usize;
         for &(sect, e) in &self.ends {
@@ -3375,6 +3389,12 @@ impl Qwen35Executor {
             p.submit_ms += prof_ms(t.elapsed());
         }
     }
+    /// 步批形状（t=token 行数, rows=段行数）入 per/full 档打印
+    fn prof_note_t(&self, t: u32, rows: u32) {
+        if let Some(p) = self.prof.borrow_mut().as_mut() {
+            p.note_t = (t, rows);
+        }
+    }
     fn prof_end(&self) {
         if let Some(p) = self.prof.borrow_mut().as_mut() {
             p.end(self.session.stream());
@@ -3628,6 +3648,7 @@ impl Qwen35Executor {
         self.run_forward(t as u32, n_rows, &inp, &spans);
         if prof_on {
             self.prof_note_submit(tsub);
+            self.prof_note_t(t as u32, n_rows);
         }
 
         // ── 采样（设备端 argmax；只回读采样行的 u32）──
