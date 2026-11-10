@@ -94,6 +94,11 @@ impl Default for SchedConfig {
             // TTFT p50 144），tps/ITL p50 漂移带内无差；Agent c=4/8 行数门
             // 下不绑定（等价关闭档）。30ms 档收益减半（p99 −7%）
             mix_budget_ms: 26.0,
+            // 2026-11-10 混批调度刀（bench-reports/agent-mixsched-20261110）
+            // 定案：行数门 32→2 + 相位二轮转两个假设均被 c=8×6 三轮 A/B 证伪
+            // ——闸门生效档 hit 0.69→0.29-0.52 崩、itl 19.5 反升（追平期拖长，
+            // 26ms 模型 0.04ms/tok 低估真实 0.07ms/tok，压了进度没压住步长）；
+            // 轮转档 ttft_hot 413→878 翻倍。维持 rows=32（仅满载 c≥32 生效）
             mix_budget_rows: 32,
             snap_align: 1,
         }
@@ -537,6 +542,12 @@ impl Scheduler {
         {
             cap = PREFILL_MIN;
         }
+        // 相位二 prefill：FIFO——先到先得独吃本步许可（budget 与 cap 的更小者）。
+        // 轮转均分已实测证伪（c=8×6 三轮 A/B，bench-reports/agent-mixsched-
+        // 20261110）：share≈预算/8 把每会话追平拉长 n×（ttft_hot 413→878ms
+        // 翻倍，itl_med 16.8→17.7 反升）——FIFO 错峰让多数会话稳在 decode、
+        // 少数逐个追平。混批步的时长问题在 kernel 层解决（v4 余段→online），
+        // 不在调度层节流（闸门 rows 下探同样证伪，见 Default 注释）
         for &id in &plan.batch {
             let r = self.reqs.get_mut(&id).unwrap();
             if r.generated >= r.max_tokens {
@@ -1015,6 +1026,38 @@ mod tests {
         let p2 = s.step();
         let n2: usize = p2.prefill.iter().filter(|&&(id, _)| id == 2).map(|(_, n)| n).sum();
         assert_eq!(n2, 256, "低并发（d=1 < 32）闸门不生效，chunk 自由");
+    }
+
+    /// s13 · 混批步 FIFO 独吃（轮转已证伪）：有稳定 decode 时本步 prefill
+    ///      许可仍按 FIFO 先到先得——先到债主吃满（chunk==budget 的生产比形
+    ///      下吃掉全部许可），后到者等下一步（A/B 数据见 bench-reports/
+    ///      agent-mixsched-20261110：轮转均分把追平拉长 n×，ttft_hot 翻倍）；
+    ///      纯 prefill 波同样是 FIFO（s10/s11 语义）
+    #[test]
+    fn s13_mixed_step_fifo() {
+        // 1 稳定 decode + 2/3 两债主；budget=chunk=512（生产比形 t_max==chunk）
+        let mut s = Scheduler::new(SchedConfig {
+            token_budget: 512,
+            max_running: 8,
+            chunk_size: 512,
+            max_batch_tokens: 1 << 30,
+            mix_cap: 1 << 30,
+            mix_budget_ms: 0.0,
+            mix_budget_rows: 1 << 30,
+            snap_align: 1,
+        });
+        s.submit(ReqInput { id: 1, prompt_token_ids: vec![0; 1], max_tokens: 30 });
+        s.submit(ReqInput { id: 2, prompt_token_ids: vec![0; 3000], max_tokens: 4 });
+        s.submit(ReqInput { id: 3, prompt_token_ids: vec![0; 900], max_tokens: 4 });
+        let p1 = s.step();
+        // 首步纯 prefill 波：1 追平转 decode（1 token），2 吃 511，3 饿等
+        assert!(p1.prefill.contains(&(1, 1)) && p1.prefill.contains(&(2, 511)),
+            "纯 prefill 波 FIFO：{:?}", p1.prefill);
+        let p2 = s.step();
+        // 混批步（1 稳定 decode）：FIFO——2 吃满 511、3 无许可（轮转会各分 255）
+        let n2 = p2.prefill.iter().filter(|&&(id, _)| id == 2).map(|(_, n)| n).sum::<usize>();
+        let n3 = p2.prefill.iter().filter(|&&(id, _)| id == 3).map(|(_, n)| n).sum::<usize>();
+        assert_eq!((n2, n3), (511, 0), "FIFO 先到债主独吃：{:?}", p2.prefill);
     }
 
     /// s9 · 容量钩子真实可插拔：准入与抢占由容量模型驱动，而非调度器内置聚合

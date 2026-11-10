@@ -1197,20 +1197,11 @@ impl Qwen35Executor {
                                 );
                             }
                         }
-                        if t4 > 0 {
-                            let s4 = cur + t64;
-                            a.run_tile_v4(
-                                &q.narrow(s4 * row, t4 * row), k, v,
-                                &bt1,
-                                &sz.narrow(s4 * 4, t4 * 4),
-                                &pos.narrow(s4 * 4, t4 * 4),
-                                &out.narrow(s4 * row, t4 * row), q_scale, bpr,
-                                block_size, qh_n, kvh, hd, t4 as u32, stream,
-                            );
-                        }
-                        let tail_s = cur + t64 + t4;
-                        if tail_s < cur + c {
-                            pend = Some((tail_s, cur + c));
+                        if t64 < c {
+                            // 余段（16 对齐部分 + <16 尾行）整体并给 online：v4
+                            // 余段在 Agent 长上下文形病态慢（同 v5 门余段注释）。
+                            // pend 在本分支入口已 flush，直接覆盖安全
+                            pend = Some((cur + t64, cur + c));
                         }
                     } else if let Some((_, ref mut pe)) = pend {
                         *pe = cur + c;
@@ -1280,50 +1271,31 @@ impl Qwen35Executor {
             }
             let rem = t - t64;
             if rem > 0 {
+                // 余段（<64 行）整体走 online：v4 余段在 Agent 长上下文形状
+                // 病态慢（c=8×6 实测 p50 3.07ms/发、max 15.8ms——48 行 × 5K
+                // 上下文的 4× KV 重读放大；v9 主段同批 p50 1.1ms 处理 ≥64 行），
+                // online 行独立且对该形状实测更快；位级（v4≡旧 tile）降为
+                // online 容差（o33 档 rel2 ≤ 8e-5）
                 let row = (qh_n * hd) as usize * 2;
                 let s = t64 as usize;
-                let t4 = rem & !15;
-                if t4 > 0 {
-                    a.run_tile_v4(
-                        &q.narrow(s * row, t4 as usize * row),
-                        k,
-                        v,
-                        bt,
-                        &seqs.narrow(s * 4, t4 as usize * 4),
-                        &pos.narrow(s * 4, t4 as usize * 4),
-                        &out.narrow(s * row, t4 as usize * row),
-                        q_scale,
-                        bpr,
-                        block_size,
-                        qh_n,
-                        kvh,
-                        hd,
-                        t4,
-                        stream,
-                    );
-                }
-                let tail = rem - t4;
-                if tail > 0 {
-                    let s2 = s + t4 as usize;
-                    a.run_tile_online_cfg(
-                        cfg,
-                        &q.narrow(s2 * row, tail as usize * row),
-                        k,
-                        v,
-                        bt,
-                        &seqs.narrow(s2 * 4, tail as usize * 4),
-                        &pos.narrow(s2 * 4, tail as usize * 4),
-                        &out.narrow(s2 * row, tail as usize * row),
-                        q_scale,
-                        bpr,
-                        block_size,
-                        qh_n,
-                        kvh,
-                        hd,
-                        tail,
-                        stream,
-                    );
-                }
+                a.run_tile_online_cfg(
+                    cfg,
+                    &q.narrow(s * row, rem as usize * row),
+                    k,
+                    v,
+                    bt,
+                    &seqs.narrow(s * 4, rem as usize * 4),
+                    &pos.narrow(s * 4, rem as usize * 4),
+                    &out.narrow(s * row, rem as usize * row),
+                    q_scale,
+                    bpr,
+                    block_size,
+                    qh_n,
+                    kvh,
+                    hd,
+                    rem,
+                    stream,
+                );
             }
             return;
         }
