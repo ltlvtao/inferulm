@@ -126,6 +126,11 @@ pub struct EngineStats {
     ctx_limit: AtomicUsize,
     /// 内存层快照（每步末刷新；未启用内存层时恒为默认值）
     mem: Mutex<MemStats>,
+    /// core 任务退出信号（run() 返回前置 true）。CLI 的 SIGTERM 路径在
+    /// process teardown 前等它：exec 的 Drop（几十毫秒的 CUDA 销毁串）
+    /// 必须先于 atexit 的 driver teardown 完成——否则两边并发销毁同一
+    /// context（WSL 实测 segfault）。watch 保留终值，等待者不会错过。
+    exit_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for EngineStats {
@@ -141,11 +146,24 @@ impl Default for EngineStats {
             // AtomicUsize::default() = 0 会被误读成"上下文窗口为 0"
             ctx_limit: AtomicUsize::new(usize::MAX),
             mem: Mutex::new(MemStats::default()),
+            exit_tx: tokio::sync::watch::Sender::new(false),
         }
     }
 }
 
 impl EngineStats {
+    /// core 任务是否已退出（exec 已完成 Drop）
+    pub fn exited(&self) -> bool {
+        *self.exit_tx.borrow()
+    }
+
+    /// 等 core 任务退出（run() 返回前置 true）。watch 保留终值——
+    /// 任务先退出后调用也不会挂住。
+    pub async fn wait_exit(&self) {
+        let mut rx = self.exit_tx.subscribe();
+        let _ = rx.wait_for(|v| *v).await;
+    }
+
     pub fn accepted_count(&self) -> usize {
         self.accepted.load(Ordering::Relaxed)
     }
@@ -532,7 +550,12 @@ impl EngineCore {
                 }
             }
         }
-        // cmd_tx 全部 drop = 引擎关闭；senders 随之 drop，事件流自然关闭
+        // cmd_tx 全部 drop = 引擎关闭；senders 随之 drop，事件流自然关闭。
+        // 退出通知顺序：先显式 drop exec（跑完几十毫秒的 CUDA 销毁串），
+        // 再置 watch —— 等待者醒来时 GPU 资源已全部归还，atexit 的
+        // driver teardown 落在干净状态上（segfault 修复，见 EngineStats）。
+        drop(exec);
+        let _ = stats.exit_tx.send(true);
     }
 
     /// 吸收当前排队中的全部命令并回放事件。

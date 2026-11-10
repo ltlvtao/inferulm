@@ -285,6 +285,10 @@ fn main() {
             (engine, Arc::new(mock_tok))
         };
         let ctx_limit = engine.ctx_limit();
+        // 退出守卫：SIGTERM 路径在 process teardown 前等 core 任务退出。
+        // 注意 clone 的是 stats（不持命令通道）——clone handle 会挡住
+        // "全部 sender drop"判定，core 挂在 recv() 永不退出（循环等待）
+        let exit_stats = engine.stats().cloned();
         // 启动预热（qwen；--no-warmup 可关，对照测量用）：进程首步 prefill
         // 的一次性成本 ~137ms（cuBLASLt workspace/algo 初始化、lm_head 首
         // 调、模块惰性页入——6009 冷跑首轮实测 676 vs 540）。暖一发满
@@ -370,7 +374,23 @@ fn main() {
             }
         }
         // 退出码 0：drain 超时也算"已尽力"——编排层看的是日志里的未完成清单
-        std::process::exit(0);
+        //
+        // ── 进程 teardown 顺序化（segfault 修复）──
+        // 旧实现在此直接 `std::process::exit(0)`：exit 立即跑 atexit（CUDA
+        // driver 的 context teardown），而 engine core 任务此刻可能还在
+        // GPU step 中 / 还在异步跑收尾（exec 的 Drop 是几十毫秒的 CUDA
+        // 销毁串：显存释放、cuBLASLt 销毁、模块卸载、pinned 解绑）——
+        // 两边并发销毁同一 context，WSL 下实测 12 发 1 次 segfault
+        // （dmesg ip==fault addr：跳进已卸载页）。
+        // 这里等 stats 的退出 watch（run() 末尾：显式 drop exec 跑完 CUDA
+        // 销毁串后才置位），再让 async 块自然返回：runtime drop → 静态析构
+        // → atexit 全部落在干净状态上。
+        if let Some(s) = exit_stats.as_ref() {
+            let _ = tokio::time::timeout(Duration::from_secs(10), s.wait_exit()).await;
+            if !s.exited() {
+                eprintln!("engine 任务 10s 未退出（长 prefill 中？）——交给 runtime teardown 兜底");
+            }
+        }
     });
 }
 
